@@ -1,0 +1,53 @@
+# Flint-5080 local development & remote RTX 5080 configuration template.
+# Copy to `.dev.toml` (gitignored) and customize for your environment.
+
+[remote]
+# Set to false when running directly on the Linux RTX 5080 host.
+enabled = true
+# SSH host alias (from ~/.ssh/config) or `user@hostname`.
+host = "gpu-dev"
+# Optional SSH port (0 uses ~/.ssh/config or SSH default).
+port = 0
+# Remote parent directory for workspace-isolated checkouts:
+# `<workspaces_root>/<workspace_name>`
+workspaces_root = "/home/user/workspace/flint-5080-workspaces"
+# Optional override; defaults to the local repository/worktree directory name.
+workspace_name = ""
+# CUDA toolkit root on the remote host (e.g. "/usr/local/cuda" or mamba/conda env).
+cuda_home = "/usr/local/cuda"
+# Extra PATH entries prepended on the remote host.
+path_prepend = ["$HOME/.cargo/bin"]
+
+[remote.env]
+# Extra environment variables exported on the remote host.
+# RUSTUP_TOOLCHAIN = "1.99.1"
+# CARGO_BUILD_TARGET = "x86_64-unknown-linux-gnu"
+
+[shared]
+# Large assets and coordination state shared across isolated workspaces on the 5080.
+models_dir = "/home/user/models"
+ccache_dir = "/home/user/.cache/flint-5080/ccache"
+lock_file = "/tmp/flint-5080-gpu.lock.json"
+
+[build]
+build_type = "Release"
+cuda_arch = "120a"
+# 0 auto-detects available remote CPU cores.
+jobs = 0
+# "auto" prefers mold -> lld -> system default.
+linker = "auto"
+use_ccache = true
+
+[gpu]
+# Lease duration (seconds) for the single-GPU lock; expired/dead leases auto-recover.
+lease_ttl_sec = 600
+
+[model]
+# Model safetensors directory (absolute path on 5080 or relative to shared.models_dir).
+weights_dir = ""
+
+[server]
+bind = "127.0.0.1:8080"
+
+[workload]
+default_case = ""
