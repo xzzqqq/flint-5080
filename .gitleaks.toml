@@ -1,0 +1,10 @@
+title = "flint-5080 gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Ignore example templates and non-secret placeholder values"
+paths = [
+  '''^\.dev\.toml\.example$''',
+]

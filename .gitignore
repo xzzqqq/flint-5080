@@ -1,0 +1,55 @@
+# Build artifacts
+build/
+engine/build*/
+server/target/
+target/
+compile_commands.json
+*.o
+*.a
+*.so
+*.cubin
+*.ptx
+
+# Local machine & private remote configuration (template: .dev.toml.example)
+/.dev.toml
+.env
+.env.*
+!.env.example
+
+# Forge, run records & temporary scratch
+.forge/
+.runs/
+.scratch/
+*.log
+*.log.err
+
+# Model weights & tensor dumps (never commit)
+models/
+*.safetensors
+*.gguf
+
+# Profiler captures (contain process env vars & API keys, plus large binaries)
+*.nsys-rep
+*.nsys-rep.sqlite
+*.ncu-rep
+*.qdrep
+
+# Recorded private traces (commit only anonymized fixtures/metadata)
+workloads/private/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+
+# Web UI (P1)
+node_modules/
+web/dist/
+.vitest/
+
+# Local agent state & OS junk
+.claude/
+.codex/
+.qwen/
+.DS_Store

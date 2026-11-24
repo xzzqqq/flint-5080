@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Pre-commit guard: scan staged changes with gitleaks and block accidental large binaries.
+set -euo pipefail
+
+root=$(git rev-parse --show-toplevel)
+
+# 1. Secret scan via gitleaks (fail closed if missing).
+if ! command -v gitleaks >/dev/null 2>&1; then
+    printf 'pre-commit: gitleaks not found in PATH; install gitleaks to commit safely\n' >&2
+    exit 1
+fi
+gitleaks git --staged --no-banner --redact --config "$root/.gitleaks.toml" "$root"
+
+# 2. Block accidental large files (> 5 MiB) such as weights, dumps, or captures.
+max_bytes=$((5 * 1024 * 1024))
+git diff --cached --name-only --diff-filter=ACM -z | while IFS= read -r -d '' path; do
+    size=$(git cat-file -s ":$path" 2>/dev/null || echo 0)
+    if [ "$size" -gt "$max_bytes" ]; then
+        printf 'pre-commit: staged file %s is %d bytes (> 5 MiB); do not commit large binaries\n' "$path" "$size" >&2
+        exit 1
+    fi
+done
+
+exit 0

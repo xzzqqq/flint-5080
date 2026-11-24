@@ -1,0 +1,29 @@
+#!/bin/sh
+# Enforce English Conventional Commits on every commit.
+set -eu
+
+msg=$(sed '/^#/d' "$1")
+first=$(printf '%s\n' "$msg" | sed -n '/[^[:space:]]/{p;q;}')
+
+fail() {
+    printf 'commit-msg: %s\n' "$1" >&2
+    exit 1
+}
+
+[ -n "$first" ] || fail "commit message must not be empty"
+
+if printf '%s\n' "$msg" | grep -qi '^co-authored-by:'; then
+    fail "do not include Co-Authored-By trailers"
+fi
+
+# Reject non-ASCII characters in the subject line (enforce English).
+if printf '%s' "$first" | LC_ALL=C grep -q '[^ -~]'; then
+    fail "subject line must be English ASCII: $first"
+fi
+
+# Enforce Conventional Commits: type(optional-scope)!: description
+if ! printf '%s\n' "$first" | grep -Eq '^(feat|fix|perf|refactor|docs|test|build|ci|chore|style|revert)(\([a-z0-9._/-]+\))?!?: [[:print:]]+'; then
+    fail "subject must follow Conventional Commits (e.g. 'feat(forge): add hot-reload'): $first"
+fi
+
+exit 0
