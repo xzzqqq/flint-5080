@@ -63,7 +63,7 @@ class WorkloadConfig:
 def _shell_path(value: str) -> str:
     for prefix in ("$HOME", "${HOME}", "~"):
         if value == prefix or value.startswith(prefix + "/"):
-            return '"$HOME"' + shlex.quote(value[len(prefix):])
+            return '"$HOME"' + shlex.quote(value[len(prefix) :])
     return shlex.quote(value)
 
 
@@ -97,7 +97,9 @@ class DevConfig:
         paths = [_shell_path(p) for p in self.remote.path_prepend]
         if self.remote.cuda_home:
             exports.append("export CUDA_HOME=" + _shell_path(self.remote.cuda_home))
-            exports.append('export LD_LIBRARY_PATH="$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"')
+            exports.append(
+                'export LD_LIBRARY_PATH="$CUDA_HOME/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"'
+            )
             paths.append('"$CUDA_HOME/bin"')
         if paths:
             exports.append("export PATH=" + ":".join([*paths, '"$PATH"']))
@@ -135,16 +137,23 @@ def _section(name, cls, raw):
     return cls(**raw)
 
 
-def load_config(config_path: Path | None = None, repo_root: Path | None = None,
-                allow_missing: bool = False) -> DevConfig:
+def load_config(
+    config_path: Path | None = None, repo_root: Path | None = None, allow_missing: bool = False
+) -> DevConfig:
     root = repo_root.resolve() if repo_root else find_repo_root()
-    path = Path(config_path or os.environ.get("FLINT_DEV_CONFIG") or root / ".dev.toml").expanduser().resolve()
+    path = (
+        Path(config_path or os.environ.get("FLINT_DEV_CONFIG") or root / ".dev.toml")
+        .expanduser()
+        .resolve()
+    )
     try:
         with path.open("rb") as handle:
             raw = tomllib.load(handle)
     except FileNotFoundError as exc:
         if not allow_missing:
-            raise ConfigError(f"Missing {path}. Copy .dev.toml.example to .dev.toml and configure it.") from exc
+            raise ConfigError(
+                f"Missing {path}. Copy .dev.toml.example to .dev.toml and configure it."
+            ) from exc
         raw, path = {}, None
     except (OSError, ValueError) as exc:
         raise ConfigError(f"Cannot read {path}: {exc}") from exc
@@ -162,7 +171,9 @@ def load_config(config_path: Path | None = None, repo_root: Path | None = None,
     if cfg.is_remote and (not cfg.remote.host.strip() or cfg.remote.host.startswith("-")):
         raise ConfigError("remote.host must be an SSH destination")
     if not 0 <= cfg.remote.port <= 65535 or cfg.build.jobs < 0 or cfg.gpu.lease_ttl_sec <= 0:
-        raise ConfigError("Check remote.port (0..65535), build.jobs (>=0), and gpu.lease_ttl_sec (>0)")
+        raise ConfigError(
+            "Check remote.port (0..65535), build.jobs (>=0), and gpu.lease_ttl_sec (>0)"
+        )
     if not cfg.shared.lock_file or not cfg.remote.workspaces_root:
         raise ConfigError("shared.lock_file and remote.workspaces_root must be nonempty")
     return cfg

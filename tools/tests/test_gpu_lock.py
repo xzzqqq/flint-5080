@@ -65,6 +65,7 @@ def test_dead_pid(manager):
 def test_pid_check_permission(monkeypatch):
     def denied(pid, signal):
         raise PermissionError()
+
     monkeypatch.setattr(os, "kill", denied)
     assert _lease.is_pid_alive(1)
 

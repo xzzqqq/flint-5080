@@ -42,8 +42,16 @@ def test_overrides(repo, monkeypatch):
     assert cfg.effective_workspace_name == "trial-A"
 
 
-@pytest.mark.parametrize("text", ["bad =", '[remote]\nenabled = "yes"', "[build]\njobs = true",
-                                  '[remote.env]\n"bad-key" = "x"', "[gpu]\nlease_ttl_sec = 0"])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "bad =",
+        '[remote]\nenabled = "yes"',
+        "[build]\njobs = true",
+        '[remote.env]\n"bad-key" = "x"',
+        "[gpu]\nlease_ttl_sec = 0",
+    ],
+)
 def test_invalid_config(repo, text):
     (repo / ".dev.toml").write_text(text)
     with pytest.raises(ConfigError):
@@ -55,12 +63,17 @@ def test_remote_env_is_shell_safe(cfg):
     cfg.remote.cuda_home = "/cuda 'special'"
     cfg.shared.ccache_dir = "$HOME/cache"
     cfg.remote.env = {"EXTRA": "literal $PATH 'quoted'"}
-    script = cfg.remote_env_prefix() + '\nprintf "%s\\n" "$PATH" "$LD_LIBRARY_PATH" "$CCACHE_DIR" "$EXTRA"'
+    script = (
+        cfg.remote_env_prefix()
+        + '\nprintf "%s\\n" "$PATH" "$LD_LIBRARY_PATH" "$CCACHE_DIR" "$EXTRA"'
+    )
     env = dict(os.environ, PATH="/bin", HOME="/my home", LD_LIBRARY_PATH="/old/lib")
     out = subprocess.check_output(["bash", "-c", script], text=True, env=env)
     assert out.splitlines() == [
         "/my home/.cargo/bin:/path with space/$(false):/cuda 'special'/bin:/bin",
-        "/cuda 'special'/lib64:/old/lib", "/my home/cache", "literal $PATH 'quoted'",
+        "/cuda 'special'/lib64:/old/lib",
+        "/my home/cache",
+        "literal $PATH 'quoted'",
     ]
     cfg.remote.cuda_home = cfg.shared.ccache_dir = ""
     assert "CUDA_HOME" not in cfg.remote_env_prefix()

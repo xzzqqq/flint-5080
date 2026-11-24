@@ -9,8 +9,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="bench",
         description=(
-            "Flint-5080 black-box OpenAI HTTP benchmark and canary harness. "
-            "Scheduled for Phase 2."
+            "Flint-5080 black-box OpenAI HTTP benchmark and canary harness. Scheduled for Phase 2."
         ),
     )
     parser.parse_args(argv)

@@ -12,6 +12,7 @@ from tools.common.config import ConfigError, load_config
 from tools.common.gpu_lock import GpuLeaseManager, GpuLockError
 from tools.common.output import RunResult, log
 from tools.common.remote import Executor
+
 from . import _probe
 
 
@@ -31,9 +32,12 @@ def _git(root):
 def status(cfg, args, result):
     executor = Executor(cfg)
     data = result.data
-    data.update(mode="remote" if cfg.is_remote else "local",
-                config_path=str(cfg.config_path) if cfg.config_path else None,
-                remote_workspace=cfg.remote_workspace_dir, git=_git(cfg.repo_root))
+    data.update(
+        mode="remote" if cfg.is_remote else "local",
+        config_path=str(cfg.config_path) if cfg.config_path else None,
+        remote_workspace=cfg.remote_workspace_dir,
+        git=_git(cfg.repo_root),
+    )
     if cfg.is_remote:
         source = Path(_probe.__file__).read_text(encoding="utf-8")
         command = shlex.join(["python3", "-c", source, cfg.remote_workspace_dir])
@@ -43,7 +47,11 @@ def status(cfg, args, result):
                 raise RuntimeError(probe.stderr.strip() or "Remote inventory failed")
             data.update(json.loads(probe.stdout))
         except (ValueError, OSError, RuntimeError, subprocess.TimeoutExpired) as exc:
-            error = str(exc) if not isinstance(exc, subprocess.TimeoutExpired) else "Host probe timed out"
+            error = (
+                str(exc)
+                if not isinstance(exc, subprocess.TimeoutExpired)
+                else "Host probe timed out"
+            )
             for key in ("gpu", "compute_processes", "toolchain"):
                 data[key] = {"error": error}
             result.ok, result.error = False, error
@@ -55,15 +63,26 @@ def status(cfg, args, result):
             del lease["record"]["token"]
         data["lease"] = lease
     except (GpuLockError, OSError, subprocess.TimeoutExpired) as exc:
-        error = "Lease inspection timed out" if isinstance(exc, subprocess.TimeoutExpired) else str(exc)
+        error = (
+            "Lease inspection timed out" if isinstance(exc, subprocess.TimeoutExpired) else str(exc)
+        )
         data["lease"] = {"error": error}
         result.ok, result.error = False, result.error or error
 
 
 def _engine_script(cfg, clean):
     build = cfg.build
-    flags = ["cmake", "-S", "engine", "-B", "engine/build", "-G", "Ninja",
-             f"-DCMAKE_BUILD_TYPE={build.build_type}", f"-DCMAKE_CUDA_ARCHITECTURES={build.cuda_arch}"]
+    flags = [
+        "cmake",
+        "-S",
+        "engine",
+        "-B",
+        "engine/build",
+        "-G",
+        "Ninja",
+        f"-DCMAKE_BUILD_TYPE={build.build_type}",
+        f"-DCMAKE_CUDA_ARCHITECTURES={build.cuda_arch}",
+    ]
     configure = shlex.join(flags)
     for lang in ("C", "CXX", "CUDA"):
         configure += f' "-DCMAKE_{lang}_COMPILER_LAUNCHER=$launcher"'
@@ -78,11 +97,11 @@ def _engine_script(cfg, clean):
         'if [ "$use_ccache" = 1 ] && command -v ccache >/dev/null; then launcher=ccache; fi',
         f"linker={shlex.quote(build.linker)}",
         'if [ "$linker" = auto ]; then',
-        '    if command -v mold >/dev/null; then linker=mold',
-        '    elif command -v ld.lld >/dev/null; then linker=lld',
-        '    else linker=system',
-        '    fi',
-        'fi',
+        "    if command -v mold >/dev/null; then linker=mold",
+        "    elif command -v ld.lld >/dev/null; then linker=lld",
+        "    else linker=system",
+        "    fi",
+        "fi",
         'link_flags=""',
         'if [ "$linker" != system ] && [ -n "$linker" ]; then link_flags="-fuse-ld=$linker"; fi',
     ]
@@ -104,14 +123,20 @@ def _server_script(cfg, clean):
 
 def _artifact_sizes(executor, target):
     if target == "engine":
-        paths = ["engine/build/" + name for name in
-                 ("libengine.a", "libengine.so", "forward.so", "forge-host")]
+        paths = [
+            "engine/build/" + name
+            for name in ("libengine.a", "libengine.so", "forward.so", "forge-host")
+        ]
         select = f"paths = {paths!r}"
     else:
-        select = ('paths = [Path("server/target") / os.environ.get("CARGO_BUILD_TARGET", "") '
-                  '/ "release/server"]')
-    source = ("import json, os\nfrom pathlib import Path\n" + select + "\n"
-              "print(json.dumps({str(p): p.stat().st_size for p in map(Path, paths) if p.is_file()}))")
+        select = (
+            'paths = [Path("server/target") / os.environ.get("CARGO_BUILD_TARGET", "") '
+            '/ "release/server"]'
+        )
+    source = (
+        "import json, os\nfrom pathlib import Path\n" + select + "\n"
+        "print(json.dumps({str(p): p.stat().st_size for p in map(Path, paths) if p.is_file()}))"
+    )
     out = executor.run(shlex.join(["python3", "-c", source]), check=True)
     return json.loads(out.stdout)
 
@@ -122,19 +147,29 @@ def build(cfg, args, result):
         result.data["sync"] = {"skipped": True}
     else:
         sync = executor.sync()
-        result.data["sync"] = {"skipped": sync.skipped, "duration_ms": sync.duration_ms,
-                               "transferred_files": sync.transferred_files}
+        result.data["sync"] = {
+            "skipped": sync.skipped,
+            "duration_ms": sync.duration_ms,
+            "transferred_files": sync.transferred_files,
+        }
     targets = result.data["targets"] = {}
-    for target, manifest, script in (("engine", "engine/CMakeLists.txt", _engine_script),
-                                     ("server", "server/Cargo.toml", _server_script)):
+    for target, manifest, script in (
+        ("engine", "engine/CMakeLists.txt", _engine_script),
+        ("server", "server/Cargo.toml", _server_script),
+    ):
         if args.target not in ("all", target):
             continue
-        check = f'test -f {manifest} || {{ echo "Missing {manifest}. Add the {target} build manifest first." >&2; exit 1; }}'
+        check = (
+            f"test -f {manifest} || "
+            f'{{ echo "Missing {manifest}. Add the {target} build manifest first." >&2; exit 1; }}'
+        )
         out = executor.run("set -e\n" + check + "\n" + script(cfg, args.clean), stream_stderr=True)
         targets[target] = {"duration_ms": out.duration_ms, "returncode": out.returncode}
         if out.returncode:
             result.ok = False
-            result.error = out.stderr.strip()[-2000:] or f"{target} build failed (exit {out.returncode})"
+            result.error = (
+                out.stderr.strip()[-2000:] or f"{target} build failed (exit {out.returncode})"
+            )
             return
         targets[target]["artifacts_bytes"] = _artifact_sizes(executor, target)
 
@@ -142,10 +177,99 @@ def build(cfg, args, result):
 def _check_step(executor, checks, name, command):
     log(f"Running {name}")
     out = executor.run(command, stream_stderr=True)
-    checks[name] = {"status": "failed" if out.returncode else "passed",
-                    "returncode": out.returncode, "duration_ms": out.duration_ms}
+    checks[name] = {
+        "status": "failed" if out.returncode else "passed",
+        "returncode": out.returncode,
+        "duration_ms": out.duration_ms,
+    }
     if out.returncode:
         checks[name]["error"] = out.stderr.strip()[-2000:] or f"exit {out.returncode}"
+
+
+def _ruff_runner():
+    if shutil.which("uv"):
+        return "uv run ruff"
+    if shutil.which("ruff"):
+        return "ruff"
+    return None
+
+
+def _has_python_tools(root):
+    tools_dir = root / "tools"
+    return tools_dir.is_dir() and any(tools_dir.rglob("*.py"))
+
+
+def _aggregate_tool_checks(tools, empty_reason):
+    errors = [
+        f"{name}: {step['error']}" for name, step in tools.items() if step["status"] == "failed"
+    ]
+    if errors:
+        return {"status": "failed", "errors": errors, "tools": tools}
+    if all(step["status"] == "skipped" for step in tools.values()):
+        return {"status": "skipped", "reason": empty_reason, "tools": tools}
+    return {"status": "passed", "tools": tools}
+
+
+def _check_format(root, executor):
+    suffixes = {".h", ".hpp", ".c", ".cc", ".cpp", ".cu", ".cuh"}
+    engine = root / "engine"
+    sources = []
+    for directory, children, filenames in os.walk(engine):
+        directory = Path(directory)
+        if directory == engine:
+            children[:] = [
+                name for name in children if name != "third_party" and not name.startswith("build")
+            ]
+        sources.extend(
+            str((directory / name).relative_to(root))
+            for name in filenames
+            if Path(name).suffix in suffixes
+        )
+
+    tools = {}
+    if not sources:
+        tools["clang-format"] = {"status": "skipped", "reason": "no engine sources"}
+    elif not shutil.which("clang-format"):
+        tools["clang-format"] = {"status": "failed", "error": "clang-format is missing"}
+    else:
+        command = shlex.join(["clang-format", "--dry-run", "--Werror", *sorted(sources)])
+        _check_step(executor, tools, "clang-format", command)
+
+    if (root / "server/Cargo.toml").is_file():
+        _check_step(executor, tools, "cargo fmt", "cd server && cargo fmt --check")
+    else:
+        tools["cargo fmt"] = {"status": "skipped", "reason": "server/Cargo.toml is missing"}
+
+    if not _has_python_tools(root):
+        tools["ruff format"] = {"status": "skipped", "reason": "no python tool sources"}
+    elif not (ruff := _ruff_runner()):
+        tools["ruff format"] = {"status": "failed", "error": "ruff is missing"}
+    else:
+        _check_step(executor, tools, "ruff format", f"{ruff} format --check tools")
+
+    return _aggregate_tool_checks(tools, "no engine, server, or python tool sources")
+
+
+def _check_lint(root, executor):
+    tools = {}
+    if (root / "server/Cargo.toml").is_file():
+        _check_step(
+            executor,
+            tools,
+            "cargo clippy",
+            "cd server && cargo clippy --all-targets -- -D warnings",
+        )
+    else:
+        tools["cargo clippy"] = {"status": "skipped", "reason": "server/Cargo.toml is missing"}
+
+    if not _has_python_tools(root):
+        tools["ruff check"] = {"status": "skipped", "reason": "no python tool sources"}
+    elif not (ruff := _ruff_runner()):
+        tools["ruff check"] = {"status": "failed", "error": "ruff is missing"}
+    else:
+        _check_step(executor, tools, "ruff check", f"{ruff} check tools")
+
+    return _aggregate_tool_checks(tools, "no server or python tool sources")
 
 
 def _check_local(cfg, checks):
@@ -157,6 +281,8 @@ def _check_local(cfg, checks):
         _check_step(executor, checks, "cargo", "cd server && cargo test")
     else:
         checks["cargo"] = {"status": "skipped", "reason": "server/Cargo.toml is missing"}
+    checks["format"] = _check_format(cfg.repo_root, executor)
+    checks["lint"] = _check_lint(cfg.repo_root, executor)
     errors = []
     for name in ("dev", "forge", "bench", "weights"):
         path = cfg.repo_root / "bin" / name
@@ -177,16 +303,22 @@ def check(cfg, args, result):
     else:
         executor = Executor(cfg)
         executor.sync()
+        server_bin = "server/target/${CARGO_BUILD_TARGET:+$CARGO_BUILD_TARGET/}release/server"
         with GpuLeaseManager(cfg, executor).hold("dev-check"):
             for name, path, test, run in (
-                ("ctest", "engine/build/CTestTestfile.cmake", "-f",
-                 "ctest --test-dir engine/build --output-on-failure --no-tests=error"),
+                (
+                    "ctest",
+                    "engine/build/CTestTestfile.cmake",
+                    "-f",
+                    "ctest --test-dir engine/build --output-on-failure --no-tests=error",
+                ),
                 ("forge-host", "engine/build/forge-host", "-x", "engine/build/forge-host --smoke"),
-                ("server", 'server/target/${CARGO_BUILD_TARGET:+$CARGO_BUILD_TARGET/}release/server', "-x",
-                 '"server/target/${CARGO_BUILD_TARGET:+$CARGO_BUILD_TARGET/}release/server" --smoke'),
+                ("server", server_bin, "-x", f'"{server_bin}" --smoke'),
             ):
-                command = (f'if test {test} "{path}"; then {run}; else '
-                           f'echo "Missing {path}. Run dev build first." >&2; exit 1; fi')
+                command = (
+                    f'if test {test} "{path}"; then {run}; else '
+                    f'echo "Missing {path}. Run dev build first." >&2; exit 1; fi'
+                )
                 _check_step(executor, checks, name, command)
     failed = [name for name, detail in checks.items() if detail["status"] == "failed"]
     if failed:
@@ -194,13 +326,17 @@ def check(cfg, args, result):
 
 
 def serve(cfg, args, result):
-    result.data.update(action=args.action, status="unavailable",
-                       message="The server runtime arrives in Phase 2.")
+    result.data.update(
+        action=args.action, status="unavailable", message="The server runtime arrives in Phase 2."
+    )
 
 
 def _status_lines(data):
-    lines = [f"mode: {data['mode']}", f"config: {data['config_path']}",
-             f"remote workspace: {data['remote_workspace']}"]
+    lines = [
+        f"mode: {data['mode']}",
+        f"config: {data['config_path']}",
+        f"remote workspace: {data['remote_workspace']}",
+    ]
     git = data["git"]
     if "error" in git:
         lines.append(f"git: {git['error']}")
@@ -212,8 +348,10 @@ def _status_lines(data):
     if not gpu.get("rows"):
         lines.append("GPU: " + gpu.get("error", "none reported"))
     for row in gpu.get("rows", []):
-        lines.append(f"GPU {row['index']}: {row['name']}, {row['memory.used']}/{row['memory.total']} MiB, "
-                     f"{row['utilization.gpu']}% utilization, {row['temperature.gpu']} °C")
+        lines.append(
+            f"GPU {row['index']}: {row['name']}, {row['memory.used']}/{row['memory.total']} MiB, "
+            f"{row['utilization.gpu']}% utilization, {row['temperature.gpu']} °C"
+        )
     processes = data["compute_processes"]
     if not processes.get("rows"):
         lines.append("compute processes: " + processes.get("error", "none"))

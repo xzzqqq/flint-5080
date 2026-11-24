@@ -1,4 +1,5 @@
 import json
+import shlex
 from pathlib import Path
 
 import pytest
@@ -37,14 +38,22 @@ def executor(monkeypatch):
     return fake
 
 
-@pytest.mark.parametrize("argv", [["--json", "status"], ["status", "--json"],
-                                  ["check", "--local", "--json"], ["serve", "logs", "--json"]])
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--json", "status"],
+        ["status", "--json"],
+        ["check", "--local", "--json"],
+        ["serve", "logs", "--json"],
+    ],
+)
 def test_json_placement(argv):
     assert cli.build_parser().parse_args(argv).json
 
 
-@pytest.mark.parametrize("argv", [["check"], ["check", "--gpu", "--local"],
-                                  ["build", "--all", "--engine"]])
+@pytest.mark.parametrize(
+    "argv", [["check"], ["check", "--gpu", "--local"], ["build", "--all", "--engine"]]
+)
 def test_mutually_exclusive(argv):
     with pytest.raises(SystemExit):
         cli.build_parser().parse_args(argv)
@@ -57,10 +66,17 @@ def test_build_commands(cfg, entry, executor, capsys):
     result = json.loads(capsys.readouterr().out)
     assert executor.syncs == 1 and result["data"]["sync"]["transferred_files"] == 3
     engine, server = [cmd for cmd, kwargs in executor.runs if kwargs.get("stream_stderr")]
-    for part in ("-G Ninja", "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_CUDA_ARCHITECTURES=120a",
-                 "command -v mold", "command -v ld.lld", "command -v ccache",
-                 "-DCMAKE_CUDA_COMPILER_LAUNCHER=$launcher",
-                 "rm -rf engine/build", "cmake --build engine/build --parallel 4"):
+    for part in (
+        "-G Ninja",
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DCMAKE_CUDA_ARCHITECTURES=120a",
+        "command -v mold",
+        "command -v ld.lld",
+        "command -v ccache",
+        "-DCMAKE_CUDA_COMPILER_LAUNCHER=$launcher",
+        "rm -rf engine/build",
+        "cmake --build engine/build --parallel 4",
+    ):
         assert part in engine
     assert "FLINT_ENGINE_BUILD_DIR=" in server and "cd server" in server
     assert "cargo clean" in server and "cargo build --release --features link-engine" in server
@@ -77,7 +93,9 @@ def test_build_no_sync(cfg, entry, executor, capsys, target):
     assert set(json.loads(capsys.readouterr().out)["data"]["targets"]) == {target}
 
 
-@pytest.mark.parametrize("target,manifest", [("engine", "engine/CMakeLists.txt"), ("server", "server/Cargo.toml")])
+@pytest.mark.parametrize(
+    "target,manifest", [("engine", "engine/CMakeLists.txt"), ("server", "server/Cargo.toml")]
+)
 def test_missing_manifest(entry, capsys, target, manifest):
     assert entry(["build", "--" + target, "--json"]) == 1
     assert manifest in json.loads(capsys.readouterr().out)["error"]
@@ -90,6 +108,7 @@ def test_status(cfg, entry, capsys, monkeypatch):
         if args[0] == "nvidia-smi":
             return "GPU-1, 123, server, 50", None
         return None, "missing tool"
+
     monkeypatch.setattr(_probe, "query", query)
     assert entry(["--json", "status"]) == 0
     data = json.loads(capsys.readouterr().out)["data"]
@@ -105,7 +124,9 @@ def test_status(cfg, entry, capsys, monkeypatch):
 
 def test_status_unreachable(cfg, entry, monkeypatch, capsys):
     cfg.remote.enabled = True
-    monkeypatch.setattr(commands.Executor, "run", lambda *a, **kw: CommandResult(255, "", "offline", 1, []))
+    monkeypatch.setattr(
+        commands.Executor, "run", lambda *a, **kw: CommandResult(255, "", "offline", 1, [])
+    )
     assert entry(["status", "--json"]) == 1
     data = json.loads(capsys.readouterr().out)["data"]
     for key in ("gpu", "lease", "compute_processes", "toolchain"):
@@ -127,8 +148,82 @@ def test_local_without_config(repo, executor, capsys, monkeypatch, uv, cargo):
     checks = result["data"]["checks"]
     assert checks["hygiene"]["status"] == "passed"
     assert checks["cargo"]["status"] == ("passed" if cargo else "skipped")
+    assert checks["format"]["status"] == ("passed" if cargo else "skipped")
+    assert checks["format"]["tools"]["clang-format"]["status"] == "skipped"
+    assert checks["format"]["tools"]["ruff format"]["status"] == "skipped"
+    assert checks["lint"]["status"] == ("passed" if cargo else "skipped")
+    assert checks["lint"]["tools"]["ruff check"]["status"] == "skipped"
     if cargo:
         assert "cargo test" in executor.runs[1][0]
+        assert any("cargo clippy" in cmd for cmd, _ in executor.runs)
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    ["passed", "clang-format", "missing", "cargo fmt", "ruff format", "ruff check", "cargo clippy"],
+)
+def test_local_format_and_lint_checks(repo, entry, executor, capsys, monkeypatch, outcome):
+    names = [
+        "engine/src/op with spaces.cu",
+        "engine/include/api.h",
+        "engine/src/ignore.md",
+        "engine/build/obj.c",
+        "engine/build-debug/nested/generated.cuh",
+        "engine/third_party/lib/vendored.hpp",
+        "server/Cargo.toml",
+        "tools/sample.py",
+    ]
+    for name in names:
+        path = repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.touch()
+
+    def fake_which(tool):
+        if outcome == "missing":
+            return None
+        if tool in ("clang-format", "uv"):
+            return f"/bin/{tool}"
+        return None
+
+    monkeypatch.setattr(commands.shutil, "which", fake_which)
+    invoked = []
+
+    def run(command, **kwargs):
+        invoked.append(command)
+        if (
+            (outcome == "clang-format" and command.startswith("clang-format"))
+            or (outcome == "cargo fmt" and "cargo fmt" in command)
+            or (outcome == "ruff format" and "ruff format" in command)
+            or (outcome == "ruff check" and "ruff check" in command)
+            or (outcome == "cargo clippy" and "cargo clippy" in command)
+        ):
+            return CommandResult(1, "", "style violation", 1, [])
+        return CommandResult(0, "", "", 1, [])
+
+    executor.run = run
+    assert entry(["check", "--local", "--json"]) == int(outcome != "passed")
+    checks = json.loads(capsys.readouterr().out)["data"]["checks"]
+    fmt = checks["format"]
+    lint = checks["lint"]
+    fmt_failed = outcome in ("clang-format", "missing", "cargo fmt", "ruff format")
+    lint_failed = outcome in ("missing", "ruff check", "cargo clippy")
+    assert fmt["status"] == ("failed" if fmt_failed else "passed")
+    assert lint["status"] == ("failed" if lint_failed else "passed")
+    assert "cd server && cargo fmt --check" in invoked
+    assert "cd server && cargo clippy --all-targets -- -D warnings" in invoked
+    clang = [shlex.split(command) for command in invoked if command.startswith("clang-format")]
+    if outcome == "missing":
+        assert not clang and "missing" in fmt["tools"]["clang-format"]["error"]
+        assert "missing" in fmt["tools"]["ruff format"]["error"]
+        assert "missing" in lint["tools"]["ruff check"]["error"]
+    else:
+        assert clang == [["clang-format", "--dry-run", "--Werror", *sorted(names[:2])]]
+        assert "uv run ruff format --check tools" in invoked
+        assert "uv run ruff check tools" in invoked
+    if outcome in ("clang-format", "cargo fmt", "ruff format"):
+        assert fmt["tools"][outcome]["error"] == "style violation"
+    if outcome in ("ruff check", "cargo clippy"):
+        assert lint["tools"][outcome]["error"] == "style violation"
 
 
 def test_local_bad_hygiene(repo, entry, executor, capsys):
@@ -180,7 +275,9 @@ def test_gpu_steps_run_under_lease(cfg, entry, executor, capsys, interrupted):
         assert result["error"] == "interrupted transport"
     else:
         assert len(runs) == 3
-        for cmd, expected in zip(runs, ["ctest --test-dir", "forge-host --smoke", 'server" --smoke']):
+        for cmd, expected in zip(
+            runs, ["ctest --test-dir", "forge-host --smoke", 'server" --smoke'], strict=True
+        ):
             assert expected in cmd
 
 

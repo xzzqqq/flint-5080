@@ -1,1 +1,1 @@
-"""`weights` CLI: offline safetensors inspection, repacking, HF golden fixtures, and KLD evaluation."""
+"""`weights` CLI: offline safetensors inspection, repacking, golden fixtures, and KLD eval."""

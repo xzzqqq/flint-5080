@@ -19,12 +19,13 @@ def query(args):
 
 
 def smi(table, columns):
-    output, error = query(["nvidia-smi", f"--query-{table}=" + ",".join(columns),
-                           "--format=csv,noheader,nounits"])
+    output, error = query(
+        ["nvidia-smi", f"--query-{table}=" + ",".join(columns), "--format=csv,noheader,nounits"]
+    )
     if error:
         return {"error": error}
     rows = csv.reader(io.StringIO(output), skipinitialspace=True)
-    return {"rows": [dict(zip(columns, row)) for row in rows]}
+    return {"rows": [dict(zip(columns, row, strict=False)) for row in rows]}
 
 
 def inventory(workspace):
@@ -36,9 +37,21 @@ def inventory(workspace):
         versions[tool] = {"error": error} if error else {"version": version}
     return {
         "workspace_exists": Path(workspace).is_dir(),
-        "gpu": smi("gpu", ["index", "uuid", "name", "temperature.gpu", "utilization.gpu",
-                           "memory.used", "memory.total"]),
-        "compute_processes": smi("compute-apps", ["gpu_uuid", "pid", "process_name", "used_memory"]),
+        "gpu": smi(
+            "gpu",
+            [
+                "index",
+                "uuid",
+                "name",
+                "temperature.gpu",
+                "utilization.gpu",
+                "memory.used",
+                "memory.total",
+            ],
+        ),
+        "compute_processes": smi(
+            "compute-apps", ["gpu_uuid", "pid", "process_name", "used_memory"]
+        ),
         "toolchain": versions,
     }
 

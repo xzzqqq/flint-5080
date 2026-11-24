@@ -32,18 +32,53 @@ class SyncResult:
 
 
 RSYNC_EXCLUDES = (
-    ".git/", ".git", ".dev.toml", ".env", ".env.*", "build/", "engine/build*/", "server/target/",
-    "target/", ".forge/", ".runs/", ".scratch/", "models/", "*.safetensors", "*.gguf",
-    "*.nsys-rep*", "*.ncu-rep", "*.qdrep", "__pycache__/", "*.pyc", ".pytest_cache/",
-    ".venv/", ".claude/", ".codex/", ".qwen/", ".DS_Store", "*.log", "*.log.err",
+    ".git/",
+    ".git",
+    ".dev.toml",
+    ".env",
+    ".env.*",
+    "build/",
+    "engine/build*/",
+    "server/target/",
+    "target/",
+    ".forge/",
+    ".runs/",
+    ".scratch/",
+    "models/",
+    "*.safetensors",
+    "*.gguf",
+    "*.nsys-rep*",
+    "*.ncu-rep",
+    "*.qdrep",
+    "__pycache__/",
+    "*.pyc",
+    ".pytest_cache/",
+    ".ruff_cache/",
+    ".venv/",
+    ".claude/",
+    ".codex/",
+    ".qwen/",
+    ".DS_Store",
+    "*.log",
+    "*.log.err",
     "workloads/private/",
 )
 
 
 def ssh_base_args(cfg: DevConfig) -> list[str]:
-    args = ["ssh", "-o", "ControlMaster=auto", "-o", "ControlPersist=60",
-            "-o", "ControlPath=/tmp/flint-ssh-%C", "-o", "BatchMode=yes",
-            "-o", "ConnectTimeout=10"]
+    args = [
+        "ssh",
+        "-o",
+        "ControlMaster=auto",
+        "-o",
+        "ControlPersist=60",
+        "-o",
+        "ControlPath=/tmp/flint-ssh-%C",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=10",
+    ]
     if cfg.remote.port > 0:
         args.extend(["-p", str(cfg.remote.port)])
     return args
@@ -55,14 +90,19 @@ def build_rsync_args(cfg: DevConfig, *, dry_run: bool = False) -> list[str]:
         args.append("--dry-run")
     for pattern in RSYNC_EXCLUDES:
         args.extend(["--exclude", pattern])
-    return args + ["-e", shlex.join(ssh_base_args(cfg)), str(cfg.repo_root) + "/",
-                   f"{cfg.remote.host}:{cfg.remote_workspace_dir}/"]
+    return args + [
+        "-e",
+        shlex.join(ssh_base_args(cfg)),
+        str(cfg.repo_root) + "/",
+        f"{cfg.remote.host}:{cfg.remote_workspace_dir}/",
+    ]
 
 
 def _capture(cmd: list[str], *, stream: bool, timeout: int | None) -> CommandResult:
     start = time.monotonic()
-    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          start_new_session=True) as proc:
+    with subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True
+    ) as proc:
         try:
             if stream:
                 chunks = [[], []]
@@ -119,17 +159,34 @@ class Executor:
     def _args(self, shell_cmd: str, cwd: str | None, *, tty: bool = False) -> list[str]:
         cfg = self.cfg
         if not cfg.is_remote:
-            return ["bash", "-c", f"cd -- {shlex.quote(cwd or str(cfg.repo_root))} || exit 1\n{shell_cmd}"]
+            return [
+                "bash",
+                "-c",
+                f"cd -- {shlex.quote(cwd or str(cfg.repo_root))} || exit 1\n{shell_cmd}",
+            ]
         path = _shell_path(cwd or cfg.remote_workspace_dir)
         script = f"{cfg.remote_env_prefix()}\ncd -- {path} || exit 1\n{shell_cmd}"
-        return [*ssh_base_args(cfg), *(["-t"] if tty else []), cfg.remote.host,
-                "bash -lc " + shlex.quote(script)]
+        return [
+            *ssh_base_args(cfg),
+            *(["-t"] if tty else []),
+            cfg.remote.host,
+            "bash -lc " + shlex.quote(script),
+        ]
 
-    def run(self, shell_cmd: str, *, cwd: str | None = None, check: bool = False,
-            stream_stderr: bool = False, timeout: int | None = None) -> CommandResult:
+    def run(
+        self,
+        shell_cmd: str,
+        *,
+        cwd: str | None = None,
+        check: bool = False,
+        stream_stderr: bool = False,
+        timeout: int | None = None,
+    ) -> CommandResult:
         result = _capture(self._args(shell_cmd, cwd), stream=stream_stderr, timeout=timeout)
         if check and result.returncode:
-            raise RuntimeError(result.stderr.strip() or f"Command failed (exit {result.returncode})")
+            raise RuntimeError(
+                result.stderr.strip() or f"Command failed (exit {result.returncode})"
+            )
         return result
 
     def interactive_ssh(self, extra_cmd: list[str] | None = None, *, stdout=None) -> int:

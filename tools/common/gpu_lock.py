@@ -9,8 +9,16 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from . import _lease
-from ._lease import (GpuLockBusyError, GpuLockError, LeaseRecord, LockStatus, acquire_local,
-                     inspect_local, is_pid_alive, release_local, renew_local)
+from ._lease import (
+    GpuLockBusyError,
+    GpuLockError,
+    LeaseRecord,
+    LockStatus,
+    acquire_local,
+    inspect_local,
+    release_local,
+    renew_local,
+)
 from .config import DevConfig
 from .remote import Executor
 
@@ -23,8 +31,12 @@ class GpuLeaseManager:
     def _call(self, operation, **kwargs):
         kwargs["lock_file"] = self.cfg.shared.lock_file
         if not self.cfg.is_remote:
-            fn = {"inspect": inspect_local, "acquire": acquire_local,
-                  "renew": renew_local, "release": release_local}[operation]
+            fn = {
+                "inspect": inspect_local,
+                "acquire": acquire_local,
+                "renew": renew_local,
+                "release": release_local,
+            }[operation]
             return fn(**kwargs)
 
         # cwd="." works even when rsync has never created the workspace.
@@ -51,11 +63,19 @@ class GpuLeaseManager:
     def inspect(self) -> LockStatus:
         return self._call("inspect")
 
-    def acquire(self, mode: str, ttl_sec: int | None = None, force: bool = False,
-                pid: int = 0) -> LeaseRecord:
+    def acquire(
+        self, mode: str, ttl_sec: int | None = None, force: bool = False, pid: int = 0
+    ) -> LeaseRecord:
         ttl = self.cfg.gpu.lease_ttl_sec if ttl_sec is None else ttl_sec
-        return self._call("acquire", mode=mode, ttl_sec=ttl, force=force, pid=pid,
-                          owner=getpass.getuser(), workspace=self.cfg.effective_workspace_name)
+        return self._call(
+            "acquire",
+            mode=mode,
+            ttl_sec=ttl,
+            force=force,
+            pid=pid,
+            owner=getpass.getuser(),
+            workspace=self.cfg.effective_workspace_name,
+        )
 
     def renew(self, token: str, ttl_sec: int | None = None) -> LeaseRecord:
         ttl = self.cfg.gpu.lease_ttl_sec if ttl_sec is None else ttl_sec

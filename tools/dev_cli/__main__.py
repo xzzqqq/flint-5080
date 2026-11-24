@@ -10,11 +10,14 @@ from pathlib import Path
 from tools.common.config import find_repo_root, load_config
 from tools.common.output import RunResult, archive_run, emit_result
 from tools.common.remote import Executor
+
 from . import commands
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="dev", description="Manage the Flint-5080 development workspace.")
+    parser = argparse.ArgumentParser(
+        prog="dev", description="Manage the Flint-5080 development workspace."
+    )
     json_help = "Emit machine-readable JSON on stdout."
     parser.add_argument("--json", action="store_true", help=json_help)
     subs = parser.add_subparsers(dest="command", required=True)
@@ -31,7 +34,9 @@ def build_parser() -> argparse.ArgumentParser:
         targets.add_argument("--" + name, dest="target", action="store_const", const=name)
     build.set_defaults(target="all")
     build.add_argument("--clean", action="store_true", help="Rebuild targets from a clean state.")
-    build.add_argument("--no-sync", action="store_true", help="Use sources already on the build host.")
+    build.add_argument(
+        "--no-sync", action="store_true", help="Use sources already on the build host."
+    )
     check = sub("check", "Run local tests or the GPU smoke checks.")
     modes = check.add_mutually_exclusive_group(required=True)
     modes.add_argument("--local", action="store_true")
@@ -67,15 +72,21 @@ def main(argv: list[str] | None = None) -> int:
                 archive_run(root, result)
                 return code
         else:
-            handler = {"build": commands.build, "check": commands.check, "status": commands.status,
-                       "serve": commands.serve}[args.command]
+            handler = {
+                "build": commands.build,
+                "check": commands.check,
+                "status": commands.status,
+                "serve": commands.serve,
+            }[args.command]
             handler(cfg, args, result)
     except subprocess.TimeoutExpired:
         result.ok, result.error = False, "Command timed out"
     except (OSError, RuntimeError, ValueError) as exc:
         result.ok, result.error = False, str(exc)
     result.duration_ms = (time.monotonic() - start) * 1000
-    return emit_result(result, json_mode=args.json, human_formatter=commands.human_format, repo_root=root)
+    return emit_result(
+        result, json_mode=args.json, human_formatter=commands.human_format, repo_root=root
+    )
 
 
 if __name__ == "__main__":

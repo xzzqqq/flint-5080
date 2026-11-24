@@ -10,8 +10,10 @@ from tools.common.output import RunResult, emit_result, log
 def test_json_contract(repo, capsys, ok, code):
     result = RunResult("dev/check --local", ok, {"test": "running"}, error=None if ok else "failed")
     log("build log")
-    assert emit_result(result, json_mode=True, human_formatter=lambda _: pytest.fail(),
-                       repo_root=repo) == code
+    assert (
+        emit_result(result, json_mode=True, human_formatter=lambda _: pytest.fail(), repo_root=repo)
+        == code
+    )
     std = capsys.readouterr()
     data = json.loads(std.out)
     assert std.err == "build log\n" and "build log" not in std.out
@@ -23,8 +25,16 @@ def test_json_contract(repo, capsys, ok, code):
 
 def test_human(repo, capsys):
     result = RunResult("dev status", True, {})
-    assert emit_result(result, json_mode=False, human_formatter=lambda r: r.command,
-                       archive=False, repo_root=repo) == 0
+    assert (
+        emit_result(
+            result,
+            json_mode=False,
+            human_formatter=lambda r: r.command,
+            archive=False,
+            repo_root=repo,
+        )
+        == 0
+    )
     assert capsys.readouterr().out == "dev status\n" and not (repo / ".runs").exists()
 
 

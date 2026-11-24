@@ -74,7 +74,9 @@ def _inspect(path: Path) -> LockStatus:
     reason = None
     if time.time() >= record.expires_at:
         reason = "expired"
-    elif record.pid > 0 and record.hostname == socket.gethostname() and not is_pid_alive(record.pid):
+    elif (
+        record.pid > 0 and record.hostname == socket.gethostname() and not is_pid_alive(record.pid)
+    ):
         reason = "dead_pid"
     return LockStatus(reason is None, reason is not None, reason, record, str(path))
 
@@ -95,8 +97,15 @@ def inspect_local(lock_file: str | Path) -> LockStatus:
         return _inspect(path)
 
 
-def acquire_local(lock_file: str | Path, mode: str, workspace: str, ttl_sec: int,
-                  owner: str | None = None, force: bool = False, pid: int = 0) -> LeaseRecord:
+def acquire_local(
+    lock_file: str | Path,
+    mode: str,
+    workspace: str,
+    ttl_sec: int,
+    owner: str | None = None,
+    force: bool = False,
+    pid: int = 0,
+) -> LeaseRecord:
     if ttl_sec <= 0:
         raise GpuLockError("GPU lease TTL must be positive")
     with _locked(lock_file) as path:
@@ -104,8 +113,17 @@ def acquire_local(lock_file: str | Path, mode: str, workspace: str, ttl_sec: int
         if status.locked and not force:
             raise GpuLockBusyError(status.record)
         now = time.time()
-        record = LeaseRecord(uuid.uuid4().hex, owner or getpass.getuser(), workspace, mode,
-                             pid, socket.gethostname(), now, now, now + ttl_sec)
+        record = LeaseRecord(
+            uuid.uuid4().hex,
+            owner or getpass.getuser(),
+            workspace,
+            mode,
+            pid,
+            socket.gethostname(),
+            now,
+            now,
+            now + ttl_sec,
+        )
         _write(path, record)
         return record
 
@@ -140,8 +158,12 @@ if __name__ == "__main__":
     import sys
 
     operation, arguments = json.loads(sys.argv[1])
-    operations = {"inspect": inspect_local, "acquire": acquire_local,
-                  "renew": renew_local, "release": release_local}
+    operations = {
+        "inspect": inspect_local,
+        "acquire": acquire_local,
+        "renew": renew_local,
+        "release": release_local,
+    }
     try:
         result = operations[operation](**arguments)
         print(json.dumps({"result": asdict(result) if result else None}))
