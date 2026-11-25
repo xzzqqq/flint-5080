@@ -18,6 +18,7 @@ void RunFullAttention(const Gemm&, ScratchArenaView, const LayerWeightsView&,
 void RunSparseMoeBlock(const Gemm&, ScratchArenaView, const LayerWeightsView&, const void* x,
                        void* y, int tokens, float* logits = nullptr, int* ids = nullptr,
                        float* weights = nullptr);
+void RunBlockResidual(const Gemm&, ScratchArenaView, ResidualParams);
 void RunMessageGate(const Gemm&, ScratchArenaView, const ControllerWeightsView&, const float* x,
                     const float* message, float* y, int tokens);
 }  // namespace flint

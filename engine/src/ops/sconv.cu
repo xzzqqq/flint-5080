@@ -34,7 +34,7 @@ __global__ void Conv(ConvParams p, bool dynamic) {
                         : Read(p.weight, 4 * c + j, FLINT_BF16);
       sum = __fadd_rn(sum, __fmul_rn(w, window[3 - lag]));
     }
-    Write(p.y, i, (sum + x) / (dynamic ? 3.f : 2.2360679775f), p.output);
+    Write(p.y, i, (sum + x) * (dynamic ? 1.f / 3.f : 1.f / 2.2360679775f), p.output);
     a = b;
     b = d;
     d = x;

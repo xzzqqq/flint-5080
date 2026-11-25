@@ -30,8 +30,9 @@ __global__ void Route(RouterParams p) {
   }
   __syncthreads();
   if (i < 8) {
-    float total = 0;
-    for (int j = 0; j < 8; ++j) total += sigmoid[ids[j]];
+    float pair[4];
+    for (int j = 0; j < 4; ++j) pair[j] = sigmoid[ids[j]] + sigmoid[ids[j + 4]];
+    float total = (pair[0] + pair[2]) + (pair[1] + pair[3]);
     p.weights[t * 8 + i] = sigmoid[ids[i]] / (total + 1e-20f) * 8.f;
   }
 }
@@ -42,7 +43,7 @@ __global__ void Swiglu(SwigluParams p) {
   const B* x = static_cast<const B*>(p.gate_up);
   float g = __bfloat162float(x[j]), u = __bfloat162float(x[j + p.width]);
   static_cast<B*>(p.y)[i] = __float2bfloat16_rn((4.f * tanhf(g / 4.f)) * (1.f / (1.f + expf(-g))) *
-                                                (25.f * tanhf(u / 25.f)));
+                                                (25.f * tanhf(u * (1.f / 25.f))));
 }
 __global__ void Accum(AccumParams p) {
   __shared__ int slots[8];

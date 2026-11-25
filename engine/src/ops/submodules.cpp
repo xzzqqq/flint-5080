@@ -1,6 +1,7 @@
 #include "ops/submodules.h"
 
 #include <algorithm>
+#include <cmath>
 #include <stdexcept>
 #include <vector>
 
@@ -109,6 +110,23 @@ void RunSlidingAttention(const Gemm& g, ScratchArenaView w, const LayerWeightsVi
 void RunFullAttention(const Gemm& g, ScratchArenaView w, const LayerWeightsView& l,
                       const KvStateArenaView& c, AttentionBatch b) {
   Attention(g, w, l, c, b, true);
+}
+void RunBlockResidual(const Gemm& g, ScratchArenaView scratch, ResidualParams p) {
+  // Keep the two per-token FP32 matrix products in the reference orientation.
+  // Even one changed BF16 input can select a different expert later in the loop.
+  ScratchWorkspace ws(scratch);
+  int nb = p.num_blocks + 1, h = p.width, nq = p.queries;
+  auto states = ws.Take<float>(size_t(p.tokens) * nb * h);
+  auto scores = ws.Take<float>(size_t(p.tokens) * nq * nb);
+  CheckCuda(flint_residual_norm_states(p, states, g.stream()));
+  for (int t = 0; t < p.tokens; ++t)
+    g.Multiply(p.query, states + t * nb * h, scores + t * nq * nb, nq, nb, h, FLINT_F32, FLINT_F32,
+               true);
+  CheckCuda(
+      flint_residual_softmax(scores, p.tokens * nq, nb, 1.f / std::sqrt(float(h)), g.stream()));
+  for (int t = 0; t < p.tokens; ++t)
+    g.Multiply(scores + t * nq * nb, states + t * nb * h, p.y + t * nq * h, nq, h, nb, FLINT_F32,
+               FLINT_F32, false);
 }
 void RunMessageGate(const Gemm& g, ScratchArenaView w, const ControllerWeightsView& ctl,
                     const float* x, const float* msg, float* y, int t) {

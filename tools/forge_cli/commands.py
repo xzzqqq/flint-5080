@@ -125,6 +125,7 @@ def execute(cfg, args, result):
         q = dict(
             command=cmd,
             case=name,
+            step=args.step,
             input_ids=case["input_ids"],
             begin_visit=begin,
             end_visit=end,
@@ -148,7 +149,6 @@ def execute(cfg, args, result):
             q.update(nsys=args.nsys)
         elif cmd == "dump":
             q.update(
-                step=args.step,
                 with_state=args.with_state,
                 iters=1,
                 warmup=0,

@@ -140,6 +140,8 @@ typedef struct {
 int flint_exl3_decode_inner_f16(DecodeParams p, void* cuda_stream);
 int flint_wht128_scale_in(WhtParams p, void* cuda_stream);
 int flint_wht128_scale_out(WhtParams p, void* cuda_stream);
+int flint_add_residual(const float* partial, const void* bf16, void* out, int count,
+                       FlintType output, void* stream);
 int flint_cast(CastParams p, void* cuda_stream);
 int flint_embed_rmsnorm(NormParams p, void* cuda_stream);
 int flint_rmsnorm(NormParams p, void* cuda_stream);
@@ -156,6 +158,8 @@ int flint_gated_mul_sigmoid(GateMulParams p, void* cuda_stream);
 int flint_moe_router_top8(RouterParams p, void* cuda_stream);
 int flint_softcapped_swiglu(SwigluParams p, void* cuda_stream);
 int flint_moe_weighted_accum(AccumParams p, void* cuda_stream);
+int flint_residual_norm_states(ResidualParams p, float* states, void* stream);
+int flint_residual_softmax(float* scores, int rows, int states, float scale, void* stream);
 int flint_block_attn_residual(ResidualParams p, void* cuda_stream);
 int flint_message_gate_prep(PrepParams p, void* cuda_stream);
 int flint_message_gate_mix(MixParams p, void* cuda_stream);

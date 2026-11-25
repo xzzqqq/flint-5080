@@ -16,7 +16,8 @@ extern "C" cudaError_t CUDARTAPI cudaProfilerStop(void);
 #include <span>
 
 #include "forge/forward_abi.h"
-#include "ops/op_params.h"
+#include "model/inkling2_forward.h"
+#include "ops/scratch_workspace.h"
 
 struct ForwardContext {
   ForwardContext() = default;
@@ -24,6 +25,7 @@ struct ForwardContext {
   ForwardContext& operator=(const ForwardContext&) = delete;
 
   ~ForwardContext() {
+    gemm.reset();
     if (graph) cudaGraphExecDestroy(graph);
     for (auto event : marks)
       if (event) cudaEventDestroy(event);
@@ -36,6 +38,10 @@ struct ForwardContext {
     }
   }
 
+  std::unique_ptr<flint::Gemm> gemm;
+  ScratchArenaView activations{};
+  int* next_token{};
+  std::array<VisitPlanEntry, 48> plan{};
   const ModelWeightsView* weights{};
   const KvStateArenaView* kv{};
   const ScratchArenaView* scratch{};
@@ -99,6 +105,10 @@ ForwardContext* flint_forward_create(const ModelWeightsView* weights, const KvSt
   if (cudaEventCreate(&context->stop) != cudaSuccess) {
     return nullptr;
   }
+  if (scratch) {
+    for (auto& mark : context->marks)
+      if (cudaEventCreate(&mark) != cudaSuccess) return nullptr;
+  }
   context->weights = weights;
   context->kv = kv;
   context->scratch = scratch;
@@ -106,6 +116,20 @@ ForwardContext* flint_forward_create(const ModelWeightsView* weights, const KvSt
       cudaStreamCreateWithFlags(&context->owned_stream, cudaStreamNonBlocking) != cudaSuccess)
     return nullptr;
   context->stream = stream ? static_cast<cudaStream_t>(stream) : context->owned_stream;
+  if (weights) {
+    try {
+      if (!kv || !scratch) return nullptr;
+      context->plan = flint::BuildVisitPlan(weights->config);
+      flint::ops_detail::ScratchWorkspace ws(*scratch);
+      constexpr size_t bytes = 4 << 20;
+      auto workspace = ws.Take<char>(bytes);
+      context->next_token = ws.Take<int>(1);
+      context->activations = ws.rest;
+      context->gemm = std::make_unique<flint::Gemm>(context->stream, workspace, bytes);
+    } catch (const std::exception&) {
+      return nullptr;
+    }
+  }
   return context.release();
 }
 
@@ -159,8 +183,8 @@ void Execute(ForwardContext& c, const ForwardRunSpec& s, const ForwardOptions& o
     }
   };
   StubParams p{};
-  p.width = c.weights ? c.weights->config.hidden_size : 2304;
-  p.vocab = c.weights ? c.weights->config.vocab_size : 201024;
+  p.width = 2304;
+  p.vocab = 201024;
   p.count = s.seq_len * p.width;
   p.position = s.pos_offset;
   p.ids = s.d_input_ids;
@@ -177,7 +201,6 @@ void Execute(ForwardContext& c, const ForwardRunSpec& s, const ForwardOptions& o
   }
   mark();
   if (s.run_embed) {
-    p.weight = c.weights ? static_cast<const unsigned short*>(c.weights->embed_weight) : nullptr;
     Require(flint_stub_embed(p, c.stream));
     p.input = p.output;
     stage("embed", 972288);
@@ -187,9 +210,6 @@ void Execute(ForwardContext& c, const ForwardRunSpec& s, const ForwardOptions& o
   }
   for (unsigned v = s.begin_visit; v < s.end_visit; ++v) {
     p.visit = v;
-    unsigned physical = v < 6 ? v : v < 42 ? 6 + (v - 6) % 12 : v - 24;
-    p.weight = c.weights ? static_cast<const unsigned short*>(c.weights->layers[physical].attn_norm)
-                         : nullptr;
     if (v + 1 == s.end_visit) p.output = out;
     Require(flint_stub_visit(p, c.stream));
     p.input = p.output;
@@ -199,7 +219,6 @@ void Execute(ForwardContext& c, const ForwardRunSpec& s, const ForwardOptions& o
   }
   if (s.run_lm_head) {
     p.input = out;
-    if (c.weights) p.vocab = c.weights->config.unpadded_vocab_size;
     p.logits = o.return_logits ? s.d_logits_out : nullptr;
     p.next = s.d_next_token;
     Require(flint_stub_head(p, c.stream));
@@ -232,26 +251,26 @@ void PrepareGraph(ForwardContext& c, const ForwardRunSpec& s, const ForwardOptio
 }
 }  // namespace
 
-int32_t flint_forward_run_layers(ForwardContext* c, const ForwardRunSpec* s,
-                                 const ForwardOptions* o, ForwardRunResult* r) {
+int32_t flint_forward_run_layers_capture(ForwardContext* c, const ForwardRunSpec* s,
+                                         const ForwardOptions* o, ForwardRunResult* r,
+                                         const ForwardCapture* capture) {
   if (!r) return cudaErrorInvalidValue;
   *r = {.status = cudaErrorInvalidValue, .next_token_id = -1};
   if (!c || !s || !o || !c->scratch || !c->scratch->device_ptr || !s->seq_len ||
       s->begin_visit > s->end_visit || s->end_visit > 48 || !s->d_hidden_out ||
       (s->run_embed ? !s->d_input_ids : !s->d_hidden_in) ||
-      (s->run_lm_head && o->return_logits && !s->d_logits_out) || s->num_block_in)
+      (s->run_lm_head && o->return_logits && !s->d_logits_out) || (!c->weights && s->num_block_in))
     return r->status;
   size_t width = c->weights ? c->weights->config.hidden_size : 2304;
   if (width * s->seq_len > std::min<size_t>(UINT32_MAX - 256, c->scratch->bytes / sizeof(float)))
     return r->status;
+  auto spec = *s;
+  if (c->weights && spec.run_lm_head && !spec.d_next_token) spec.d_next_token = c->next_token;
+  s = &spec;
   if (s->num_block_out) *s->num_block_out = 0;
   bool profiling = false;
   try {
-    if (o->enable_profiling) {
-      for (auto& event : c->marks)
-        if (!event) Require(cudaEventCreate(&event));
-    }
-    if (o->use_cuda_graph) {
+    if (o->use_cuda_graph && !c->weights) {
       PrepareGraph(*c, *s, *o);
       *r = c->graph_plan;
     }
@@ -260,8 +279,11 @@ int32_t flint_forward_run_layers(ForwardContext* c, const ForwardRunSpec* s,
       profiling = true;
     }
     Require(cudaEventRecord(c->start, c->stream));
-    if (o->use_cuda_graph)
+    if (o->use_cuda_graph && !c->weights)
       Require(cudaGraphLaunch(c->graph, c->stream));
+    else if (c->weights)
+      flint::RunInkling(*c->gemm, c->plan, *c->weights, *c->kv, c->activations, *s, *o, *r,
+                        c->marks.data(), capture);
     else
       Execute(*c, *s, *o, *r, false);
     Require(cudaEventRecord(c->stop, c->stream));
@@ -275,10 +297,22 @@ int32_t flint_forward_run_layers(ForwardContext* c, const ForwardRunSpec* s,
     r->status = cudaSuccess;
   } catch (cudaError_t error) {
     r->status = error;
+  } catch (const std::length_error&) {
+    r->status = cudaErrorMemoryAllocation;
+  } catch (const std::invalid_argument&) {
+    r->status = cudaErrorInvalidValue;
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "forward execution failed: %s\n", e.what());
+    r->status = cudaErrorUnknown;
   }
   if (profiling) {
     auto status = cudaProfilerStop();
     if (!r->status) r->status = status;
   }
   return r->status;
+}
+
+int32_t flint_forward_run_layers(ForwardContext* c, const ForwardRunSpec* s,
+                                 const ForwardOptions* o, ForwardRunResult* r) {
+  return flint_forward_run_layers_capture(c, s, o, r, nullptr);
 }

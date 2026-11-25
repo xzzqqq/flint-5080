@@ -32,7 +32,7 @@ def atomic_json(path, value):
             Path(tmp.name).unlink(missing_ok=True)
 
 
-def ipc(request, timeout=180):
+def ipc(request, timeout=1800):
     with socket.socket(socket.AF_UNIX) as client:
         client.settimeout(timeout)
         client.connect(str(SOCKET))

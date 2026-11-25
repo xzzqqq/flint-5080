@@ -75,6 +75,7 @@ def build_parser():
                 span.add_argument("--e2e", action="store_true")
                 p.add_argument("--no-graph", action="store_true")
                 p.add_argument("--no-spec", action="store_true")
+            p.add_argument("--step", type=natural, default=0, help="0=prefill, 1=first decode")
             p.add_argument("--case")
             if name != "ab":
                 p.add_argument("--candidate", type=candidate, default="current")
@@ -91,7 +92,6 @@ def build_parser():
         if name == "profile":
             p.add_argument("--nsys", action="store_true")
         if name == "dump":
-            p.add_argument("--step", type=natural, default=0, help="0=prefill, 1=first decode")
             p.add_argument("--with-state", action="store_true")
             p.add_argument("--out")
     return parser

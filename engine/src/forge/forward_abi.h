@@ -36,8 +36,17 @@ typedef struct ForwardStageTiming {
   uint64_t traffic_bytes;
 } ForwardStageTiming;
 
-/* M1.3 hidden buffers are F32 [seq_len, hidden_size]; logits cover the last token.
-   Block streams are reserved for the M1.4 residual attention implementation. */
+/* Real hidden and carry planes are BF16 [seq_len,hidden_size]. The stub uses
+   F32 hidden buffers. Carry slots 0..3 are active block states, slots 4/5
+   are the prologue hidden/block, slots 6/7 the previous pass hidden/block.
+   num_block_in/out count active blocks; num_block_out is a host pointer.
+   Snapshot validity is implicit in the visit boundary. */
+enum { FLINT_CARRY_PLANES = 8 };
+typedef struct ForwardCapture {
+  void* embed;
+  void* steps[48];
+  void* taps[4]; /* visit inputs 5,23,41 and final norm */
+} ForwardCapture;
 typedef struct ForwardRunSpec {
   uint32_t begin_visit, end_visit;
   uint8_t run_embed, run_lm_head, is_decode, reset_kv;
@@ -73,6 +82,11 @@ ForwardContext* flint_forward_create(const ModelWeightsView* weights, const KvSt
                                      const ScratchArenaView* scratch, void* cuda_stream);
 int32_t flint_forward_run_layers(ForwardContext* context, const ForwardRunSpec* spec,
                                  const ForwardOptions* options, ForwardRunResult* result);
+/* Optional inspection entry point. The original ABI v2 spec and entry point
+   keep their binary layouts, including for previously saved forge modules. */
+int32_t flint_forward_run_layers_capture(ForwardContext* context, const ForwardRunSpec* spec,
+                                         const ForwardOptions* options, ForwardRunResult* result,
+                                         const ForwardCapture* capture);
 /* Synchronous. Returns zero on success. Each context runs one call at a time. */
 int32_t flint_forward_run_smoke(ForwardContext* context, const ForwardWorkspace* workspace,
                                 const ForwardOptions* options, int32_t n_elems, float bias,

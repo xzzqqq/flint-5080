@@ -8,10 +8,9 @@
 #include <memory>
 #include <utility>
 
-#include "loader/model_views.h"
+#include "model/visit_plan.h"
 
 namespace flint {
-std::array<VisitPlanEntry, FLINT_NUM_LOGICAL_VISITS> BuildVisitPlan(const ModelConfig& config);
 
 namespace detail {
 struct DeviceFree {

@@ -1,6 +1,7 @@
 #include <cuda_bf16.h>
 
 #include "op_params.h"
+#include "row_reduction.cuh"
 
 namespace {
 using B = __nv_bfloat16;
@@ -23,17 +24,28 @@ __device__ float Reduce(float* buf, float v, int n, bool maximum = false) {
 }
 __global__ void Clip(ClipParams p, int heads, int dim, float threshold) {
   __shared__ float buf[128];
-  int i = blockIdx.x * dim + threadIdx.x;
-  float x = Get(p.x, i);
-  if (p.scale) x *= Get(p.scale, i % (heads * dim));
-  float norm = sqrtf(Reduce(buf, x * x, dim));
-  float clipped = Round(x * fminf(1.f, threshold / (norm + 1e-6f)));
-  if (p.log_scale)
-    clipped *= 1.f + 0.1f * logf(fmaxf(1.f, (p.position + blockIdx.x / heads + 1) / 8192.f));
-  Put(p.y, i, clipped);
+  auto value = [&](int c) {
+    int i = blockIdx.x * dim + c;
+    return Get(p.x, i) * (p.scale ? Get(p.scale, i % (heads * dim)) : 1.f);
+  };
+  float norm = sqrtf(flint::row::Sum(
+      dim,
+      [&](int c) {
+        float x = value(c);
+        return __fmul_rn(x, x);
+      },
+      buf));
+  for (int c = threadIdx.x; c < dim; c += blockDim.x) {
+    // Scalar / tensor in the reference rounds the reciprocal before multiplying.
+    float clipped = Round(value(c) * fminf(1.f, threshold * __frcp_rn(norm + 1e-6f)));
+    if (p.log_scale)
+      clipped *= 1.f + 0.1f * logf(fmaxf(1.f, (p.position + blockIdx.x / heads + 1) / 8192.f));
+    Put(p.y, blockIdx.x * dim + c, clipped);
+  }
 }
 int LaunchClip(ClipParams p, void* s, int heads, int dim, float threshold) {
-  Clip<<<p.tokens * heads, dim, 0, static_cast<cudaStream_t>(s)>>>(p, heads, dim, threshold);
+  Clip<<<p.tokens * heads, dim == 128 ? 32 : dim, 0, static_cast<cudaStream_t>(s)>>>(p, heads, dim,
+                                                                                     threshold);
   return cudaGetLastError();
 }
 __global__ void Cache(CacheParams p) {
@@ -53,10 +65,13 @@ __global__ void Score(AttentionParams p) {
       key = begin + blockIdx.x;
   if (key > pos) return;
   int c = threadIdx.x, dist = pos - key;
-  float dot = Reduce(buf,
-                     Get(p.q, (t * 24 + h) * 128 + c) *
-                         Get(p.cache_k, ((size_t)(key % p.capacity) * 8 + h / 3) * 128 + c),
-                     128);
+  float dot = flint::row::Sum(
+      128,
+      [&](int i) {
+        return Get(p.q, (t * 24 + h) * 128 + i) *
+               Get(p.cache_k, ((size_t)(key % p.capacity) * 8 + h / 3) * 128 + i);
+      },
+      buf);
   if (!c) {
     float bias = dist < 1024 ? Get(p.rel, (t * 24 + h) * 1024 + dist) : 0;
     p.scores[(size_t)(t * 24 + h) * p.capacity + blockIdx.x] =
@@ -71,17 +86,29 @@ __global__ void Attend(AttentionParams p) {
   float sink = Get(p.sink, row), peak = sink;
   for (int j = c; j < n; j += 128) peak = fmaxf(peak, scores[j]);
   peak = Reduce(buf, peak, 128, true);
-  float denom = c == 0 ? expf(sink - peak) : 0;
-  for (int j = c; j < n; j += 128) {
-    scores[j] = expf(scores[j] - peak);
-    denom += scores[j];
-  }
+  // The sink is the last softmax column. Preserve its lane in the
+  // 32-lane reduction, including when a row spans multiple warp iterations.
+  for (int j = c; j < n; j += 128) scores[j] = expf(scores[j] - peak);
+  __syncthreads();
+  float denom = 0;
+  if (c < 32)
+    for (int j = c; j <= n; j += 32) denom += j == n ? expf(sink - peak) : scores[j];
   denom = Reduce(buf, denom, 128);
   for (int j = c; j < n; j += 128) scores[j] = Round(scores[j] / denom);
   __syncthreads();
-  float out = 0;
-  for (int j = 0; j < n; ++j)
-    out += scores[j] * Get(p.cache_v, ((size_t)((begin + j) % p.capacity) * 8 + h / 3) * 128 + c);
+  // The reference reduces the strided key axis with four accumulators.
+  // At 64 visible keys it also splits the reduction across four warps.
+  int groups = n >= 64 ? 4 : 1;
+  float group[4] = {};
+  for (int g = 0; g < groups; ++g) {
+    float part[4] = {};
+    for (int j = g; j < n; j += groups) {
+      auto index = ((size_t)((begin + j) % p.capacity) * 8 + h / 3) * 128 + c;
+      part[(j / groups) % 4] += scores[j] * Get(p.cache_v, index);
+    }
+    group[g] = ((part[0] + part[1]) + part[2]) + part[3];
+  }
+  float out = (group[0] + group[2]) + (group[1] + group[3]);
   Put(p.y, row * 128 + c, out);
 }
 __global__ void Gate(GateMulParams p) {
@@ -112,7 +139,7 @@ int flint_attention_forward(AttentionParams p, void* s) {
     return cudaErrorInvalidValue;
   int visible = p.position + p.tokens;
   if (visible > p.capacity) visible = p.capacity;
-  Score<<<dim3(visible, 24, p.tokens), 128, 0, static_cast<cudaStream_t>(s)>>>(p);
+  Score<<<dim3(visible, 24, p.tokens), 32, 0, static_cast<cudaStream_t>(s)>>>(p);
   auto status = cudaGetLastError();
   if (status) return status;
   Attend<<<p.tokens * 24, 128, 0, static_cast<cudaStream_t>(s)>>>(p);

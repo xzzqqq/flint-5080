@@ -68,7 +68,7 @@ unsigned Count(const Json& q, const char* name, unsigned fallback, unsigned lo, 
 }
 void Golden(Object& reply, const fs::path& dir, const std::string& name,
             const std::vector<int>& ids, const Recording& recording, unsigned end, bool head,
-            std::span<const float> values, unsigned width) {
+            std::span<const float> values, unsigned width, int next_token) {
   if (dir.empty() || name.empty() ||
       name.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.") !=
           std::string::npos)
@@ -111,6 +111,17 @@ void Golden(Object& reply, const fs::path& dir, const std::string& name,
     return;
   auto diff = Diff(ref, values);
   diff["tensor"] = key;
+  if (head) {
+    auto generated = file.Find("generated_ids");
+    size_t offset = recording.generated.size() * sizeof(int);
+    if (generated && generated->dtype == TensorDType::kI32 &&
+        offset + sizeof(int) <= generated->nbytes) {
+      int id;
+      std::memcpy(&id, file.Bytes(*generated).data() + offset, sizeof(id));
+      diff["expected_next_token_id"] = id;
+      diff["next_token_match"] = id == next_token;
+    }
+  }
   reply["golden"] = std::move(diff);
 }
 }  // namespace
@@ -200,18 +211,33 @@ Replay::Replay(DaemonConfig cfg) : config_(std::move(cfg)) {
       {config_.kv_seq_len, 1024, scratch_->view().bytes / (width_ * sizeof(float))});
   if (!capacity_) throw std::runtime_error("scratch too small for one token");
   size_t elements = size_t(capacity_) * width_;
-  io_.emplace(ScratchArena::Allocate(sizeof(float) * (2 * elements + capacity_ + 1 + vocab_)));
+  const size_t carry_bytes = weights_ ? FLINT_CARRY_PLANES * elements * sizeof(uint16_t) : 0;
+  io_.emplace(ScratchArena::Allocate(sizeof(float) * (2 * elements + capacity_ + 1 + vocab_) +
+                                     carry_bytes));
   hidden_ = static_cast<float*>(io_->view().device_ptr);
   out_ = hidden_ + elements;
   logits_ = out_ + elements;
   ids_ = reinterpret_cast<int*>(logits_ + vocab_);
   next_ = ids_ + capacity_;
+  carry_ = weights_ ? reinterpret_cast<uint16_t*>(next_ + 1) : nullptr;
   for (auto dir : {"candidates", "loaded"}) fs::create_directories(config_.state_dir / dir);
   auto baseline = config_.state_dir / "candidates/baseline.so";
   fs::copy_file(config_.baseline, baseline.string() + ".tmp", fs::copy_options::overwrite_existing);
   fs::rename(baseline.string() + ".tmp", baseline);
   config_.baseline = baseline;
   Cuda(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
+  try {
+    // Initialize the resident CUDA library context before sampling per-reload VRAM.
+    if (weights_) {
+      Cuda(cudaMemsetAsync(ids_, 0, sizeof(int), stream_));
+      auto spec = Spec(0, 1, 1, 0, true, false);
+      spec.reset_kv = 1;
+      Load(config_.baseline)->Run(spec);
+    }
+  } catch (...) {
+    cudaStreamDestroy(stream_);
+    throw;
+  }
 }
 Replay::~Replay() { cudaStreamDestroy(stream_); }
 Object Replay::Status() const {
@@ -235,7 +261,7 @@ Object Replay::Status() const {
           {"lazy_cache_entries", cache_.size()}};
 }
 ForwardRunSpec Replay::Spec(unsigned begin, unsigned end, unsigned length, unsigned pos, bool embed,
-                            bool head) const {
+                            bool head) {
   return {.begin_visit = begin,
           .end_visit = end,
           .run_embed = embed,
@@ -245,7 +271,11 @@ ForwardRunSpec Replay::Spec(unsigned begin, unsigned end, unsigned length, unsig
           .pos_offset = pos,
           .d_input_ids = ids_,
           .d_hidden_in = hidden_,
+          .d_block_in = carry_,
+          .num_block_in = begin ? blocks_ : 0,
           .d_hidden_out = out_,
+          .d_block_out = carry_,
+          .num_block_out = &blocks_,
           .d_logits_out = logits_,
           .d_next_token = next_};
 }
@@ -254,9 +284,7 @@ Recording Replay::Record(const std::vector<int>& ids, unsigned begin, unsigned e
   r.ids = ids;
   auto baseline = Load(config_.baseline);
   auto& state = kv_->view();
-  // Only these 48 scalar slots in each arena are live in the M1.3 stub.
-  Cuda(cudaMemsetAsync(state.swa_kv, 0, 48 * sizeof(float), stream_));
-  Cuda(cudaMemsetAsync(state.kv_conv_state, 0, 48 * sizeof(float), stream_));
+  kv_->Reset(stream_);
   Upload(stream_, ids_, ids);
   for (unsigned i = 0; i < step; ++i) {
     auto run = baseline->Run(Spec(0, 48, r.ids.size(), r.position, true, true));
@@ -267,19 +295,62 @@ Recording Replay::Record(const std::vector<int>& ids, unsigned begin, unsigned e
   }
   baseline->Run(Spec(0, begin, r.ids.size(), r.position, true, false));
   auto count = r.ids.size() * width_;
-  r.hidden = Read(out_, count);
-  r.kv = Read(static_cast<float*>(state.swa_kv) + begin, end - begin);
-  r.conv = Read(state.kv_conv_state + begin, end - begin);
-  Upload(stream_, hidden_, r.hidden);
+  r.hidden = ReadHidden(count);
+  r.blocks = blocks_;
+  if (weights_) {
+    r.carry = Read(carry_, FLINT_CARRY_PLANES * count);
+    auto save = [&](const void* ptr, size_t bytes) {
+      auto p = static_cast<const std::byte*>(ptr);
+      r.state.push_back(
+          {size_t(p - static_cast<const std::byte*>(state.arena_base)), Read(p, bytes)});
+    };
+    const auto plan = BuildVisitPlan(weights_->view().config);
+    for (unsigned v = begin; v < end; ++v) {
+      auto visit = plan[v];
+      auto cap = visit.is_full_attention ? state.max_full_seq_len : state.swa_window;
+      auto base = static_cast<uint16_t*>(visit.is_full_attention ? state.full_kv : state.swa_kv);
+      size_t dim = state.num_kv_heads * state.head_dim;
+      auto live = std::min<size_t>(cap, r.position + r.ids.size());
+      for (int j = 0; j < 2; ++j)
+        save(base + (2 * visit.kv_slot_idx + j) * size_t(cap) * dim, live * dim * 2);
+      size_t kc = 2 * dim * state.conv_state_len, sc = 2 * width_ * state.conv_state_len;
+      save(state.kv_conv_state + v * kc, kc * 4);
+      save(state.sublayer_conv_state + v * sc, sc * 4);
+    }
+  } else {
+    r.kv = Read(static_cast<float*>(state.swa_kv) + begin, end - begin);
+    r.conv = Read(state.kv_conv_state + begin, end - begin);
+  }
+  UploadHidden(r.hidden);
   bool head = begin == 0 && end == 48;
   auto result = baseline->Run(Spec(begin, end, r.ids.size(), r.position, head, head),
                               {.return_logits = head});
-  r.reference = Read(out_, count);
+  r.reference = ReadHidden(count);
   r.next = result.next_token_id;
   if (head) r.logits = Read(logits_, vocab_);
   return r;
 }
+std::vector<float> Replay::ReadHidden(size_t count) const {
+  if (!weights_) return Read(out_, count);
+  auto bits = Read(reinterpret_cast<uint16_t*>(out_), count);
+  std::vector<float> out(count);
+  for (size_t i = 0; i < count; ++i) out[i] = std::bit_cast<float>(uint32_t(bits[i]) << 16);
+  return out;
+}
+void Replay::UploadHidden(const std::vector<float>& data) {
+  if (!weights_) return Upload(stream_, hidden_, data);
+  std::vector<uint16_t> bits(data.size());
+  for (size_t i = 0; i < data.size(); ++i) bits[i] = std::bit_cast<uint32_t>(data[i]) >> 16;
+  Upload(stream_, reinterpret_cast<uint16_t*>(hidden_), bits);
+  Cuda(cudaStreamSynchronize(stream_));
+}
 void Replay::Restore(const Recording& r, unsigned begin) {
+  if (weights_) {
+    Upload(stream_, carry_, r.carry);
+    for (const auto& slice : r.state)
+      Upload(stream_, static_cast<std::byte*>(kv_->view().arena_base) + slice.offset, slice.bytes);
+    return;
+  }
   Upload(stream_, static_cast<float*>(kv_->view().swa_kv) + begin, r.kv);
   Upload(stream_, kv_->view().kv_conv_state + begin, r.conv);
 }
@@ -339,8 +410,9 @@ Object Replay::Measure(const Json& q, const std::string& cmd) {
     rec = &it->second;
   }
   const auto& r = *rec;
+  blocks_ = r.blocks;
   auto spec = Spec(begin, end, r.ids.size(), r.position, e2e, e2e);
-  Upload(stream_, hidden_, r.hidden);
+  UploadHidden(r.hidden);
   Upload(stream_, ids_, r.ids);
   ForwardOptions options{.use_cuda_graph = q.get("use_cuda_graph", true),
                          .use_speculative = q.get("use_speculative", true),
@@ -370,7 +442,7 @@ Object Replay::Measure(const Json& q, const std::string& cmd) {
       if (!b) continue;
       group_a.push_back(last.elapsed_ms);
       if (round + 1 == rounds && i + 1 == iters) {
-        a_output = Read(out_, r.hidden.size());
+        a_output = ReadHidden(r.hidden.size());
         if (e2e) a_logits = Read(logits_, vocab_);
         a_next = last.next_token_id;
       }
@@ -383,7 +455,7 @@ Object Replay::Measure(const Json& q, const std::string& cmd) {
       pairs.emplace_back(Object{{"a_ms", round_a.back()}, {"b_ms", round_b.back()}});
     }
   }
-  auto output = Read(out_, r.hidden.size());
+  auto output = ReadHidden(r.hidden.size());
   auto logits = e2e ? Read(logits_, vocab_) : std::vector<float>{};
   if (b) {
     double am = Median(round_a), bm = Median(round_b);
@@ -407,7 +479,7 @@ Object Replay::Measure(const Json& q, const std::string& cmd) {
     reply["logical_bytes"] = last.logical_bytes;
     reply["effective_bw_gbs"] = bw;
     reply["sol_pct"] = bw / 9.6;
-    reply["traffic_basis"] = "model.md 6.1 logical weight budget per forward (M1.3 stub)";
+    reply["traffic_basis"] = "model.md 6.1 single-token logical weight budget, mean expert bitrate";
     reply["numerical_error"] = Diff(r.reference, output);
     if (e2e) {
       reply["logits_error"] = Diff(r.logits, logits);
@@ -432,7 +504,8 @@ Object Replay::Measure(const Json& q, const std::string& cmd) {
   }
   b.reset();
   a.reset();
-  Golden(reply, config_.golden_dir, name, ids, r, end, e2e, e2e ? logits : output, width_);
+  Golden(reply, config_.golden_dir, name, ids, r, end, e2e, e2e ? logits : output, width_,
+         last.next_token_id);
   if (cmd == "dump") {
     Array shape{r.ids.size(), width_};
     std::vector<DumpTensor> tensors{
@@ -440,7 +513,24 @@ Object Replay::Measure(const Json& q, const std::string& cmd) {
         {"hidden_in", "F32", shape, std::as_bytes(std::span(r.hidden))},
         {"ref_hidden_out", "F32", shape, std::as_bytes(std::span(r.reference))},
         {"cand_hidden_out", "F32", shape, std::as_bytes(std::span(output))}};
-    if (q.get("with_state", false)) {
+    const std::array<uint32_t, 5> layout{begin, end, r.position, r.blocks,
+                                         kv_->view().max_full_seq_len};
+    if (q.get("with_state", false) && weights_) {
+      // Absolute byte offsets below use this full-KV capacity and the loader arena layout.
+      const char* names[] = {"begin_visit", "end_visit", "pos_offset", "num_block_in",
+                             "max_full_seq_len"};
+      for (size_t i = 0; i < layout.size(); ++i)
+        tensors.push_back({names[i], "U32", {}, std::as_bytes(std::span(layout).subspan(i, 1))});
+      tensors.push_back({"carry",
+                         "BF16",
+                         {int(FLINT_CARRY_PLANES), r.ids.size(), width_},
+                         std::as_bytes(std::span(r.carry))});
+      for (const auto& slice : r.state)
+        tensors.push_back({"state_offset_" + std::to_string(slice.offset),
+                           "U8",
+                           {slice.bytes.size()},
+                           slice.bytes});
+    } else if (q.get("with_state", false)) {
       tensors.push_back({"kv_state", "F32", {end - begin}, std::as_bytes(std::span(r.kv))});
       tensors.push_back({"conv_state", "F32", {end - begin}, std::as_bytes(std::span(r.conv))});
     }
