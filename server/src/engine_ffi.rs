@@ -138,7 +138,8 @@ mod backend {
         }
         pub fn stats_json(&self) -> Result<String, EngineError> {
             Ok(serde_json::json!({
-                "backend": "stub", "abi_version": FLINT_ENGINE_ABI_VERSION,
+                "backend": "stub", "mode": "smoke", "completed_requests": self.submitted.get(),
+                "active_requests": 0, "queued_requests": 0, "abi_version": FLINT_ENGINE_ABI_VERSION,
                 "gpu_name": null, "sm_major": 0, "sm_minor": 0,
                 "vram_total_bytes": 0, "vram_free_bytes": 0,
                 "submitted_requests": self.submitted.get(), "cancelled_requests": self.cancellations.get()
@@ -183,6 +184,7 @@ mod backend {
         panic::{AssertUnwindSafe, catch_unwind},
         ptr::{self, NonNull},
         slice,
+        sync::mpsc,
     };
 
     #[repr(C)]
@@ -222,40 +224,45 @@ mod backend {
         Some(s)
     }
 
-    #[derive(Default)]
-    struct Capture {
-        events: Vec<Event>,
-        error: Option<EngineError>,
-        panicked: bool,
-    }
+    type CallbackState = mpsc::Sender<Result<Event, EngineError>>;
 
     unsafe extern "C" fn collect(event: *const EngineEvent, data: *mut c_void) {
-        // engine_submit borrows Capture exclusively and calls us synchronously.
-        let capture = unsafe { &mut *data.cast::<Capture>() };
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            let event = unsafe { &*event };
-            match event.kind {
-                EngineEventKind::Tokens => {
-                    let ids = unsafe { slice::from_raw_parts(event.token_ids, event.n_tokens) };
-                    capture.events.push(Event::Tokens(ids.to_vec()));
-                }
-                EngineEventKind::Done => capture.events.push(Event::Done(event.telemetry)),
-                EngineEventKind::Error => {
-                    let msg = if event.error_message.is_null() {
-                        "engine error without a diagnostic".into()
-                    } else {
-                        unsafe { CStr::from_ptr(event.error_message) }.to_string_lossy()
-                    };
-                    capture.error = Some(EngineError::new(event.status, &msg));
-                }
+        let event = unsafe { &*event };
+        // Exactly one terminal callback owns the final drop, even if rx disconnected.
+        let terminal = (event.kind != EngineEventKind::Tokens)
+            .then(|| unsafe { Box::from_raw(data.cast::<CallbackState>()) });
+        let tx = terminal
+            .as_deref()
+            .unwrap_or_else(|| unsafe { &*data.cast::<CallbackState>() });
+        let message = catch_unwind(AssertUnwindSafe(|| match event.kind {
+            EngineEventKind::Tokens => {
+                let ids = unsafe { slice::from_raw_parts(event.token_ids, event.n_tokens) };
+                Ok(Event::Tokens(ids.to_vec()))
             }
-        }));
-        if result.is_err() {
-            capture.panicked = true;
-        }
+            EngineEventKind::Done => Ok(Event::Done(event.telemetry)),
+            EngineEventKind::Error => {
+                let msg = if event.error_message.is_null() {
+                    "engine error without a diagnostic".into()
+                } else {
+                    unsafe { CStr::from_ptr(event.error_message) }.to_string_lossy()
+                };
+                Err(EngineError::new(event.status, &msg))
+            }
+        }))
+        .unwrap_or_else(|_| {
+            Err(EngineError::new(
+                EngineStatus::Internal,
+                "callback panicked",
+            ))
+        });
+        let _ = tx.send(message);
     }
 
     pub struct Engine(NonNull<EngineHandle>);
+    // The runtime serializes GPU execution and synchronizes all shared request state.
+    // Drop requires exclusive ownership and joins the worker before releasing the handle.
+    unsafe impl Send for Engine {}
+    unsafe impl Sync for Engine {}
     impl Engine {
         pub fn new(config: &str) -> Result<Self, EngineError> {
             validate_config(config)?;
@@ -290,7 +297,8 @@ mod backend {
                 n_stop_token_ids: req.stop_token_ids.len(),
                 ignore_eos: req.ignore_eos.into(),
             };
-            let mut capture = Capture::default();
+            let (tx, rx) = mpsc::channel::<Result<Event, EngineError>>();
+            let state = Box::into_raw(Box::new(tx));
             let id = unsafe {
                 engine_submit(
                     self.0.as_ptr(),
@@ -300,19 +308,29 @@ mod backend {
                     ptr::null(),
                     0,
                     collect,
-                    (&mut capture as *mut Capture).cast(),
+                    state.cast(),
                 )
             };
-            if capture.panicked || id == 0 {
-                Err(EngineError::new(
+            if id == 0 {
+                unsafe { drop(Box::from_raw(state)) };
+                return Err(EngineError::new(
                     EngineStatus::Internal,
                     "engine submission failed",
-                ))
-            } else if let Some(err) = capture.error {
-                Err(err)
-            } else {
-                Ok((id, capture.events))
+                ));
             }
+            let mut events = Vec::new();
+            for message in rx {
+                let event = message?;
+                let done = matches!(event, Event::Done(_));
+                events.push(event);
+                if done {
+                    return Ok((id, events));
+                }
+            }
+            Err(EngineError::new(
+                EngineStatus::Internal,
+                "missing terminal event",
+            ))
         }
         pub fn cancel(&self, id: u64) {
             unsafe { engine_cancel(self.0.as_ptr(), id) }

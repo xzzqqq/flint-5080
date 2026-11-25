@@ -318,6 +318,8 @@ def _gpu_check_commands(model_dir, golden_dir):
     ops = "engine/build/ops_tests"
     e2e = "engine/build/e2e_tests"
     forward = "engine/build/forward.so"
+    runtime = "engine/build/runtime_tests"
+    model_config = json.dumps({"model_dir": str(model_dir), "max_context": 2048})
     return {
         "ctest": [
             build("-f", "engine/build/CTestTestfile.cmake"),
@@ -350,11 +352,19 @@ def _gpu_check_commands(model_dir, golden_dir):
                 ]
             ),
         ],
+        "runtime-golden": [
+            build("-x", runtime),
+            model,
+            golden("-d", golden_dir),
+            shlex.join([runtime, "--model-dir", str(model_dir), "--golden-dir", str(golden_dir)]),
+        ],
         "forge-host": [build("-x", "engine/build/forge-host"), "engine/build/forge-host --smoke"],
         "server": [
+            "set -e",
             'server="server/target/${CARGO_BUILD_TARGET:+$CARGO_BUILD_TARGET/}release/server"',
             'test -x "$server" || { echo "Missing $server. Run dev build first." >&2; exit 1; }',
             '"$server" --smoke',
+            '"$server" --smoke --config-json ' + shlex.quote(model_config),
         ],
     }
 

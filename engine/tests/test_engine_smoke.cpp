@@ -1,9 +1,11 @@
 #include <cmath>
+#include <future>
 #include <iostream>
 #include <memory>
 #include <span>
 #include <stdexcept>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "engine_api.h"
@@ -25,6 +27,11 @@ struct Capture {
   EngineTelemetry telemetry{};
   EngineStatus status{};
   bool valid = true;
+  std::thread::id caller = std::this_thread::get_id();
+  std::promise<void>* done{};
+  std::promise<void>* entered{};
+  std::shared_future<void> release{};
+  std::vector<uint64_t>* order{};
 };
 
 void Collect(const EngineEvent* event, void* user_data) {
@@ -32,6 +39,7 @@ void Collect(const EngineEvent* event, void* user_data) {
   if (event->req_id == 0 || (capture.request_id != 0 && capture.request_id != event->req_id)) {
     capture.valid = false;
   }
+  capture.valid &= capture.caller != std::this_thread::get_id();
   capture.request_id = event->req_id;
   capture.kinds.push_back(event->kind);
   capture.status = event->status;
@@ -40,12 +48,20 @@ void Collect(const EngineEvent* event, void* user_data) {
   if (event->kind == ENGINE_EVENT_TOKENS && event->token_ids != nullptr) {
     const std::span tokens(event->token_ids, event->n_tokens);
     capture.tokens.insert(capture.tokens.end(), tokens.begin(), tokens.end());
+    if (capture.entered) {
+      capture.entered->set_value();
+      capture.release.wait();
+    }
     if (capture.cancel_on_tokens) {
       engine_cancel(capture.engine, event->req_id);
     }
   }
   if (event->kind == ENGINE_EVENT_ERROR && (!event->error_message || !*event->error_message)) {
     capture.valid = false;
+  }
+  if (event->kind != ENGINE_EVENT_TOKENS) {
+    if (capture.order) capture.order->push_back(event->req_id);
+    if (capture.done) capture.done->set_value();
   }
 }
 
@@ -56,8 +72,14 @@ void CheckRequests(EngineHandle* engine) {
   const auto submit = [&](std::span<const int32_t> prompt, std::span<const MediaSlice> media = {},
                           bool cancel_on_tokens = false) {
     Capture capture{.engine = engine, .cancel_on_tokens = cancel_on_tokens};
+    std::promise<void> done;
+    auto terminal = done.get_future();
+    capture.done = &done;
     const auto id = engine_submit(engine, &params, prompt.data(), prompt.size(), media.data(),
                                   media.size(), Collect, &capture);
+    Require(id, "failed to enqueue");
+    terminal.get();
+    capture.done = nullptr;
     Require(capture.valid && id > last_id && capture.request_id == id, "invalid request/event ID");
     last_id = id;
     return capture;
@@ -101,6 +123,60 @@ void CheckRequests(EngineHandle* engine) {
           "engine stats");
 }
 
+void CheckQueue(bool destroy) {
+  std::unique_ptr<EngineHandle, decltype(&engine_destroy)> owner(engine_create("{}", nullptr),
+                                                                 engine_destroy);
+  auto* e = owner.get();
+  Require(e, "queue engine_create");
+  std::promise<void> entered, release;
+  auto started = entered.get_future();
+  std::vector<uint64_t> order;
+  Capture first{
+      .engine = e, .entered = &entered, .release = release.get_future().share(), .order = &order};
+  Capture second{.engine = e, .order = &order}, third{.engine = e, .order = &order};
+  std::promise<void> done;
+  auto terminal = done.get_future();
+  third.done = &done;
+  RequestParams p{.max_tokens = 1};
+  int32_t prompt = 1, stop = 42;
+  auto submit = [&](Capture& c) {
+    return engine_submit(e, &p, &prompt, 1, nullptr, 0, Collect, &c);
+  };
+  auto a = submit(first);
+  started.get();
+  auto b = submit(second);
+  p.stop_token_ids = &stop;
+  p.n_stop_token_ids = 1;
+  auto c = submit(third);
+  stop = 12;
+  p.max_tokens = 0;
+  engine_cancel(e, b);
+  std::unique_ptr<char, decltype(&engine_string_free)> snapshot(engine_stats_json(e),
+                                                                engine_string_free);
+  bool queue_stats =
+      snapshot &&
+      std::string_view(snapshot.get()).find("\"queued_requests\":2") != std::string_view::npos &&
+      std::string_view(snapshot.get()).find("\"active_requests\":1") != std::string_view::npos;
+  if (destroy) {
+    std::thread unblock([&] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      release.set_value();
+    });
+    owner.reset();
+    unblock.join();
+  } else {
+    release.set_value();
+    terminal.get();
+    owner.reset();
+  }
+  Require(queue_stats, "queue and active counters");
+  Require(order == std::vector<uint64_t>{a, b, c}, "FIFO terminal order");
+  Require(first.valid && second.valid && third.valid && second.status == ENGINE_ERR_CANCELLED &&
+              third.tokens.empty() &&
+              third.status == (destroy ? ENGINE_ERR_CANCELLED : ENGINE_OK) &&
+              first.status == (destroy ? ENGINE_ERR_CANCELLED : ENGINE_OK),
+          "pending request outcomes");
+}
 void TestEngine() {
   Require(engine_abi_version() == FLINT_ENGINE_ABI_VERSION, "engine ABI mismatch");
   char* error = nullptr;
@@ -112,6 +188,8 @@ void TestEngine() {
   std::unique_ptr<char, decltype(&engine_string_free)> diagnostic(error, engine_string_free);
   Require(engine && !diagnostic, error ? error : "engine_create failed");
   CheckRequests(engine.get());
+  CheckQueue(false);
+  CheckQueue(true);
 }
 }  // namespace
 

@@ -245,7 +245,14 @@ def test_gpu_missing_builds_and_cleanup(cfg, entry, capsys):
     cfg.model.weights_dir = "tiny"
     assert entry(["check", "--gpu", "--json"]) == 1
     checks = json.loads(capsys.readouterr().out)["data"]["checks"]
-    assert set(checks) == {"ctest", "ops-golden", "e2e-golden", "server", "forge-host"}
+    assert set(checks) == {
+        "ctest",
+        "ops-golden",
+        "e2e-golden",
+        "server",
+        "forge-host",
+        "runtime-golden",
+    }
     assert all("dev build" in check["error"] for check in checks.values())
     assert not Path(cfg.shared.lock_file).exists()
 
@@ -267,7 +274,7 @@ def test_gpu_missing_golden_prerequisite(cfg, entry, capsys, missing):
     cfg.model.weights_dir = "tiny"
     build = cfg.repo_root / "engine/build"
     build.mkdir(parents=True)
-    for name in ("ops_tests", "e2e_tests"):
+    for name in ("ops_tests", "e2e_tests", "runtime_tests"):
         (build / name).write_text("#!/bin/sh\nexit 0\n")
         (build / name).chmod(0o755)
     if missing != "forward.so":
@@ -284,7 +291,7 @@ def test_gpu_missing_golden_prerequisite(cfg, entry, capsys, missing):
     assert entry(["check", "--gpu", "--json"]) == 1
     checks = json.loads(capsys.readouterr().out)["data"]["checks"]
     if missing == "model":
-        for name in ("ops-golden", "e2e-golden"):
+        for name in ("ops-golden", "e2e-golden", "runtime-golden"):
             assert "Missing model directory" in checks[name]["error"]
     elif missing == "forward.so":
         assert "Missing engine/build/forward.so. Run dev build" in checks["e2e-golden"]["error"]
@@ -336,10 +343,11 @@ def test_gpu_steps_run_under_lease(cfg, entry, executor, capsys, interrupted):
             "ctest",
             "ops-golden",
             "e2e-golden",
+            "runtime-golden",
             "forge-host",
             "server",
         }
-        assert len(runs) == 5
+        assert len(runs) == 6
         assert "ctest --test-dir" in runs[0]
         assert shlex.split(runs[1].splitlines()[-1]) == [
             "engine/build/ops_tests",
@@ -357,8 +365,18 @@ def test_gpu_steps_run_under_lease(cfg, entry, executor, capsys, interrupted):
             "--golden-dir",
             golden,
         ]
-        assert "forge-host --smoke" in runs[3]
-        assert '"$server" --smoke' in runs[4]
+        assert shlex.split(runs[3].splitlines()[-1]) == [
+            "engine/build/runtime_tests",
+            "--model-dir",
+            model,
+            "--golden-dir",
+            golden,
+        ]
+        assert "forge-host --smoke" in runs[4]
+        assert runs[5].splitlines()[-2] == '"$server" --smoke'
+        server, smoke, flag, config = shlex.split(runs[5].splitlines()[-1])
+        assert (server, smoke, flag) == ("$server", "--smoke", "--config-json")
+        assert json.loads(config) == {"model_dir": model, "max_context": 2048}
 
 
 def test_missing_required_config(repo, monkeypatch, capsys):

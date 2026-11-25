@@ -78,13 +78,15 @@ uint32_t engine_abi_version(void);
  * place an owned diagnostic in *err_out. Free it with engine_string_free. */
 EngineHandle* engine_create(const char* config_json, char** err_out);
 
-/* Finish all calls on the handle before destroying it. Accepts NULL. */
+/* Finish external calls on the handle before destroying it. Cancels active and
+ * queued requests, drains their callbacks, and joins the worker before releasing
+ * resources. Do not call from the worker callback. Accepts NULL. */
 void engine_destroy(EngineHandle* engine);
 
-/* Phase 0 runs synchronously. The engine borrows the request data and
- * user_data until this function returns and never retains the callback.
- * Each submission with a handle and callback gets a nonzero ID and one
- * terminal DONE or ERROR event. Missing handle or callback returns zero.
+/* Deep-copies params (including stop_token_ids) and token_ids before returning
+ * a nonzero request ID. The worker invokes callback asynchronously until exactly
+ * one terminal DONE or ERROR. Keep user_data valid through that callback.
+ * Missing handle or callback, or failure to enqueue, returns zero.
  * Callbacks may cancel their request and must return normally. */
 uint64_t engine_submit(EngineHandle* engine, const RequestParams* params, const int32_t* token_ids,
                        size_t n_tokens, const MediaSlice* media, size_t n_media,
