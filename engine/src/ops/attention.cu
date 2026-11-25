@@ -22,6 +22,7 @@ __device__ float Reduce(float* buf, float v, int n, bool maximum = false) {
   __syncthreads();
   return result;
 }
+__device__ int Position(int pos, const int32_t* ptr) { return ptr ? *ptr : pos; }
 __global__ void Clip(ClipParams p, int heads, int dim, float threshold) {
   __shared__ float buf[128];
   auto value = [&](int c) {
@@ -39,7 +40,9 @@ __global__ void Clip(ClipParams p, int heads, int dim, float threshold) {
     // Scalar / tensor in the reference rounds the reciprocal before multiplying.
     float clipped = Round(value(c) * fminf(1.f, threshold * __frcp_rn(norm + 1e-6f)));
     if (p.log_scale)
-      clipped *= 1.f + 0.1f * logf(fmaxf(1.f, (p.position + blockIdx.x / heads + 1) / 8192.f));
+      clipped *=
+          1.f + 0.1f * logf(fmaxf(
+                           1.f, (Position(p.position, p.d_pos) + blockIdx.x / heads + 1) / 8192.f));
     Put(p.y, blockIdx.x * dim + c, clipped);
   }
 }
@@ -49,7 +52,8 @@ int LaunchClip(ClipParams p, void* s, int heads, int dim, float threshold) {
   return cudaGetLastError();
 }
 __global__ void Cache(CacheParams p) {
-  int t = blockIdx.x + max(0, p.tokens - p.capacity), slot = (p.position + t) % p.capacity;
+  int t = blockIdx.x + max(0, p.tokens - p.capacity),
+      slot = (Position(p.position, p.d_pos) + t) % p.capacity;
   for (int c = threadIdx.x; c < 1024; c += blockDim.x) {
     size_t dest = (size_t)slot * 1024 + c, src = (size_t)t * 1024 + c;
     static_cast<B*>(p.cache_k)[dest] = static_cast<const B*>(p.k)[src];
@@ -61,27 +65,29 @@ __device__ int Begin(AttentionParams p, int pos) {
 }
 __global__ void Score(AttentionParams p) {
   __shared__ float buf[128];
-  int h = blockIdx.y, t = blockIdx.z, pos = p.position + t, begin = Begin(p, pos),
-      key = begin + blockIdx.x;
-  if (key > pos) return;
-  int c = threadIdx.x, dist = pos - key;
-  float dot = flint::row::Sum(
-      128,
-      [&](int i) {
-        return Get(p.q, (t * 24 + h) * 128 + i) *
-               Get(p.cache_k, ((size_t)(key % p.capacity) * 8 + h / 3) * 128 + i);
-      },
-      buf);
-  if (!c) {
-    float bias = dist < 1024 ? Get(p.rel, (t * 24 + h) * 1024 + dist) : 0;
-    p.scores[(size_t)(t * 24 + h) * p.capacity + blockIdx.x] =
-        Round(Round(Round(dot) * 0.08838834764831845f) + bias);
+  int h = blockIdx.y, t = blockIdx.z, pos = Position(p.position, p.d_pos) + t,
+      begin = Begin(p, pos);
+  for (int offset = blockIdx.x; offset <= pos - begin; offset += gridDim.x) {
+    int key = begin + offset;
+    int c = threadIdx.x, dist = pos - key;
+    float dot = flint::row::Sum(
+        128,
+        [&](int i) {
+          return Get(p.q, (t * 24 + h) * 128 + i) *
+                 Get(p.cache_k, ((size_t)(key % p.capacity) * 8 + h / 3) * 128 + i);
+        },
+        buf);
+    if (!c) {
+      float bias = dist < 1024 ? Get(p.rel, (t * 24 + h) * 1024 + dist) : 0;
+      p.scores[(size_t)(t * 24 + h) * p.capacity + offset] =
+          Round(Round(Round(dot) * 0.08838834764831845f) + bias);
+    }
   }
 }
 __global__ void Attend(AttentionParams p) {
   __shared__ float buf[128];
   int row = blockIdx.x, t = row / 24, h = row % 24, c = threadIdx.x;
-  int pos = p.position + t, begin = Begin(p, pos), n = pos - begin + 1;
+  int pos = Position(p.position, p.d_pos) + t, begin = Begin(p, pos), n = pos - begin + 1;
   float* scores = p.scores + (size_t)row * p.capacity;
   float sink = Get(p.sink, row), peak = sink;
   for (int j = c; j < n; j += 128) peak = fmaxf(peak, scores[j]);
@@ -137,7 +143,7 @@ int flint_attention_forward(AttentionParams p, void* s) {
   if (p.tokens < 1 || p.position < 0 || p.capacity < 1 ||
       (!p.sliding && p.position > p.capacity - p.tokens))
     return cudaErrorInvalidValue;
-  int visible = p.position + p.tokens;
+  int visible = p.d_pos ? 128 : p.position + p.tokens;
   if (visible > p.capacity) visible = p.capacity;
   Score<<<dim3(visible, 24, p.tokens), 32, 0, static_cast<cudaStream_t>(s)>>>(p);
   auto status = cudaGetLastError();

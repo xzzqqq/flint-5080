@@ -140,6 +140,7 @@ class Replay::Module {
         throw std::runtime_error("forward ABI version mismatch");
       destroy_ = Symbol<decltype(destroy_)>("flint_forward_destroy");
       run_ = Symbol<decltype(run_)>("flint_forward_run_layers");
+      stats_ = reinterpret_cast<decltype(stats_)>(dlsym(handle_, "flint_forward_graph_stats"));
       context_ = Symbol<decltype(&flint_forward_create)>("flint_forward_create")(
           host.weights_ ? &host.weights_->view() : nullptr, &host.kv_->view(),
           &host.scratch_->view(), host.stream_);
@@ -150,6 +151,12 @@ class Replay::Module {
     }
   }
   ~Module() { Close(); }
+  void ReportGraphStats(Object& reply, const char* key) const {
+    if (stats_) {
+      auto stats = stats_(context_);
+      reply[key] = Object{{"captures", stats.captures}, {"launches", stats.launches}};
+    }
+  }
   ForwardRunResult Run(const ForwardRunSpec& s, const ForwardOptions& o = {}) {
     ForwardRunResult r{};
     int code = run_(context_, &s, &o, &r);
@@ -183,6 +190,7 @@ class Replay::Module {
   void* handle_{};
   ForwardContext* context_{};
   decltype(&flint_forward_destroy) destroy_{};
+  decltype(&flint_forward_graph_stats) stats_{};
   decltype(&flint_forward_run_layers) run_{};
 };
 std::unique_ptr<Replay::Module> Replay::Load(const fs::path& path) {
@@ -227,12 +235,22 @@ Replay::Replay(DaemonConfig cfg) : config_(std::move(cfg)) {
   config_.baseline = baseline;
   Cuda(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
   try {
-    // Initialize the resident CUDA library context before sampling per-reload VRAM.
+    // The driver retains graph launch storage at its high-water mark for
+    // the process lifetime. Warm the same two live executables as interleaved
+    // A/B, then destroy both before sampling steady-state unload losses.
     if (weights_) {
       Cuda(cudaMemsetAsync(ids_, 0, sizeof(int), stream_));
-      auto spec = Spec(0, 1, 1, 0, true, false);
+      const auto free_before = FreeBytes();
+      auto spec = Spec(0, 48, 1, 0, true, true);
+      spec.is_decode = 1;
       spec.reset_kv = 1;
-      Load(config_.baseline)->Run(spec);
+      {
+        auto a = Load(config_.baseline), b = Load(config_.baseline);
+        ForwardOptions opts{.use_cuda_graph = 1, .return_logits = 1};
+        a->Run(spec, opts);
+        b->Run(spec, opts);
+      }
+      warmup_vram_bytes_ = int64_t(free_before) - int64_t(FreeBytes());
     }
   } catch (...) {
     cudaStreamDestroy(stream_);
@@ -250,6 +268,7 @@ Object Replay::Status() const {
           {"model_dir", config_.model_dir.string()},
           {"weights_load_ms", weights_load_ms_},
           {"weights_h2d_ms", weights_ ? weights_->transfer_ms() : 0},
+          {"warmup_vram_bytes", warmup_vram_bytes_},
           {"weights_bytes", weights_ ? weights_->view().arena_bytes : 0},
           {"kv_bytes", kv_->view().arena_bytes},
           {"kv_seq_len", config_.kv_seq_len},
@@ -397,6 +416,11 @@ Object Replay::Measure(const Json& q, const std::string& cmd) {
   auto rounds = cmd == "ab" ? Count(q, "rounds", 5, 1, 10000) : 1;
   if (size_t(iters) * rounds > 100000) throw std::runtime_error("too many timed iterations");
   Object reply;
+  using Clock = std::chrono::steady_clock;
+  auto elapsed_ms = [](Clock::time_point start) {
+    return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+  };
+  auto record_start = Clock::now();
   Recording uncached;
   const Recording* rec;
   if (e2e) {
@@ -409,6 +433,7 @@ Object Replay::Measure(const Json& q, const std::string& cmd) {
     if (it == cache_.end()) it = cache_.emplace(key, Record(ids, begin, end, step)).first;
     rec = &it->second;
   }
+  reply["recording_ms"] = elapsed_ms(record_start);
   const auto& r = *rec;
   blocks_ = r.blocks;
   auto spec = Spec(begin, end, r.ids.size(), r.position, e2e, e2e);
@@ -418,8 +443,10 @@ Object Replay::Measure(const Json& q, const std::string& cmd) {
                          .use_speculative = q.get("use_speculative", true),
                          .return_logits = e2e,
                          .enable_profiling = cmd == "profile" || q.get("enable_profiling", false)};
+  auto load_start = Clock::now();
   auto a = Load(q.at(cmd == "ab" ? "so_a" : "so_path").as<std::string>());
   auto b = cmd == "ab" ? Load(q.at("so_b").as<std::string>()) : nullptr;
+  reply["module_load_ms"] = elapsed_ms(load_start);
   auto run = [&](Module& module) {
     Restore(r, begin);
     return module.Run(spec, options);
@@ -502,8 +529,12 @@ Object Replay::Measure(const Json& q, const std::string& cmd) {
     }
     reply["stages"] = std::move(stages);
   }
+  a->ReportGraphStats(reply, b ? "graph_a" : "graph");
+  if (b) b->ReportGraphStats(reply, "graph_b");
+  auto unload_start = Clock::now();
   b.reset();
   a.reset();
+  reply["module_unload_ms"] = elapsed_ms(unload_start);
   Golden(reply, config_.golden_dir, name, ids, r, end, e2e, e2e ? logits : output, width_,
          last.next_token_id);
   if (cmd == "dump") {

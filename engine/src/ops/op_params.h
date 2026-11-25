@@ -1,6 +1,8 @@
 #ifndef FLINT_OP_PARAMS_H
 #define FLINT_OP_PARAMS_H
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -73,6 +75,7 @@ typedef struct {
   const void *x, *scale;
   void* y;
   int tokens, position, log_scale;
+  const int32_t* d_pos;
 } ClipParams;
 /* Caller selects one visit's cache planes. For ring writes, only the last capacity slots survive.
  */
@@ -80,6 +83,7 @@ typedef struct {
   const void *k, *v;
   void *cache_k, *cache_v;
   int tokens, position, capacity, sliding;
+  const int32_t* d_pos;
 } CacheParams;
 /* scores: tokens * 24 * capacity floats. Cache must retain every visible key. */
 typedef struct {
@@ -87,6 +91,7 @@ typedef struct {
   void* y;
   float* scores;
   int tokens, position, capacity, sliding;
+  const int32_t* d_pos;
 } AttentionParams;
 typedef struct {
   const void *x, *gate;
@@ -137,6 +142,21 @@ typedef struct {
   float* y;
   int layer, width;
 } MergeParams;
+typedef struct {
+  const short* trellis;
+  const void *suh, *svh;
+  int k2;
+} ExpertProjection;
+typedef struct {
+  const ExpertProjection* table;
+  const int* ids;
+} ExpertSelection;
+/* Reference SGEMM partitions K into this many contiguous reductions. */
+enum { FLINT_EXPERT_K_SPLITS = 12 };
+int flint_exl3_indexed_gemv(ExpertSelection experts, const float* rotated, float* partial, int k,
+                            int n, void* stream);
+int flint_exl3_indexed_rotate(ExpertSelection expert, WhtParams p, int input, int broadcast,
+                              void* stream);
 int flint_exl3_decode_inner_f16(DecodeParams p, void* cuda_stream);
 int flint_wht128_scale_in(WhtParams p, void* cuda_stream);
 int flint_wht128_scale_out(WhtParams p, void* cuda_stream);

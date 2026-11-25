@@ -9,6 +9,7 @@ struct AttentionBatch {
   void* y;
   int tokens, position;
   VisitPlanEntry visit;
+  const int32_t* d_pos{};
 };
 void RunSlidingAttention(const Gemm&, ScratchArenaView, const LayerWeightsView&,
                          const KvStateArenaView&, AttentionBatch);
@@ -17,7 +18,7 @@ void RunFullAttention(const Gemm&, ScratchArenaView, const LayerWeightsView&,
 // Optional diagnostic outputs use the same token-major layout as the router.
 void RunSparseMoeBlock(const Gemm&, ScratchArenaView, const LayerWeightsView&, const void* x,
                        void* y, int tokens, float* logits = nullptr, int* ids = nullptr,
-                       float* weights = nullptr);
+                       float* weights = nullptr, const ExpertProjection* experts = nullptr);
 void RunBlockResidual(const Gemm&, ScratchArenaView, ResidualParams);
 void RunMessageGate(const Gemm&, ScratchArenaView, const ControllerWeightsView&, const float* x,
                     const float* message, float* y, int tokens);

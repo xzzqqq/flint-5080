@@ -14,6 +14,8 @@ extern "C" cudaError_t CUDARTAPI cudaProfilerStop(void);
 #include <memory>
 #include <new>
 #include <span>
+#include <tuple>
+#include <vector>
 
 #include "forge/forward_abi.h"
 #include "model/inkling2_forward.h"
@@ -25,8 +27,11 @@ struct ForwardContext {
   ForwardContext& operator=(const ForwardContext&) = delete;
 
   ~ForwardContext() {
-    gemm.reset();
     if (graph) cudaGraphExecDestroy(graph);
+    if (source_graph) cudaGraphDestroy(source_graph);
+    gemm.reset();
+    if (experts) cudaFree(experts);
+    if (host_token) cudaFreeHost(host_token);
     for (auto event : marks)
       if (event) cudaEventDestroy(event);
     if (owned_stream) cudaStreamDestroy(owned_stream);
@@ -40,7 +45,12 @@ struct ForwardContext {
 
   std::unique_ptr<flint::Gemm> gemm;
   ScratchArenaView activations{};
-  int* next_token{};
+  int *next_token{}, *host_token{};
+  int32_t* d_decode_pos{};
+  ExpertProjection* experts{};
+  ForwardGraphStats graph_stats{};
+  uint32_t graph_blocks{};
+  cudaGraph_t source_graph{};
   std::array<VisitPlanEntry, 48> plan{};
   const ModelWeightsView* weights{};
   const KvStateArenaView* kv{};
@@ -119,18 +129,39 @@ ForwardContext* flint_forward_create(const ModelWeightsView* weights, const KvSt
   if (weights) {
     try {
       if (!kv || !scratch) return nullptr;
+      if (cudaMallocHost(&context->host_token, sizeof(int)) != cudaSuccess) return nullptr;
       context->plan = flint::BuildVisitPlan(weights->config);
       flint::ops_detail::ScratchWorkspace ws(*scratch);
       constexpr size_t bytes = 4 << 20;
       auto workspace = ws.Take<char>(bytes);
       context->next_token = ws.Take<int>(1);
+      context->d_decode_pos = ws.Take<int32_t>(1);
       context->activations = ws.rest;
+      std::vector<ExpertProjection> descriptors;
+      descriptors.reserve(2 * FLINT_NUM_EXPERTS * FLINT_NUM_PHYSICAL_LAYERS);
+      for (const auto& layer : weights->layers)
+        for (const auto* projection : {layer.gate_up_proj, layer.down_proj})
+          for (unsigned e = 0; e < FLINT_NUM_EXPERTS; ++e) {
+            const auto& m = projection[e];
+            if (m.k2 != 6 && m.k2 != 7) return nullptr;
+            descriptors.push_back({m.trellis, m.suh, m.svh, m.k2});
+          }
+      auto table_bytes = descriptors.size() * sizeof(ExpertProjection);
+      if (cudaMalloc(&context->experts, table_bytes) != cudaSuccess ||
+          cudaMemcpyAsync(context->experts, descriptors.data(), table_bytes, cudaMemcpyHostToDevice,
+                          context->stream) != cudaSuccess ||
+          cudaStreamSynchronize(context->stream) != cudaSuccess)
+        return nullptr;
       context->gemm = std::make_unique<flint::Gemm>(context->stream, workspace, bytes);
     } catch (const std::exception&) {
       return nullptr;
     }
   }
   return context.release();
+}
+
+ForwardGraphStats flint_forward_graph_stats(const ForwardContext* context) {
+  return context->graph_stats;
 }
 
 void flint_forward_destroy(ForwardContext* context) { delete context; }
@@ -227,16 +258,35 @@ void Execute(ForwardContext& c, const ForwardRunSpec& s, const ForwardOptions& o
 }
 
 void PrepareGraph(ForwardContext& c, const ForwardRunSpec& s, const ForwardOptions& o) {
-  if (c.graph && !std::memcmp(&s, &c.captured, sizeof(s)) &&
-      !std::memcmp(&o, &c.captured_options, sizeof(o)))
-    return;
-  if (c.graph) Require(cudaGraphExecDestroy(c.graph));
-  c.graph = nullptr;
+  auto key = [](const ForwardRunSpec& spec, const ForwardOptions& options) {
+    return std::tuple(spec.begin_visit, spec.end_visit, spec.run_embed, spec.run_lm_head,
+                      options.return_logits, spec.d_input_ids, spec.d_hidden_in, spec.d_block_in,
+                      spec.num_block_in, spec.d_hidden_out, spec.d_block_out, spec.d_logits_out,
+                      spec.d_next_token);
+  };
+  if (c.graph) {
+    bool hit = c.weights ? key(s, o) == key(c.captured, c.captured_options)
+                         : !std::memcmp(&s, &c.captured, sizeof(s)) &&
+                               !std::memcmp(&o, &c.captured_options, sizeof(o));
+    if (hit) return;
+    Require(cudaGraphExecDestroy(c.graph));
+    c.graph = nullptr;
+    Require(cudaGraphDestroy(c.source_graph));
+    c.source_graph = nullptr;
+  }
   c.graph_plan = {};
   cudaGraph_t graph{};
   Require(cudaStreamBeginCapture(c.stream, cudaStreamCaptureModeThreadLocal));
   try {
-    Execute(c, s, o, c.graph_plan, true);
+    if (c.weights) {
+      auto spec = s;
+      spec.reset_kv = 0;
+      spec.num_block_out = &c.graph_blocks;
+      flint::RunInkling(*c.gemm, c.plan, *c.weights, *c.kv, c.activations, spec, o, c.graph_plan,
+                        c.marks.data(), nullptr, c.experts, c.d_decode_pos);
+    } else {
+      Execute(c, s, o, c.graph_plan, true);
+    }
   } catch (...) {
     cudaStreamEndCapture(c.stream, &graph);
     if (graph) cudaGraphDestroy(graph);
@@ -244,8 +294,12 @@ void PrepareGraph(ForwardContext& c, const ForwardRunSpec& s, const ForwardOptio
   }
   Require(cudaStreamEndCapture(c.stream, &graph));
   auto status = cudaGraphInstantiate(&c.graph, graph, 0);
-  cudaGraphDestroy(graph);
-  Require(status);
+  if (status != cudaSuccess) {
+    cudaGraphDestroy(graph);
+    Require(status);
+  }
+  c.source_graph = graph;
+  ++c.graph_stats.captures;
   std::memcpy(&c.captured, &s, sizeof(s));
   c.captured_options = o;
 }
@@ -270,7 +324,10 @@ int32_t flint_forward_run_layers_capture(ForwardContext* c, const ForwardRunSpec
   if (s->num_block_out) *s->num_block_out = 0;
   bool profiling = false;
   try {
-    if (o->use_cuda_graph && !c->weights) {
+    bool decode = c->weights && spec.is_decode && spec.seq_len == 1;
+    bool graph = o->use_cuda_graph && (!c->weights || (decode && !capture && !o->enable_profiling));
+    if (decode && spec.pos_offset >= c->kv->max_full_seq_len) return r->status;
+    if (graph) {
       PrepareGraph(*c, *s, *o);
       *r = c->graph_plan;
     }
@@ -279,21 +336,31 @@ int32_t flint_forward_run_layers_capture(ForwardContext* c, const ForwardRunSpec
       profiling = true;
     }
     Require(cudaEventRecord(c->start, c->stream));
-    if (o->use_cuda_graph && !c->weights)
+    if (decode)
+      Require(cudaMemcpyAsync(c->d_decode_pos, &spec.pos_offset, sizeof(int32_t),
+                              cudaMemcpyHostToDevice, c->stream));
+    if (graph) {
+      if (decode && spec.reset_kv)
+        Require(cudaMemsetAsync(c->kv->arena_base, 0, c->kv->arena_bytes, c->stream));
       Require(cudaGraphLaunch(c->graph, c->stream));
-    else if (c->weights)
+      ++c->graph_stats.launches;
+      if (c->weights && spec.num_block_out) *spec.num_block_out = c->graph_blocks;
+    } else if (c->weights)
       flint::RunInkling(*c->gemm, c->plan, *c->weights, *c->kv, c->activations, *s, *o, *r,
-                        c->marks.data(), capture);
+                        c->marks.data(), capture, c->experts, decode ? c->d_decode_pos : nullptr);
     else
       Execute(*c, *s, *o, *r, false);
+    r->next_token_id = -1;
+    int* token = c->weights ? c->host_token : &r->next_token_id;
+    if (s->run_lm_head && s->d_next_token)
+      Require(
+          cudaMemcpyAsync(token, s->d_next_token, sizeof(int), cudaMemcpyDeviceToHost, c->stream));
     Require(cudaEventRecord(c->stop, c->stream));
     Require(cudaEventSynchronize(c->stop));
+    if (s->run_lm_head && s->d_next_token) r->next_token_id = *token;
     Require(cudaEventElapsedTime(&r->elapsed_ms, c->start, c->stop));
     for (unsigned i = 0; i < r->num_stages; ++i)
       Require(cudaEventElapsedTime(&r->stages[i].elapsed_ms, c->marks[i], c->marks[i + 1]));
-    r->next_token_id = -1;
-    if (s->run_lm_head && s->d_next_token)
-      Require(cudaMemcpy(&r->next_token_id, s->d_next_token, sizeof(int), cudaMemcpyDeviceToHost));
     r->status = cudaSuccess;
   } catch (cudaError_t error) {
     r->status = error;

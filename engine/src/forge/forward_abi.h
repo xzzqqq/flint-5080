@@ -91,6 +91,11 @@ int32_t flint_forward_run_layers_capture(ForwardContext* context, const ForwardR
 int32_t flint_forward_run_smoke(ForwardContext* context, const ForwardWorkspace* workspace,
                                 const ForwardOptions* options, int32_t n_elems, float bias,
                                 ForwardSmokeOutput* result);
+/* Optional inspection symbol, including for hosts loading older ABI v2 modules. */
+typedef struct ForwardGraphStats {
+  uint64_t captures, launches;
+} ForwardGraphStats;
+ForwardGraphStats flint_forward_graph_stats(const ForwardContext* context);
 void flint_forward_destroy(ForwardContext* context);
 
 #ifdef __cplusplus

@@ -42,6 +42,7 @@ class Replay {
   std::optional<KvStateArena> kv_;
   std::optional<ScratchArena> scratch_, io_;
   double weights_load_ms_{};
+  int64_t warmup_vram_bytes_{};
   cudaStream_t stream_{};
   unsigned width_{2304}, vocab_{201024}, capacity_{}, serial_{};
   uint16_t* carry_{};

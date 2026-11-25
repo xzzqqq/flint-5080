@@ -37,7 +37,8 @@ uint64_t VisitBytes(const ModelConfig& c, const LayerWeightsView& l, VisitPlanEn
 void RunInkling(const Gemm& g, const std::array<VisitPlanEntry, 48>& plan,
                 const ModelWeightsView& w, const KvStateArenaView& kv, ScratchArenaView scratch,
                 const ForwardRunSpec& s, const ForwardOptions& o, ForwardRunResult& result,
-                const cudaEvent_t* marks, const ForwardCapture* capture) {
+                const cudaEvent_t* marks, const ForwardCapture* capture,
+                const ExpertProjection* experts, const int32_t* d_pos) {
   const int t = s.seq_len, h = w.config.hidden_size, n = t * h;
   const auto stream = g.stream();
   ScratchWorkspace ws(scratch);
@@ -138,7 +139,8 @@ void RunInkling(const Gemm& g, const std::array<VisitPlanEntry, 48>& plan,
     }
     int stride = (visit.has_messages || nq == 3) ? n : 0;
     AttentionBatch batch{
-        normalized, normalized + stride, normalized + 2 * stride, tmp, t, int(s.pos_offset), visit};
+        normalized, normalized + stride, normalized + 2 * stride, tmp, t, int(s.pos_offset), visit,
+        d_pos};
     (visit.is_full_attention ? RunFullAttention : RunSlidingAttention)(g, ws.rest, l, kv, batch);
     float* history = kv.sublayer_conv_state + size_t(v) * 2 * h * kv.conv_state_len;
     auto conv = [&](const void* weight, float* state) {
@@ -155,7 +157,8 @@ void RunInkling(const Gemm& g, const std::array<VisitPlanEntry, 48>& plan,
     if (visit.has_messages)
       RunMessageGate(g, ws.rest, l.controllers[3], attn, messages + 3 * n, attn, t);
     norm(attn, FLINT_F32, l.mlp_norm, normalized);
-    RunSparseMoeBlock(g, ws.rest, l, normalized, tmp, t);
+    RunSparseMoeBlock(g, ws.rest, l, normalized, tmp, t, nullptr, nullptr, nullptr,
+                      experts + visit.physical_layer * 2 * FLINT_NUM_EXPERTS);
     conv(l.mlp_sconv, history + h * kv.conv_state_len);
     CheckCuda(flint_add_residual(partial, tmp, hidden, n, FLINT_BF16, stream));
     if (v == 5) {

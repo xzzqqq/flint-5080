@@ -49,8 +49,9 @@ struct Runner {
         w, kv, &scratch, nullptr));
     Require(bool(ctx), "create context");
   }
-  ForwardRunResult operator()(const ForwardRunSpec& s, const ForwardCapture* cap = nullptr) {
-    ForwardOptions opts{.use_cuda_graph = 1, .return_logits = s.run_lm_head};
+  ForwardRunResult operator()(const ForwardRunSpec& s, const ForwardCapture* cap = nullptr,
+                              bool graph = true) {
+    ForwardOptions opts{.use_cuda_graph = graph, .return_logits = s.run_lm_head};
     ForwardRunResult r{};
     CheckCuda(cap ? inspect(ctx.get(), &s, &opts, &r, cap) : run(ctx.get(), &s, &opts, &r));
     CheckCuda(r.status);
@@ -198,46 +199,79 @@ bool Case(Runner& run, const ModelConfig& c, const KvStateArenaView& kv,
   decode.reset_kv = 0;
   decode.seq_len = 1;
   decode.is_decode = 1;
-  std::vector<int> actual{first.next_token_id};
-  double elapsed = 0;
-  auto step = [&](int token, size_t idx, bool capture) {
-    upload(&token, 1);
-    decode.pos_offset = t + idx;
-    return run(decode, capture ? &cap : nullptr);
-  };
-  for (size_t j = 1; j < gold.size(); ++j) {
-    auto r = step(actual.back(), j - 1, j == 1);
-    actual.push_back(r.next_token_id);
-    elapsed += r.elapsed_ms;
-    if (j == 1) {
-      for (int v = 0; v < 48; ++v)
-        ok &= Compare(file, "decode_0.step_" + std::to_string(v), cap.steps[v], c.hidden_size);
-      ok &= Compare(file, "decode_0.logits", logits, vocab, true);
-    }
-  }
-  size_t hits = std::inner_product(actual.begin(), actual.end(), gold.begin(), size_t(0),
-                                   std::plus<>(), std::equal_to<>());
-  std::cout << "greedy " << hits << "/" << gold.size() << " prefill_ms=" << first.elapsed_ms
-            << " decode_ms=" << elapsed / (gold.size() - 1) << " ids=";
-  for (auto id : actual) std::cout << id << ' ';
-  std::cout << std::endl;
-  if (hits != gold.size()) {
+  // Inspect intermediate tensors separately from the timed decode runs.
+  upload(&first.next_token_id, 1);
+  decode.pos_offset = t;
+  run(decode, &cap, false);
+  for (int v = 0; v < 48; ++v)
+    ok &= Compare(file, "decode_0.step_" + std::to_string(v), cap.steps[v], c.hidden_size);
+  ok &= Compare(file, "decode_0.logits", logits, vocab, true);
+
+  std::vector<std::vector<float>> eager;
+  double eager_ms = 0;
+  auto stats = run.module.symbol<decltype(&flint_forward_graph_stats)>("flint_forward_graph_stats");
+  for (bool graph : {false, true}) {
     upload(ids.data(), t);
-    size_t forced = run(pre).next_token_id == gold[0];
+    int token = run(pre).next_token_id;
+    size_t hits = token == gold.front();
+    auto before = stats(run.ctx.get());
+    double elapsed = 0, max_abs = 0, top64_max_abs = 0;
+    uint64_t traffic = 0;
     for (size_t j = 1; j < gold.size(); ++j) {
-      auto r = step(gold[j - 1], j - 1, false);
-      if (r.next_token_id == gold[j])
-        ++forced;
-      else {
-        auto rank = Tensor<float>(file, "decode_" + std::to_string(j - 1) + ".top64_logits",
-                                  TensorDType::kF32);
-        std::cout << "forced mismatch position=" << j << " expected=" << gold[j]
-                  << " actual=" << r.next_token_id << " golden_margin=" << rank[0] - rank[1]
-                  << std::endl;
+      decode.pos_offset = t + j - 1;
+      upload(&token, 1);
+      auto r = run(decode, nullptr, graph);
+      token = r.next_token_id;
+      hits += token == gold[j];
+      elapsed += r.elapsed_ms;
+      traffic = r.logical_bytes;
+      auto values = Read<float>(logits, vocab);
+      auto key = "decode_" + std::to_string(j - 1);
+      auto top = Tensor<int>(file, key + ".top64_ids", TensorDType::kI32);
+      auto ref = Tensor<float>(file, key + ".top64_logits", TensorDType::kF32);
+      for (size_t k = 0; k < top.size(); ++k) {
+        double diff = double(values.at(top[k])) - ref.at(k);
+        Require(std::isfinite(diff), "nonfinite golden top64 logit");
+        top64_max_abs = std::max(top64_max_abs, std::abs(diff));
+      }
+      if (graph) {
+        const auto& expected = eager[j - 1];
+        for (size_t k = 0; k < values.size(); ++k)
+          max_abs = std::max(max_abs, std::abs(double(values[k]) - expected[k]));
+        Require(!std::memcmp(values.data(), expected.data(), vocab * sizeof(float)),
+                "graph/eager logits mismatch at " + key);
+      } else {
+        eager.push_back(std::move(values));
       }
     }
-    std::cout << "teacher_forced " << forced << "/" << gold.size() << std::endl;
-    ok = false;
+    auto after = stats(run.ctx.get());
+    auto count = after.captures - before.captures;
+    auto launches = after.launches - before.launches;
+    double ms = elapsed / (gold.size() - 1);
+    if (!graph) eager_ms = ms;
+    std::cout << name << (graph ? " graph" : " eager") << " greedy=" << hits << "/" << gold.size()
+              << " captures=" << count << " launches=" << launches << " decode_ms=" << ms
+              << " tok_s=" << 1000 / ms << " logical_bytes=" << traffic
+              << " sol_pct=" << traffic / (9.6e6 * ms) << " speedup=" << eager_ms / ms
+              << " top64_max_abs=" << top64_max_abs << " graph_eager_max_abs=" << max_abs
+              << std::endl;
+    if (hits != gold.size()) {
+      upload(ids.data(), t);
+      size_t forced = run(pre).next_token_id == gold[0];
+      for (size_t j = 1; j < gold.size(); ++j) {
+        decode.pos_offset = t + j - 1;
+        upload(&gold[j - 1], 1);
+        auto id = run(decode, nullptr, graph).next_token_id;
+        if (id == gold[j])
+          ++forced;
+        else
+          std::cout << "forced mismatch position=" << j << " expected=" << gold[j]
+                    << " actual=" << id << std::endl;
+      }
+      std::cout << "teacher_forced " << forced << "/" << gold.size() << std::endl;
+    }
+    ok &= hits == gold.size() && count == unsigned(graph) &&
+          launches == (graph ? gold.size() - 1 : 0) && top64_max_abs == 0;
   }
   return ok;
 }
@@ -312,22 +346,25 @@ int main(int argc, char** argv) {
     Require(!golden.empty(), "missing golden directory");
     std::cout << std::setprecision(9);
     // Lazy CUDA/cuBLAS kernel loading retains driver memory until process
-    // exit. Exercise one warm visit before measuring a fresh arena/DSO lifetime.
+    // exit. Warm a full decode graph before measuring a fresh arena/DSO lifetime.
     const auto cold = Free();
     {
       auto w = WeightsArena::Load(model);
       auto kv = KvStateArena::Allocate(w.view().config, 1);
       auto scratch = ScratchArena::Allocate();
-      auto io = ScratchArena::Allocate(8192);
+      auto io = ScratchArena::Allocate(8192 + sizeof(float) * w.view().config.unpadded_vocab_size);
       auto id = static_cast<int*>(io.view().device_ptr);
       CheckCuda(cudaMemset(id, 0, sizeof(int)));
       Runner warm(path, &w.view(), &kv.view(), scratch.view());
-      warm({.end_visit = 1,
+      warm({.end_visit = 48,
             .run_embed = 1,
+            .run_lm_head = 1,
+            .is_decode = 1,
             .reset_kv = 1,
             .seq_len = 1,
             .d_input_ids = id,
-            .d_hidden_out = id + 1});
+            .d_hidden_out = id + 1,
+            .d_logits_out = reinterpret_cast<float*>(id + 2048)});
     }
     const auto before = Free();
     std::cout << "cold_warmup_delta_bytes=" << int64_t(cold) - int64_t(before) << std::endl;
@@ -336,12 +373,20 @@ int main(int argc, char** argv) {
       auto w = WeightsArena::Load(model);
       auto kv = KvStateArena::Allocate(w.view().config, 1024);
       auto scratch = ScratchArena::Allocate();
-      Runner run(path, &w.view(), &kv.view(), scratch.view());
-      for (auto name : {"short_math", "short_sky", "short_code"})
-        ok &= Case(run, w.view().config, kv.view(),
-                   SafetensorsFile::Open(std::filesystem::path(golden) /
-                                         ("e2e_" + std::string(name) + ".safetensors")),
-                   name);
+      for (auto name : {"short_math", "short_sky", "short_code"}) {
+        auto available = Free();
+        {
+          Runner run(path, &w.view(), &kv.view(), scratch.view());
+          ok &= Case(run, w.view().config, kv.view(),
+                     SafetensorsFile::Open(std::filesystem::path(golden) /
+                                           ("e2e_" + std::string(name) + ".safetensors")),
+                     name);
+        }
+        auto after_case = Free();
+        auto loss = available > after_case ? available - after_case : 0;
+        std::cout << name << " unload_loss_bytes=" << loss << std::endl;
+        ok &= loss == 0;
+      }
     }
     auto after = Free();
     size_t loss = before > after ? before - after : 0;

@@ -66,6 +66,11 @@ if(NOT CMAKE_CUDA_ARCHITECTURES)
         "$<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_${FLINT_CUDA_ARCH},code=sm_${FLINT_CUDA_ARCH}>")
 endif()
 
+# Keep CUDA source-line attribution for nsys/ncu without bloating Release binaries.
+foreach(target engine_ops forward)
+    target_compile_options(${target} PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>")
+endforeach()
+
 add_library(forge_smoke STATIC src/forge/forge_smoke.cpp)
 target_include_directories(forge_smoke PUBLIC src)
 target_link_libraries(forge_smoke PRIVATE engine_loader CUDA::cudart ${CMAKE_DL_LIBS})
