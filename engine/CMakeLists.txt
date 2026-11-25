@@ -34,10 +34,15 @@ if(NOT CMAKE_CUDA_ARCHITECTURES)
         "-gencode=arch=compute_${FLINT_CUDA_ARCH},code=sm_${FLINT_CUDA_ARCH}")
 endif()
 
+add_library(engine_loader STATIC src/loader/safetensors.cpp src/loader/arenas.cpp)
+set_target_properties(engine_loader PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(engine_loader PUBLIC src)
+target_link_libraries(engine_loader PUBLIC CUDA::cudart)
+
 add_library(engine STATIC src/runtime/engine_api.cpp $<TARGET_OBJECTS:smoke_op>)
 set_target_properties(engine PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(engine PUBLIC include PRIVATE src)
-target_link_libraries(engine PRIVATE CUDA::cudart)
+target_link_libraries(engine PRIVATE engine_loader CUDA::cudart)
 
 add_library(forward SHARED src/model/forward_entry.cpp $<TARGET_OBJECTS:smoke_op>)
 set_target_properties(forward PROPERTIES PREFIX "" OUTPUT_NAME "forward")
@@ -46,7 +51,7 @@ target_link_libraries(forward PRIVATE CUDA::cudart)
 
 add_library(forge_smoke STATIC src/forge/forge_smoke.cpp)
 target_include_directories(forge_smoke PUBLIC src)
-target_link_libraries(forge_smoke PRIVATE CUDA::cudart ${CMAKE_DL_LIBS})
+target_link_libraries(forge_smoke PRIVATE engine_loader CUDA::cudart ${CMAKE_DL_LIBS})
 
 add_executable(forge-host src/forge/forge_host.cpp)
 target_link_libraries(forge-host PRIVATE forge_smoke)
@@ -57,3 +62,7 @@ add_executable(engine_tests tests/test_engine_smoke.cpp)
 target_link_libraries(engine_tests PRIVATE engine forge_smoke)
 add_dependencies(engine_tests forward)
 add_test(NAME engine_smoke COMMAND engine_tests --forward $<TARGET_FILE:forward>)
+
+add_executable(loader_tests tests/test_loader.cpp)
+target_link_libraries(loader_tests PRIVATE engine_loader)
+add_test(NAME loader_tests COMMAND loader_tests)

@@ -209,25 +209,25 @@
 
 实测目标卡为单张 **RTX 5080 16,303 MiB（15.92 GiB）**，无桌面显示占用（headless）。
 
-### 5.1 静态显存账本
+### 5.1 静态显存账本（已按 RTX 5080 `loader_tests` 实测校准）
 
-| 分区（Arena） | Phase 1–2（AR Only） | Phase 3（AR + DSpark） | 说明 |
+| 分区（Arena） | Phase 1–2（AR Only，实测） | Phase 3（AR + DSpark，预算） | 说明 |
 |---|---:|---:|---|
-| **Weights Arena：文本主干** | 11,853 MiB (11.57 GiB) | 11,853 MiB (11.57 GiB) | `model.safetensors` 全部 payload（含 BF16 `embed`/`unembed`） |
-| **Weights Arena：DSpark** | 0 MiB | 606 MiB (0.59 GiB) | `model-mtp.safetensors` 全部 54 个 BF16 张量 |
-| **CUDA Context + cuBLAS/运行时 + CUDA Graph** | ~450 MiB | ~550 MiB | 预留驱动上下文、静态 Graph 实例与流缓冲 |
-| **Scratch Workspace Arena** | ~450 MiB | ~550 MiB | 激活缓冲、chunked prefill 临时张量（如 chunk=512）、路由/重排缓冲、logits 缓冲 |
-| **KV & State Cache Arena（剩余可用）** | **~3,550 MiB (~3.47 GiB)** | **~2,744 MiB (~2.68 GiB)** | 含主干 48 逻辑层 KV、DSpark 3 层 KV 及短卷积状态（`sconv` 状态极小，单序列 <1 MiB） |
-| **合计** | **16,303 MiB** | **16,303 MiB** | 静态预分配，热路径严禁动态 `cudaMalloc` |
+| **Weights Arena：文本主干** | 11,852.6 MiB (`12,428,319,744` B) | 11,852.6 MiB | `model.safetensors` 全部 19,318 有效张量（256 B 对齐，6,264 个 `.mul1` 标量仅在 host 校验不占 VRAM）；整卡加载耗时 **1.51 s**（H2D **46.31 GB/s**） |
+| **Weights Arena：DSpark** | 0 MiB | 606.3 MiB | `model-mtp.safetensors` 全部 54 个 BF16 张量 |
+| **CUDA Context + 运行时 + CUDA Graph** | ~732 MiB（驱动初始空闲 `15,571.9 MiB`） | ~850 MiB | 含驱动上下文、cuBLAS 句柄、静态 Graph 实例与流缓冲 |
+| **Scratch Workspace Arena** | 450.0 MiB (`471,859,200` B) | ~550 MiB | 激活缓冲、chunked prefill 临时张量、路由/重排缓冲、logits 缓冲 |
+| **KV & State Cache Arena（剩余可用）** | **3,267.9 MiB 实测余量**（64K 占 `2,211.7 MiB`，仍余 `1,055.9 MiB`） | **~2,444 MiB** | 含主干 40 SWA + 8 Full BF16 KV 与 48 逻辑步 FP32 短卷积状态（单序列 `3.80 MiB`） |
+| **合计** | **16,303 MiB** | **16,303 MiB** | 单次静态预分配，热路径严禁动态 `cudaMalloc`（析构实测零泄漏） |
 
 ### 5.2 KV Cache 容量测算（按 40 SWA + 8 Full 精确折算）
 
 Inkling 2 Mini 的 48 逻辑层中仅 **8 层为 Full Attention**（`8 KV heads × 128 head_dim × 2(K,V)`），其余 40 层为固定窗长 `1024` 的 SWA；DSpark 3 层中 2 层 SWA + 1 层 Full：
 
-| KV 精度 | 主干 SWA 固定开销（40×1024） | 主干 Full 增量（8 层） | DSpark SWA / Full | 32K 上下文（AR / +DSpark） | 64K 上下文（AR / +DSpark） | KV Arena 可容纳上限（AR 3.47 GiB / +DSpark 2.68 GiB） |
+| KV 精度 | 主干 SWA + SConv 固定开销 | 主干 Full 增量（8 层） | DSpark SWA / Full | 32K 上下文（AR / +DSpark） | 64K 上下文（AR / +DSpark） | KV Arena 实测/预算上限（AR `3,268 MiB` / +DSpark `~2,444 MiB`） |
 |---|---:|---:|---|---:|---:|---|
-| **BF16 (2 B/elem)** | 160 MiB | 32 KiB/tok | 8 MiB / 4 KiB/tok | 1,184 / 1,320 MiB | 2,208 / 2,472 MiB | **~108K**（AR） / **~73K**（+DSpark） |
-| **FP8 (1 B/elem)** | 80 MiB | 16 KiB/tok | 4 MiB / 2 KiB/tok | 592 / 660 MiB | 1,104 / 1,236 MiB | **~222K**（AR） / **~151K**（+DSpark） |
+| **BF16 (2 B/elem)** | 163.8 MiB（160 MiB SWA + 3.8 MiB SConv） | 32 KiB/tok | 8 MiB / 4 KiB/tok | 1,188 / 1,324 MiB | 2,212 / 2,476 MiB | **99,335 tokens 实测上限**（AR） / **~63K**（+DSpark） |
+| **FP8 (1 B/elem)** | 83.8 MiB（80 MiB SWA + 3.8 MiB SConv） | 16 KiB/tok | 4 MiB / 2 KiB/tok | 596 / 664 MiB | 1,108 / 1,240 MiB | **~203K**（AR） / **~134K**（+DSpark） |
 
 > **工程结论**：
 > - Phase 1–2 直接采用 **BF16 KV** 即可在 16 GiB 上轻松覆盖 64K–96K 单序列（或双并发 C2 各 32K+），实现简单且零 KV 量化误差。

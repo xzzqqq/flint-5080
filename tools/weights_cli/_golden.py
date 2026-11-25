@@ -146,9 +146,10 @@ def e2e_case(model, case, steps):
     generated = [int(last.argmax())]
 
     def top(prefix, logits):
-        vals, ids = logits.topk(64)
+        # Match argmax's lowest-token-ID tie break in the saved ranking.
+        ids = logits.argsort(descending=True, stable=True)[:64]
         saved[prefix + ".top64_ids"] = ids.int()
-        saved[prefix + ".top64_logits"] = vals
+        saved[prefix + ".top64_logits"] = logits[ids]
 
     top("prefill", last)
     for s in range(steps):
