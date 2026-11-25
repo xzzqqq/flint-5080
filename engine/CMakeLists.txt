@@ -39,6 +39,19 @@ set_target_properties(engine_loader PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(engine_loader PUBLIC src)
 target_link_libraries(engine_loader PUBLIC CUDA::cudart)
 
+add_library(engine_ops OBJECT
+    src/ops/exl3_linear.cu src/ops/norm_embed.cu src/ops/sconv.cu
+    src/ops/attention.cu src/ops/moe.cu src/ops/loop_res.cu
+    src/ops/gemm_cublas.cpp src/ops/submodules.cpp)
+set_target_properties(engine_ops PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(engine_ops PUBLIC src)
+target_link_libraries(engine_ops PUBLIC CUDA::cudart CUDA::cublas)
+target_compile_options(engine_ops PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:-rdc=false>")
+if(NOT CMAKE_CUDA_ARCHITECTURES)
+    target_compile_options(engine_ops PRIVATE
+        "$<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_${FLINT_CUDA_ARCH},code=sm_${FLINT_CUDA_ARCH}>")
+endif()
+
 add_library(engine STATIC src/runtime/engine_api.cpp $<TARGET_OBJECTS:smoke_op>)
 set_target_properties(engine PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(engine PUBLIC include PRIVATE src)
@@ -47,7 +60,7 @@ target_link_libraries(engine PRIVATE engine_loader CUDA::cudart)
 add_library(forward SHARED src/model/forward_entry.cpp src/ops/stub_layers.cu $<TARGET_OBJECTS:smoke_op>)
 set_target_properties(forward PROPERTIES PREFIX "" OUTPUT_NAME "forward")
 target_include_directories(forward PRIVATE src)
-target_link_libraries(forward PRIVATE CUDA::cudart)
+target_link_libraries(forward PRIVATE engine_ops CUDA::cudart)
 if(NOT CMAKE_CUDA_ARCHITECTURES)
     target_compile_options(forward PRIVATE
         "$<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_${FLINT_CUDA_ARCH},code=sm_${FLINT_CUDA_ARCH}>")
@@ -76,3 +89,7 @@ target_link_libraries(forge_tests PRIVATE engine_loader)
 add_dependencies(forge_tests forge-host)
 add_test(NAME forge_tests COMMAND forge_tests $<TARGET_FILE:forge-host> $<TARGET_FILE:forward>)
 set_tests_properties(forge_tests PROPERTIES TIMEOUT 60)
+
+add_executable(ops_tests tests/test_ops_golden.cpp)
+target_link_libraries(ops_tests PRIVATE engine_ops engine_loader)
+add_test(NAME ops_tests COMMAND ops_tests)
