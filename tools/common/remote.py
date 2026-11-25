@@ -98,7 +98,9 @@ def build_rsync_args(cfg: DevConfig, *, dry_run: bool = False) -> list[str]:
     ]
 
 
-def _capture(cmd: list[str], *, stream: bool, timeout: int | None) -> CommandResult:
+def _capture(
+    cmd: list[str], *, stream: bool, timeout: int | None, echo_stdout: bool = True
+) -> CommandResult:
     start = time.monotonic()
     with subprocess.Popen(
         cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True
@@ -119,8 +121,9 @@ def _capture(cmd: list[str], *, stream: bool, timeout: int | None) -> CommandRes
                             block = os.read(key.fd, 65536)
                             value = decoder.decode(block, final=not block)
                             chunks[index].append(value)
-                            sys.stderr.write(value)
-                            sys.stderr.flush()
+                            if index == 1 or echo_stdout:
+                                sys.stderr.write(value)
+                                sys.stderr.flush()
                             if not block:
                                 selector.unregister(key.fileobj)
                 stdout, stderr = ("".join(parts) for parts in chunks)
@@ -181,8 +184,14 @@ class Executor:
         check: bool = False,
         stream_stderr: bool = False,
         timeout: int | None = None,
+        echo_stdout: bool = True,
     ) -> CommandResult:
-        result = _capture(self._args(shell_cmd, cwd), stream=stream_stderr, timeout=timeout)
+        result = _capture(
+            self._args(shell_cmd, cwd),
+            stream=stream_stderr,
+            timeout=timeout,
+            echo_stdout=echo_stdout,
+        )
         if check and result.returncode:
             raise RuntimeError(
                 result.stderr.strip() or f"Command failed (exit {result.returncode})"

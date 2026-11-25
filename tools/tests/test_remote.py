@@ -38,6 +38,8 @@ def test_local_run(cfg, capsys):
     assert out.stdout.strip() == str(cfg.repo_root) and out.stderr == "err\n"
     captured = capsys.readouterr()
     assert captured.out == "" and "err\n" in captured.err and out.stdout in captured.err
+    quiet = ex.run("pwd; echo progress >&2", stream_stderr=True, echo_stdout=False)
+    assert quiet.stdout == out.stdout and capsys.readouterr().err == "progress\n"
     assert ex.sync().skipped
     assert ex.run("pwd", cwd="/").stdout == "/\n"
     assert ex.run("exit 17").returncode == 17

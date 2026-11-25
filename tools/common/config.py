@@ -51,6 +51,12 @@ class ModelConfig:
 
 
 @dataclass
+class WeightsConfig:
+    python: str = ""
+    golden_dir: str = ""
+
+
+@dataclass
 class ServerConfig:
     bind: str = "127.0.0.1:8080"
 
@@ -78,6 +84,7 @@ class DevConfig:
     model: ModelConfig = field(default_factory=ModelConfig)
     server: ServerConfig = field(default_factory=ServerConfig)
     workload: WorkloadConfig = field(default_factory=WorkloadConfig)
+    weights: WeightsConfig = field(default_factory=WeightsConfig)
 
     @property
     def is_remote(self) -> bool:

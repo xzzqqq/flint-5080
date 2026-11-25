@@ -1,0 +1,119 @@
+{
+  "cases": [
+    {
+      "name": "short_math",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is 17 * 23? Answer with just the number."
+        }
+      ],
+      "reasoning_effort": "none",
+      "decode_steps": 48,
+      "input_ids": [
+        200002,
+        200004,
+        34182,
+        279,
+        154554,
+        150628,
+        25,
+        220,
+        15,
+        200010,
+        200000,
+        200004,
+        1775,
+        149884,
+        220,
+        68107,
+        196987,
+        220,
+        68169,
+        30,
+        154710,
+        149899,
+        150239,
+        149876,
+        150107,
+        13,
+        200010
+      ]
+    },
+    {
+      "name": "short_sky",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Explain in one sentence why the sky is usually blue."
+        }
+      ],
+      "reasoning_effort": "none",
+      "decode_steps": 101,
+      "input_ids": [
+        200002,
+        200004,
+        34182,
+        279,
+        154554,
+        150628,
+        25,
+        220,
+        15,
+        200010,
+        200000,
+        200004,
+        100887,
+        149881,
+        150011,
+        156021,
+        151661,
+        149876,
+        158808,
+        149884,
+        152978,
+        152778,
+        13,
+        200010
+      ]
+    },
+    {
+      "name": "short_code",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Write a one-line Python function that squares its argument."
+        }
+      ],
+      "reasoning_effort": "none",
+      "decode_steps": 136,
+      "input_ids": [
+        200002,
+        200004,
+        34182,
+        279,
+        154554,
+        150628,
+        25,
+        220,
+        15,
+        200010,
+        200000,
+        200004,
+        3711,
+        149878,
+        150011,
+        12,
+        909,
+        152743,
+        150131,
+        149890,
+        165839,
+        150114,
+        152701,
+        13,
+        200010
+      ]
+    }
+  ]
+}

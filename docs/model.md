@@ -78,7 +78,7 @@
 
 > **关键约束**：
 > - 每个逻辑步拥有独立的 KV 槽位与短卷积滚动状态（`k=4` 缓存最近 3 步状态）；循环体物理层 `6..17` 共享权重，但 Pass 0 / 1 / 2 各自维护独立的 KV Cache。
-> - `mtp_config.target_layer_ids = [5, 23, 41, 48]` 对应逻辑执行深度的边界采样点（并非物理层编号），在 Phase 1 逐层对齐与 Phase 3 接入 DSpark 时按 HF/ExLlamaV3 参考实现精确锁死。
+> - `mtp_config.target_layer_ids = [5, 23, 41, 48]` 对应逻辑执行深度的边界采样点（并非物理层编号），前三项取对应逻辑步的输入，最后一项取最终 RMSNorm 输出。
 
 ### 3.3 `model.safetensors` 张量命名与算子清单
 
@@ -92,14 +92,14 @@
 | Norm（局部 20 层） | `model.llm.layers.{i}.attn_norm.weight` | 20 | `BF16` | `[2304]` | SWA 层 Attention 输入 RMSNorm |
 | Norm（全局 4 层） | `model.llm.layers.{5,11,17,23}.{q,k,v}_input_norm.weight` | 各 4 | `BF16` | `[2304]` | Full Attention 层分离 Q/K/V 输入 RMSNorm |
 | Norm（MLP） | `model.llm.layers.{i}.mlp_norm.weight` | 24 | `BF16` | `[2304]` | MoE MLP 输入 RMSNorm |
-| Pre-Sublayer SConv | `model.llm.layers.{i}.{attn,mlp}_sconv.weight` | 各 24 | `BF16` | `[2304, 1, 4]` | Attention / MLP 前置 1D 深度因果短卷积 |
+| Post-Sublayer SConv | `model.llm.layers.{i}.{attn,mlp}_sconv.weight` | 各 24 | `BF16` | `[2304, 1, 4]` | Attention / MLP 输出的因果深度卷积（`post_attention_convolution` / `post_mlp_convolution`） |
 | Attention 量化投影 | `{i}.self_attn.{q,k,v}_proj.linear.*`<br>`{i}.self_attn.o_proj.{gate_proj,linear}.*` | 24 × 5 | EXL3 6-bit | 见 §4.2 | Q (`2304→3072`), K/V (`2304→1024`), Output Gate (`2304→3072`), O (`3072→2304`) |
 | K/V SConv（局部 20 层） | `model.llm.layers.{i}.attn.{k,v}_sconv.weight` | 各 20 | `BF16` | `[1024, 1, 4]` | 静态深度因果短卷积 |
 | K/V SConv（全局 4 层） | `model.llm.layers.{5,11,17,23}.attn.{k,v}_sconv.{static_w,weight_proj}` | 各 4 | `BF16` | `[4, 1024]`, `[32, 2304]` | 动态输入条件 K/V 因果短卷积 |
 | 相对位置 / Clip / Sink | `model.llm.layers.{i}.attn.wr_du.weight`<br>`...rel_logits_proj.proj`<br>`...{q,rel}_l2_clip.scale`<br>`...attn_sink_proj.weight` | 各 24 | `BF16` | `[384, 2304]`<br>`[16, 1024]`<br>`[24, 128]`, `[24, 16]`<br>`[24, 2304]` | 学习相对位置偏置、Q/Rel L2 裁剪缩放、学习 Attention Sink 投影 |
 | MoE Router | `model.llm.layers.{i}.mlp.gate.{weight,bias}` | 各 24 | `BF16`, `F32` | `[128, 2304]`, `[128]` | Top-8 路由打分（`route_scale = 8.0`） |
 | MoE Experts | `{i}.experts.gate_up_proj.{j}.*`<br>`{i}.experts.down_proj.{j}.*` | 24 × 128 × 2 | EXL3 3.0 / 3.5-bit | 见 §4.2 | Fused `gate_up` (`2304→2304`) + softcap SwiGLU + `down` (`1152→2304`) |
-| Attention Residuals | `model.llm.attn_res.attn_queries.{0..22}`<br>`model.llm.attn_res.mlp_queries.{0..23}`<br>`model.llm.attn_res.output_query` | 23 / 24 / 1 | `F32` | `[3, 2304]`（层 `4,10,16,22`）或 `[2304]` | 每 6 层块的跨层残差注意力汇聚（`attn_res_normalize_values = true`） |
+| Attention Residuals | `model.llm.attn_res.attn_queries.{0..22}`<br>`model.llm.attn_res.mlp_queries.{0..23}`<br>`model.llm.attn_res.output_query` | 23 / 24 / 1 | `F32` | `[3, 2304]`（查询 `4,10,16,22` 对应物理层 `5,11,17,23`）或 `[2304]` | `attn_queries.i` 属于物理层 `i+1`，层 0 无查询。`mlp_queries.i` 属于层 `i` |
 | 跨 Pass 查询与控制器 | `model.llm.middle_cycle_cross_pass{,_kv}_queries`<br>`model.llm.layers.{6..17}.controllers.{attn,k,v,mlp}.{down,forget,gain}_weight` | 2 + 144 | `F32`<br>`BF16` | `[24, 2304]`<br>`[64, 4608]`, `[2304, 64]` | 中间 12 层循环的跨轮消息门控与状态混合（低秩 `gate_rank = 64`） |
 
 ### 3.4 DSpark / MTP Drafter 结构（`model-mtp.safetensors`，Phase 3 接入）
@@ -108,6 +108,50 @@
 - **3 层 Dense Decoder**（`523,807,488` B，499.54 MiB）：`hidden=2304`、`intermediate=9216`、GQA `24Q/8KV` (`head_dim=128`)、RoPE `theta=1e6`；层 `0, 2` 为 SWA (`window=1024`)、层 `1` 为 Full Attention；带上下文条件投影 `k_proj_ctx` / `v_proj_ctx` / `k_norm_ctx` 与 `dflare_norm`。
 - **特征融合与掩码**：`fuse_weight` (`[4, 4]`)、`mask_embed` (`[2304]`)、`norm.weight` (`[2304]`)。
 - **Markov RNN Head**（`111,979,008` B，106.79 MiB，`block_size = 8`, `markov_rank = 256`, `markov_head_type = "rnn_hidden"`）：`dflare_norm`、`rnn_proj` (`[768, 5120]` + bias)、`hidden_out` (`[2304, 256]` + bias)、`markov_w1.weight` (`[201024, 256]`, 102.92 MB)。
+
+### 3.5 核心算子数学语义与前向数据流
+
+以下精确语义对照上游 `huggingface/transformers#51050`（`430050f6`）并在 [tools/weights_cli/_inkling2_ref.py](../tools/weights_cli/_inkling2_ref.py) 中针对 `Maxrio/Inkling-2-Mini-exl3`（`3.3bpw`）实测锁死。公式使用零基位置 $t$，单请求省略 batch 维，定义 $\text{cap}(x, a) = a \tanh(x / a)$、$\text{RMS}(x) = x \cdot \text{rsqrt}(\text{mean}(x^2) + 10^{-6})$。
+
+1. **Embedding 与输出头**：
+   - 输入嵌入：`embed_norm(embed[token_ids])`（带权 RMSNorm，`eps = 1e-6`）。
+   - 输出头：`final_input(block_states, partial)` → 最终带权 RMSNorm → 仅投影前 `unpadded_vocab_size = 200058` 行 `unembed[:200058]` → FP32 下执行 $\text{cap}(\text{logits}, 30.0)$。
+   - **DSpark / MTP 采样点**：`[5, 23, 41]` 取对应零基逻辑步的输入残差，`48` 取最终带权 RMSNorm 之后的隐藏态。
+
+2. **因果短卷积（`k = 4`，FP32 计算与滚动状态）**：
+   - **静态卷积**（20 层 SWA `k/v_sconv` 及全部 24 层 `post_attention_convolution` / `post_mlp_convolution`）：权重最后一位作用于当前 token，带残差缩放输出为 $(\text{conv1d}(x) + x) / \sqrt{5}$。
+   - **动态卷积**（4 层 Full Attention 的 `k/v_sconv`）：权重按反向 lag 排布（`lag = 0` 为当前 token），每个 KV 头由条件输入投影出 4 抽头系数 $w_{\text{dyn}} = x_{\text{cond}} W_{\text{proj}}^T \in \mathbb{R}^{8 \times 4}$，与逐通道静态权重 $W_{\text{static}}^T$ 相加后加权求和，输出为 $(\sum_{\text{lag}=0}^{3} x_{t-\text{lag}} \odot w_{\text{lag}} + x_t) / 3$（即 $1/\sqrt{2k+1}$）。
+   - **位置约定**：`k/v_sconv` 位于 K/V 线性投影与头归一化之间；`attn_sconv` 与 `mlp_sconv` 位于 Attention / MoE 输出之后、进入残差汇总之前。
+
+3. **注意力（GQA 24Q / 8KV，`head_dim = 128`）**：
+   - **Q / K / V 归一化与裁剪**：
+     - $Q$ 先乘逐元素 `q_l2_clip.scale`，再与 $K$ 一同按头执行 L2 裁剪：$x \leftarrow x \cdot \min(1,\, 22.627416997969522 / (\|x\|_2 + 10^{-6}))$。
+     - $V$ 执行无权 $\text{RMS}(V)$（`use_value_norm_no_gamma = true`）。
+   - **学习相对位置偏置**：$R = \text{reshape}(x_q W_r^T,\, [24, 16])$，乘 `rel_l2_clip.scale` 后按同式 L2 裁剪至阈值 `8.0`。
+   - **Full Attention 对数位置缩放**：仅 4 个全局物理层（`5, 11, 17, 23`）对裁剪后的 $Q$ 与 $R$ 乘以 $\tau(t) = 1 + 0.1 \ln(\max(1,\, (t + 1) / 8192))$。
+   - **偏置查表与打分**：$\text{rel\_logits} = R \cdot P_{\text{rel}}$（`proj [16, 1024]`），按反向距离 $d = t_q - t_k$ 索引，超出 $0 \le d < 1024$ 置零。注意力打分 $S = QK^T / \sqrt{128} + \text{bias}$；因果掩码要求 $d \ge 0$，SWA 额外要求 $d < 1024$。
+   - **Attention Sink 与门控输出**：由 $x_q$ 经 `attn_sink_proj` 得到每头 1 个 sink logit 追加为最后一列，在 FP32 下做 Softmax 后丢弃 sink 概率再乘 $V$；最后乘 $\sigma(x_q W_{\text{gate}})$ 并经 `o_proj.linear` 投影回 `2304`。
+
+4. **MoE 路由与 Softcapped SwiGLU**：
+   - **FP32 Router**：$s = \sigma(x W_{\text{gate}}^T)$，按 $s + b$ 选 Top-8 专家；路由权重取未加偏置的分数归一化并放大：$w_i = 8.0 \cdot s_i / (\sum_{j \in \text{top8}} s_j + 10^{-20})$。
+   - **专家前向**：`gate_up_proj` 输出 `[2304]` 沿末维均分为 `[gate(1152), up(1152)]`，激活为 $\text{cap}(\text{gate}, 4.0) \cdot \sigma(\text{gate}) \cdot \text{cap}(\text{up}, 25.0)$（注意 $\sigma$ 作用于**未截断的原始 `gate`**），经 `down_proj` 后按 $w_i$ 在 FP32 中累加。
+
+5. **块残差注意力（Attention Residuals）与 3-Pass 循环控制器**：
+   - **汇聚算子**：将历史 `block_states` 与当前 `partial` 拼接为 $S$ 并逐行做无权 $\text{RMS}(S)$，查询输出为 $\text{softmax}(q S^T / \sqrt{2304}) S$（物理层 `0` 无 `attention_input`；全局层 `5, 11, 17, 23` 用 `[3, 2304]` 分别查询 Q/K/V 输入）。
+   - **6 层块边界重置**：当物理层号满足 $i \bmod 6 = 0$（即层 `0, 6, 12, 18`）时，在 `post_attention_convolution` 后将**进入该层前的残差**压入 `block_states`，并将 `partial` 重置为注意力卷积输出；非边界层直接将注意力卷积输出累加到 `partial`。MLP 输入由更新后的 `(block_states, partial)` 查询，其卷积输出再加回 `partial`。
+   - **Pass 1 / 2 跨轮消息与门控**：Pass 0 不触发控制器；进入 Pass 1、2 时保留上一遍结束时的 `partial` 以及 `block_states[num_pre_loop_blocks + 1:]`（跳过 prologue 与循环首边界，Mini 中即保留层 `12` 入口块），同时将 `(hidden, block_states)` 恢复至 prologue 结束状态。循环层 `6..17` 使用由 `middle_cycle_cross_pass{,_kv}_queries` 合并而成的 `[12, 4, 2304]`（顺序 `[q, k, v, mlp]`）查询跨轮消息 $m$，再通过低秩控制器（`gate_rank = 64`）在对应输入 RMSNorm 之前混合：
+     $$z = [\text{RMS}(x),\, \text{RMS}(m)] W_{\text{down}}^T, \qquad y = (1 - \tanh(z W_{\text{forget}}^T)) \odot x + \tanh(z W_{\text{gain}}^T) \odot m$$
+   - **独立状态槽位**：48 个逻辑步各自持有独立的 KV Cache 与 4 份卷积历史（`k_sconv`、`v_sconv`、`attn_sconv`、`mlp_sconv`）。
+
+### 3.6 Golden Reference 与 Fixture 契约（`weights golden`）
+
+`./bin/weights golden` 使用 [workloads/golden_cases.json](../workloads/golden_cases.json) 中锁定的 `messages`、`reasoning_effort` 与经 checkpoint tokenizer 校验的 `input_ids`，在 5080 上持单卡 lease 生成两级标准 `.safetensors` 夹具及 `manifest.json`（默认输出至 `<weights.golden_dir>/<model_name>`）：
+
+| 产出文件 | 核心内容与命名约定 | 消费方式（Phase 1 对齐） |
+|---|---|---|
+| `ops_golden.safetensors` | • `exl3.{3_0,3_5,6_0}.*`：真实权重切片、`inner_f16_slice`、`inner_sha256` 及 `x`/`y`<br>• `{static,dynamic}_sconv.{prefill,decode_0,decode_1}.*`（层 `0` / 层 `5` `k_sconv`）<br>• `{sliding,full}_attention.{prefill,decode_0}.*`（层 `0` / 层 `5`）<br>• `moe.*`（层 `0` router logits/top-8/weights/output）<br>• `block_residual.layer_{1,5}.*`、`message_residual.layer_6_pass_1.*`、`message_gate.{attn,k,v,mlp}.*` | 单算子与子模块独立单元测试（卷积用例需按 `prefill → decode_0 → decode_1` 顺序回放状态） |
+| `e2e_<case>.safetensors` | • `input_ids` / `generated_ids`（`I32`，共 `decode_steps + 1` 个生成 token）<br>• `prefill.{embed,step_0..47,mtp_tap_{5,23,41,48}}`（`BF16`）与 `prefill.{last_logits,top64_*}`<br>• `decode_0.{step_0..47,logits}` 及每步 `decode_{s}.{final_hidden,top64_ids,top64_logits}` | 48 逻辑步逐段对齐（`forge run --layers`）与端到端多步 decode 验收 |
+| `manifest.json` | Checkpoint / 生成器 SHA256、张量清单元数据、生成文本、全位置 cached decode vs teacher-forced prefill 自检误差、峰值 VRAM 与耗时 | 可追溯的 provenance 与 CI / 回归基线核验 |
 
 ---
 
@@ -146,14 +190,18 @@
 - 单个奇数专家（`gate_up + down`，3.5-bit）：`3,499,784` B（3.338 MiB）
 - 每物理层 128 专家合计：`416,121,856` B / `1,019,215,872` 逻辑参数 = **`3.266212` effective bpw**（24 层完全一致）。
 
-### 4.3 线性前向语义（Phase 1 Baseline 基准）
+### 4.3 `mul1` 位流解码与线性前向语义
 
-对任意 EXL3 线性投影 $y = x W$（输入 $x \in \mathbb{R}^{M \times K}$，输出 $y \in \mathbb{R}^{M \times N}$）：
-1. 输入逐通道乘符号/缩放向量 `suh` 后做 128-wide Walsh-Hadamard 旋转：$\tilde{x} = \text{WHT}_{128}(x \odot \text{suh})$。
-2. 从 `trellis` 按 `mul1` 码本解码出 $16 \times 16$ 块权重 $\tilde{W}$，计算 $\tilde{y} = \tilde{x} \tilde{W}$。
-3. 输出做 128-wide Walsh-Hadamard 逆旋转并乘 `svh`：$y = \text{WHT}_{128}(\tilde{y}) \odot \text{svh}$。
+设 $b = 2 \times \text{bits} \in \{6, 7, 12\}$，单个 $16 \times 16$ tile 在 `trellis` 中占 $8b$ 个 `I16`（共 $L = 128b$ 位）：
 
-> **Phase 1 数值对齐策略**：实现正确性验证（`weights golden`）必须使用**同一份 Maxrio 3.3bpw checkpoint** 的 ExLlamaV3 / 精确反量化参考逐层比对，确保 48 逻辑层、SWA/Full、Dynamic K/V SConv、Attention Sink、Attn-Res 与 Loop Controllers 零语义误差；后续 kernel 融合、repack 与 KV 量化再以该 baseline 及 teacher-forced KLD 守门。
+1. **位流与尾绕滑窗**：相邻两个 `I16` 按低字在前拼成 `U32`，字内按大端（MSB 优先）读取位流。步 $p \in [0, 256)$ 的结束位为 $E(p) = \lfloor (p + 1) b / 2 \rfloor$（3.5-bit 下偶步进 3 位、奇步进 4 位），向前取 16 位按 $L$ 环绕得到 16-bit 状态 $u_p$。
+2. **`mul1` 码本求值**：取 $q = (u_p \times \texttt{0x83DCD12D}) \bmod 2^{32}$，令 $s$ 为 $q$ 四个无符号字节之和，则解码值为 $\text{fp16}((1024 + s) \cdot \text{fp16}(\texttt{0x1EEE}) + \text{fp16}(\texttt{0xC931}))$（单次 FP16 舍入，CUDA 侧对应 1 条 `IMAD` + 1 条 `DP4A` + 半条 `HFMA2`）。
+3. **Tensor-Core Tile 排列**：按 `mma.m16n8k16` B-fragment 顺序映射，对 $p = 8l + j$（$l \in [0, 32),\, j \in [0, 8)$），写入块内坐标：
+   $$r = 2(l \bmod 4) + (j \bmod 2) + 8(\lfloor j / 2 \rfloor \bmod 2), \qquad c = \lfloor l / 4 \rfloor + 8\lfloor j / 4 \rfloor$$
+4. **Hadamard 旋转线性前向**：拼成内层权重 $\tilde{W} \in \mathbb{R}^{K \times N}$ 后，有效权重 $W = \text{diag}(\text{suh})\, H_{128}\, \tilde{W}\, H_{128}\, \text{diag}(\text{svh})$，其中 $H_{128}$ 为按 128 维分块的归一化 Sylvester Walsh-Hadamard 矩阵（除以 $\sqrt{128}$）。在线计算等价于：
+   $$\tilde{x} = \text{WHT}_{128}(x \odot \text{suh}), \qquad \tilde{y} = \tilde{x}\tilde{W}, \qquad y = \text{WHT}_{128}(\tilde{y}) \odot \text{svh}$$
+
+> **Phase 1 数值对齐策略**：实现正确性验证统一以同一份 `Maxrio 3.3bpw` checkpoint 经 `weights golden` 生成的夹具（§3.6）逐算子、逐逻辑步比对，确保零语义误差；后续 kernel 融合、repack 与 KV 量化再以该 baseline 及 teacher-forced KLD 守门。
 
 ---
 

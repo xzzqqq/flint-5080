@@ -51,3 +51,8 @@ bind = "127.0.0.1:8080"
 
 [workload]
 default_case = ""
+
+[weights]
+# Interpreter on the execution host and parent directory for generated goldens.
+python = ""
+golden_dir = ""

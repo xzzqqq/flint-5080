@@ -193,7 +193,7 @@ char* engine_stats_json(EngineHandle* h); // 返回 JSON 快照供 /ready 与 P1
 | **`dev`** | 纯 stdlib | 工程骨架与服务运维：`status`（5080 占用/温度/显存/同步状态）、`build`（`--engine`/`--server`/`--all`）、`serve`（`start`/`stop`/`logs`）、`check`（`--local` Mac 秒级单测 + `--gpu` 远程验收）、`ssh`（逃生舱）。 |
 | **`forge`** | 纯 stdlib | 驱动远端/本机 `forge-host` 的全部调优原语（`start/stop/run/ab/profile/dump/ls/rm`）。 |
 | **`bench`** | 轻量异步 HTTP & 统计 | 纯黑盒 HTTP 压测器（支持 `--url` 测自研或任意 OpenAI 兼容竞品）：固定 coding-agent trace、TTFT、Canary 回归、paired geometric mean + bootstrap CI 报表。以服务端计时为主、客户端校准为辅。 |
-| **`weights`** | 独立重依赖环境（`torch`/`safetensors`/`transformers`） | 低频离线权重与参考对齐：`inspect`、`repack`（输出 `safetensors`）、`golden`（生成 HF tokenizer/template/layer golden fixtures）、`kld`（调用常驻引擎做 teacher-forcing KLD 评测）。 |
+| **`weights`** | 纯 stdlib 前端；离线生成子进程通过 `weights.python` 指向独立 PyTorch 环境 | 低频离线权重与参考对齐：`inspect`、`repack`（输出 `safetensors`）、`golden`（持单卡 lease 生成算子与 48 逻辑步 prefill/decode 黄金夹具，详见 [model.md](model.md)）、`kld`（调用常驻引擎做 teacher-forcing KLD 评测）。 |
 
 ---
 
