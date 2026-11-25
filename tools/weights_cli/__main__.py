@@ -1,21 +1,42 @@
-"""Entrypoint for `bin/weights` (placeholder until Phase 1)."""
-
-from __future__ import annotations
+"""Entrypoint for bin/weights."""
 
 import argparse
+import time
+from pathlib import Path
+
+from tools.common.config import find_repo_root, load_config
+from tools.common.output import RunResult, emit_result
+
+from . import commands
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        prog="weights",
-        description=(
-            "Flint-5080 offline safetensors inspection, repacking, golden fixture generation, "
-            "and KLD evaluation CLI. Scheduled for Phase 1."
-        ),
+def build_parser():
+    parser = argparse.ArgumentParser(prog="weights", description="Inspect Flint-5080 checkpoints.")
+    json_help = "Emit machine-readable JSON on stdout."
+    parser.add_argument("--json", action="store_true", help=json_help)
+    subs = parser.add_subparsers(dest="command", required=True)
+    child = subs.add_parser("inspect", help="Inventory checkpoint files and tensor headers.")
+    child.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help=json_help)
+    child.add_argument("--path", help="Inspect this directory instead of model.weights_dir.")
+    child.add_argument("--local", action="store_true", help="Inspect the local filesystem.")
+    child.add_argument("--tensors", action="store_true", help="Include individual tensor records.")
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    start = time.monotonic()
+    result = RunResult(f"weights {args.command}", True, {})
+    root = find_repo_root(Path(__file__))
+    try:
+        cfg = load_config(repo_root=root, allow_missing=args.local)
+        commands.inspect(cfg, args, result)
+    except (OSError, RuntimeError, ValueError) as exc:
+        result.ok, result.error = False, str(exc)
+    result.duration_ms = (time.monotonic() - start) * 1000
+    return emit_result(
+        result, json_mode=args.json, human_formatter=commands.human_format, repo_root=root
     )
-    parser.parse_args(argv)
-    parser.print_help()
-    return 0
 
 
 if __name__ == "__main__":
