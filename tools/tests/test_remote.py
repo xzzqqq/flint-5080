@@ -1,4 +1,6 @@
+import os
 import shlex
+import shutil
 import subprocess
 
 import pytest
@@ -59,11 +61,28 @@ def test_remote_sync(cfg, tmp_path, monkeypatch):
     ssh, rsync = tmp_path / "ssh", tmp_path / "rsync"
     ssh.write_text('#!/bin/sh\nfor last do :; done\nexec bash -c "$last"\n')
     rsync.write_text('#!/bin/sh\nprintf "%s\\n" "<f+++++++++ x" ".d..t...... ./" "<f.st...... y"\n')
-    import os
-
     for path in (ssh, rsync):
         path.chmod(0o755)
     monkeypatch.setenv("PATH", str(tmp_path) + ":" + os.environ["PATH"])
     result = Executor(cfg).sync(dry_run=True)
     assert not result.skipped and result.transferred_files == 2
     assert "--dry-run" in result.cmd and (tmp_path / "remote/my-worktree").is_dir()
+
+
+@pytest.mark.skipif(not shutil.which("rsync"), reason="requires the workspace sync transport")
+def test_incremental_same_size_same_mtime(cfg, tmp_path):
+    source = cfg.repo_root / "op.cu"
+    dest = tmp_path / "synced"
+    dest.mkdir()
+    args = build_rsync_args(cfg)
+    # Exercise the production file-selection and timestamp flags with a local destination.
+    command = [*args[: args.index("-e")], str(cfg.repo_root) + "/", str(dest)]
+    for content in ["bias(1)", "bias(2)", "bias(1)"]:
+        source.write_text(content)
+        os.utime(source, (100, 100))
+        subprocess.run(command, check=True, capture_output=True)
+        assert (dest / "op.cu").read_text() == content
+        assert (dest / "op.cu").stat().st_mtime > 100
+    before = (dest / "op.cu").stat().st_mtime_ns
+    subprocess.run(command, check=True, capture_output=True)
+    assert (dest / "op.cu").stat().st_mtime_ns == before

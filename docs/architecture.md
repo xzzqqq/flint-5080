@@ -166,7 +166,7 @@ char* engine_stats_json(EngineHandle* h); // 返回 JSON 快照供 /ready 与 P1
 
 | 原语 | 职责 | 典型用法 |
 |---|---|---|
-| **`start` / `stop`** | 拉起/关闭 `forge-host` 常驻宿主并占/释 5080 lease 锁（自动将初始版本存为 `baseline.so`） | `forge start` / `forge stop` |
+| **`start` / `stop` / `status`** | 拉起/关闭/查询 `forge-host` 常驻宿主并占/释 5080 lease 锁（自动冻结 `baseline.so`，检测到 `nsys` 时预武装 profiler-API 采集） | `forge start` / `forge status` / `forge stop` |
 | **`run`** | 自动增量编并热加载 `forward.so`，输出耗时、5080 SOL 占比与数值误差（支持 `--save <name>` 保存不可变 `.so` 候选） | `forge run --layers 0..4`<br>`forge run --e2e [--full] [--no-graph] [--no-spec]`<br>`forge run --e2e --save fast-v1` |
 | **`ab`** | 同常驻会话内交替加载两个候选 `.so` 做 A-B-A-B 交错测量，消除热机与频率漂移 | `forge ab baseline current --layers 0..4`<br>`forge ab fast-v1 fast-v2 --e2e --full` |
 | **`profile`** | 默认零重启开启轻量 CUDA Event 阶段标尺，输出分阶段耗时与 960 GB/s Roofline 占比；加 `--nsys` 采集 Nsight Systems timeline | `forge profile --layers 0..1`<br>`forge profile --e2e --nsys` |
@@ -191,7 +191,7 @@ char* engine_stats_json(EngineHandle* h); // 返回 JSON 快照供 /ready 与 P1
 | 命令 | 依赖边界 | 职责 |
 |---|---|---|
 | **`dev`** | 纯 stdlib | 工程骨架与服务运维：`status`（5080 占用/温度/显存/同步状态）、`build`（`--engine`/`--server`/`--all`）、`serve`（`start`/`stop`/`logs`）、`check`（`--local` Mac 秒级单测 + `--gpu` 远程验收）、`ssh`（逃生舱）。 |
-| **`forge`** | 纯 stdlib | 驱动远端/本机 `forge-host` 的全部调优原语（`start/stop/run/ab/profile/dump/ls/rm`）。 |
+| **`forge`** | 纯 stdlib | 驱动远端/本机 `forge-host` 的全部调优原语（`start/stop/status/run/ab/profile/dump/ls/rm`）。 |
 | **`bench`** | 轻量异步 HTTP & 统计 | 纯黑盒 HTTP 压测器（支持 `--url` 测自研或任意 OpenAI 兼容竞品）：固定 coding-agent trace、TTFT、Canary 回归、paired geometric mean + bootstrap CI 报表。以服务端计时为主、客户端校准为辅。 |
 | **`weights`** | 纯 stdlib 前端；离线生成子进程通过 `weights.python` 指向独立 PyTorch 环境 | 低频离线权重与参考对齐：`inspect`、`repack`（输出 `safetensors`）、`golden`（持单卡 lease 生成算子与 48 逻辑步 prefill/decode 黄金夹具，详见 [model.md](model.md)）、`kld`（调用常驻引擎做 teacher-forcing KLD 评测）。 |
 
@@ -211,6 +211,7 @@ flint-5080/
 │   ├── include/
 │   │   └── engine_api.h # 唯一对外 Request 级 C ABI
 │   ├── src/
+│   │   ├── common/      # 零第三方依赖的轻量内部公共头（如 JSON 解析）
 │   │   ├── loader/      # safetensors mmap loader + 静态 Arena 显存规划
 │   │   ├── runtime/     # VRAM Prefix Cache, 轻量调度循环, CUDA Graph, P1 KV-RAM 扩展位
 │   │   ├── model/       # 前向编排 run_layers(begin, end), AR + dspark verify

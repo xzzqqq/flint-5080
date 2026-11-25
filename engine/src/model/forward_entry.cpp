@@ -1,7 +1,16 @@
 #include <cuda_runtime.h>
+#if __has_include(<cuda_profiler_api.h>)
+#include <cuda_profiler_api.h>
+#else
+// CUDA runtime-only toolkit installations export both APIs without the profiler header.
+extern "C" cudaError_t CUDARTAPI cudaProfilerStart(void);
+extern "C" cudaError_t CUDARTAPI cudaProfilerStop(void);
+#endif
 
 #include <algorithm>
 #include <array>
+#include <cstdio>
+#include <cstring>
 #include <memory>
 #include <new>
 #include <span>
@@ -15,6 +24,10 @@ struct ForwardContext {
   ForwardContext& operator=(const ForwardContext&) = delete;
 
   ~ForwardContext() {
+    if (graph) cudaGraphExecDestroy(graph);
+    for (auto event : marks)
+      if (event) cudaEventDestroy(event);
+    if (owned_stream) cudaStreamDestroy(owned_stream);
     if (start != nullptr) {
       cudaEventDestroy(start);
     }
@@ -23,6 +36,15 @@ struct ForwardContext {
     }
   }
 
+  const ModelWeightsView* weights{};
+  const KvStateArenaView* kv{};
+  const ScratchArenaView* scratch{};
+  cudaStream_t stream{}, owned_stream{};
+  cudaGraphExec_t graph{};
+  ForwardRunSpec captured{};
+  ForwardOptions captured_options{};
+  ForwardRunResult graph_plan{};
+  std::array<cudaEvent_t, FLINT_MAX_STAGE_TIMINGS + 1> marks{};
   cudaEvent_t start{};
   cudaEvent_t stop{};
 };
@@ -65,7 +87,8 @@ namespace {
 
 uint32_t flint_forward_abi_version() { return FLINT_FORWARD_ABI_VERSION; }
 
-ForwardContext* flint_forward_create() {
+ForwardContext* flint_forward_create(const ModelWeightsView* weights, const KvStateArenaView* kv,
+                                     const ScratchArenaView* scratch, void* stream) {
   std::unique_ptr<ForwardContext> context(new (std::nothrow) ForwardContext);
   if (!context) {
     return nullptr;
@@ -76,6 +99,13 @@ ForwardContext* flint_forward_create() {
   if (cudaEventCreate(&context->stop) != cudaSuccess) {
     return nullptr;
   }
+  context->weights = weights;
+  context->kv = kv;
+  context->scratch = scratch;
+  if (!stream &&
+      cudaStreamCreateWithFlags(&context->owned_stream, cudaStreamNonBlocking) != cudaSuccess)
+    return nullptr;
+  context->stream = stream ? static_cast<cudaStream_t>(stream) : context->owned_stream;
   return context.release();
 }
 
@@ -103,4 +133,152 @@ int32_t flint_forward_run_smoke(ForwardContext* context, const ForwardWorkspace*
         ReadChecksum({params.output, static_cast<size_t>(element_count)}, result->checksum);
   }
   return result->status;
+}
+
+namespace {
+void Require(int status) {
+  if (status != cudaSuccess) throw static_cast<cudaError_t>(status);
+}
+
+// Each mark terminates one stage and starts the next. External events survive graph capture.
+void Execute(ForwardContext& c, const ForwardRunSpec& s, const ForwardOptions& o,
+             ForwardRunResult& r, bool capturing) {
+  auto mark = [&] {
+    if (o.enable_profiling)
+      Require(
+          cudaEventRecordWithFlags(c.marks[r.num_stages], c.stream,
+                                   capturing ? cudaEventRecordExternal : cudaEventRecordDefault));
+  };
+  auto stage = [&](const char* name, uint64_t bytes) {
+    r.logical_bytes += bytes;
+    if (o.enable_profiling) {
+      auto& timing = r.stages[r.num_stages++];
+      std::snprintf(timing.name, sizeof(timing.name), "%s", name);
+      timing.traffic_bytes = bytes;
+      mark();
+    }
+  };
+  StubParams p{};
+  p.width = c.weights ? c.weights->config.hidden_size : 2304;
+  p.vocab = c.weights ? c.weights->config.vocab_size : 201024;
+  p.count = s.seq_len * p.width;
+  p.position = s.pos_offset;
+  p.ids = s.d_input_ids;
+  p.input = static_cast<const float*>(s.d_hidden_in);
+  auto* out = static_cast<float*>(s.d_hidden_out);
+  p.output = s.begin_visit == s.end_visit ? out : static_cast<float*>(c.scratch->device_ptr);
+  if (c.kv) {
+    p.kv = static_cast<float*>(c.kv->swa_kv);
+    p.conv = c.kv->kv_conv_state;
+    if (s.reset_kv) {
+      Require(cudaMemsetAsync(p.kv, 0, 48 * sizeof(float), c.stream));
+      Require(cudaMemsetAsync(p.conv, 0, 48 * sizeof(float), c.stream));
+    }
+  }
+  mark();
+  if (s.run_embed) {
+    p.weight = c.weights ? static_cast<const unsigned short*>(c.weights->embed_weight) : nullptr;
+    Require(flint_stub_embed(p, c.stream));
+    p.input = p.output;
+    stage("embed", 972288);
+  } else if (s.begin_visit == s.end_visit && p.input != out) {
+    Require(
+        cudaMemcpyAsync(out, p.input, p.count * sizeof(float), cudaMemcpyDeviceToDevice, c.stream));
+  }
+  for (unsigned v = s.begin_visit; v < s.end_visit; ++v) {
+    p.visit = v;
+    unsigned physical = v < 6 ? v : v < 42 ? 6 + (v - 6) % 12 : v - 24;
+    p.weight = c.weights ? static_cast<const unsigned short*>(c.weights->layers[physical].attn_norm)
+                         : nullptr;
+    if (v + 1 == s.end_visit) p.output = out;
+    Require(flint_stub_visit(p, c.stream));
+    p.input = p.output;
+    char name[32];
+    std::snprintf(name, sizeof(name), "visit_%02u", v);
+    stage(name, (1248365568ull + 1232253888ull) / 48);
+  }
+  if (s.run_lm_head) {
+    p.input = out;
+    if (c.weights) p.vocab = c.weights->config.unpadded_vocab_size;
+    p.logits = o.return_logits ? s.d_logits_out : nullptr;
+    p.next = s.d_next_token;
+    Require(flint_stub_head(p, c.stream));
+    stage("lm_head", 926318592);
+  }
+}
+
+void PrepareGraph(ForwardContext& c, const ForwardRunSpec& s, const ForwardOptions& o) {
+  if (c.graph && !std::memcmp(&s, &c.captured, sizeof(s)) &&
+      !std::memcmp(&o, &c.captured_options, sizeof(o)))
+    return;
+  if (c.graph) Require(cudaGraphExecDestroy(c.graph));
+  c.graph = nullptr;
+  c.graph_plan = {};
+  cudaGraph_t graph{};
+  Require(cudaStreamBeginCapture(c.stream, cudaStreamCaptureModeThreadLocal));
+  try {
+    Execute(c, s, o, c.graph_plan, true);
+  } catch (...) {
+    cudaStreamEndCapture(c.stream, &graph);
+    if (graph) cudaGraphDestroy(graph);
+    throw;
+  }
+  Require(cudaStreamEndCapture(c.stream, &graph));
+  auto status = cudaGraphInstantiate(&c.graph, graph, 0);
+  cudaGraphDestroy(graph);
+  Require(status);
+  std::memcpy(&c.captured, &s, sizeof(s));
+  c.captured_options = o;
+}
+}  // namespace
+
+int32_t flint_forward_run_layers(ForwardContext* c, const ForwardRunSpec* s,
+                                 const ForwardOptions* o, ForwardRunResult* r) {
+  if (!r) return cudaErrorInvalidValue;
+  *r = {.status = cudaErrorInvalidValue, .next_token_id = -1};
+  if (!c || !s || !o || !c->scratch || !c->scratch->device_ptr || !s->seq_len ||
+      s->begin_visit > s->end_visit || s->end_visit > 48 || !s->d_hidden_out ||
+      (s->run_embed ? !s->d_input_ids : !s->d_hidden_in) ||
+      (s->run_lm_head && o->return_logits && !s->d_logits_out) || s->num_block_in)
+    return r->status;
+  size_t width = c->weights ? c->weights->config.hidden_size : 2304;
+  if (width * s->seq_len > std::min<size_t>(UINT32_MAX - 256, c->scratch->bytes / sizeof(float)))
+    return r->status;
+  if (s->num_block_out) *s->num_block_out = 0;
+  bool profiling = false;
+  try {
+    if (o->enable_profiling) {
+      for (auto& event : c->marks)
+        if (!event) Require(cudaEventCreate(&event));
+    }
+    if (o->use_cuda_graph) {
+      PrepareGraph(*c, *s, *o);
+      *r = c->graph_plan;
+    }
+    if (o->profiler_range) {
+      Require(cudaProfilerStart());
+      profiling = true;
+    }
+    Require(cudaEventRecord(c->start, c->stream));
+    if (o->use_cuda_graph)
+      Require(cudaGraphLaunch(c->graph, c->stream));
+    else
+      Execute(*c, *s, *o, *r, false);
+    Require(cudaEventRecord(c->stop, c->stream));
+    Require(cudaEventSynchronize(c->stop));
+    Require(cudaEventElapsedTime(&r->elapsed_ms, c->start, c->stop));
+    for (unsigned i = 0; i < r->num_stages; ++i)
+      Require(cudaEventElapsedTime(&r->stages[i].elapsed_ms, c->marks[i], c->marks[i + 1]));
+    r->next_token_id = -1;
+    if (s->run_lm_head && s->d_next_token)
+      Require(cudaMemcpy(&r->next_token_id, s->d_next_token, sizeof(int), cudaMemcpyDeviceToHost));
+    r->status = cudaSuccess;
+  } catch (cudaError_t error) {
+    r->status = error;
+  }
+  if (profiling) {
+    auto status = cudaProfilerStop();
+    if (!r->status) r->status = status;
+  }
+  return r->status;
 }

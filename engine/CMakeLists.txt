@@ -44,17 +44,21 @@ set_target_properties(engine PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(engine PUBLIC include PRIVATE src)
 target_link_libraries(engine PRIVATE engine_loader CUDA::cudart)
 
-add_library(forward SHARED src/model/forward_entry.cpp $<TARGET_OBJECTS:smoke_op>)
+add_library(forward SHARED src/model/forward_entry.cpp src/ops/stub_layers.cu $<TARGET_OBJECTS:smoke_op>)
 set_target_properties(forward PROPERTIES PREFIX "" OUTPUT_NAME "forward")
 target_include_directories(forward PRIVATE src)
 target_link_libraries(forward PRIVATE CUDA::cudart)
+if(NOT CMAKE_CUDA_ARCHITECTURES)
+    target_compile_options(forward PRIVATE
+        "$<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_${FLINT_CUDA_ARCH},code=sm_${FLINT_CUDA_ARCH}>")
+endif()
 
 add_library(forge_smoke STATIC src/forge/forge_smoke.cpp)
 target_include_directories(forge_smoke PUBLIC src)
 target_link_libraries(forge_smoke PRIVATE engine_loader CUDA::cudart ${CMAKE_DL_LIBS})
 
-add_executable(forge-host src/forge/forge_host.cpp)
-target_link_libraries(forge-host PRIVATE forge_smoke)
+add_executable(forge-host src/forge/forge_host.cpp src/forge/forge_daemon.cpp src/forge/replay.cpp src/forge/safetensors_writer.cpp)
+target_link_libraries(forge-host PRIVATE forge_smoke engine_loader ${CMAKE_DL_LIBS})
 add_dependencies(forge-host forward)
 
 enable_testing()
@@ -66,3 +70,9 @@ add_test(NAME engine_smoke COMMAND engine_tests --forward $<TARGET_FILE:forward>
 add_executable(loader_tests tests/test_loader.cpp)
 target_link_libraries(loader_tests PRIVATE engine_loader)
 add_test(NAME loader_tests COMMAND loader_tests)
+
+add_executable(forge_tests tests/test_forge_daemon.cpp)
+target_link_libraries(forge_tests PRIVATE engine_loader)
+add_dependencies(forge_tests forge-host)
+add_test(NAME forge_tests COMMAND forge_tests $<TARGET_FILE:forge-host> $<TARGET_FILE:forward>)
+set_tests_properties(forge_tests PROPERTIES TIMEOUT 60)

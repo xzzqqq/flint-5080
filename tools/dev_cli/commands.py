@@ -70,7 +70,7 @@ def status(cfg, args, result):
         result.ok, result.error = False, result.error or error
 
 
-def _engine_script(cfg, clean):
+def _engine_script(cfg, clean, targets=(), incremental=False):
     build = cfg.build
     flags = [
         "cmake",
@@ -88,7 +88,10 @@ def _engine_script(cfg, clean):
         configure += f' "-DCMAKE_{lang}_COMPILER_LAUNCHER=$launcher"'
     for kind in ("EXE", "SHARED", "MODULE"):
         configure += f' "-DCMAKE_{kind}_LINKER_FLAGS=$link_flags"'
-    compile_args = ["cmake", "--build", "engine/build", "--parallel"]
+    compile_args = ["cmake", "--build", "engine/build"]
+    if targets:
+        compile_args.extend(["--target", *targets])
+    compile_args.append("--parallel")
     if build.jobs:
         compile_args.append(str(build.jobs))
     lines = [
@@ -107,6 +110,8 @@ def _engine_script(cfg, clean):
     ]
     if clean:
         lines.append("rm -rf engine/build")
+    if incremental:
+        configure = f"if ! test -f engine/build/build.ninja; then {configure}; fi"
     lines.extend([configure, shlex.join(compile_args)])
     return "\n".join(lines)
 

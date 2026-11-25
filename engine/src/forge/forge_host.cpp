@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include <string_view>
 
+#include "forge_daemon.h"
 #include "forge_smoke.h"
 
 namespace {
@@ -33,6 +34,8 @@ std::filesystem::path ParseSmokeCommand(std::span<char*> arguments) {
 int main(int argc, char** argv) {
   try {
     const std::span arguments(argv, static_cast<size_t>(argc));
+    if (argc > 1 && std::string_view(argv[1]) == "--daemon")
+      return flint::RunDaemon(arguments.subspan(2));
     flint::RunForgeSmoke(ParseSmokeCommand(arguments.subspan(1)));
     return 0;
   } catch (const std::exception& error) {

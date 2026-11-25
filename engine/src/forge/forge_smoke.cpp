@@ -116,7 +116,8 @@ float RunForward(const Module& module, const ForwardWorkspace& workspace,
   const auto create = module.Symbol<decltype(&flint_forward_create)>("flint_forward_create");
   const auto destroy = module.Symbol<decltype(&flint_forward_destroy)>("flint_forward_destroy");
   const auto run = module.Symbol<decltype(&flint_forward_run_smoke)>("flint_forward_run_smoke");
-  const std::unique_ptr<ForwardContext, decltype(destroy)> context(create(), destroy);
+  const std::unique_ptr<ForwardContext, decltype(destroy)> context(
+      create(nullptr, nullptr, nullptr, workspace.cuda_stream), destroy);
   if (!context) {
     throw std::runtime_error("forward context creation failed");
   }

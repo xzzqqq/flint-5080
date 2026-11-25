@@ -128,7 +128,9 @@ def acquire_local(
         return record
 
 
-def renew_local(lock_file: str | Path, token: str, ttl_sec: int) -> LeaseRecord:
+def renew_local(
+    lock_file: str | Path, token: str, ttl_sec: int, pid: int | None = None
+) -> LeaseRecord:
     if ttl_sec <= 0:
         raise GpuLockError("GPU lease TTL must be positive")
     with _locked(lock_file) as path:
@@ -138,16 +140,22 @@ def renew_local(lock_file: str | Path, token: str, ttl_sec: int) -> LeaseRecord:
         record = status.record
         if token != record.token:
             raise GpuLockError("GPU lease token mismatch")
+        if pid is not None:
+            record.pid = pid
         record.heartbeat_at = time.time()
         record.expires_at = record.heartbeat_at + ttl_sec
         _write(path, record)
         return record
 
 
-def release_local(lock_file: str | Path, token: str | None = None, force: bool = False) -> None:
+def release_local(
+    lock_file: str | Path, token: str | None = None, force: bool = False, only_unbound: bool = False
+) -> None:
     with _locked(lock_file) as path:
         record = _inspect(path).record
         if record is None:
+            return
+        if only_unbound and (record.pid or record.token != token):
             return
         if not force and token != record.token:
             raise GpuLockError("GPU lease token mismatch")

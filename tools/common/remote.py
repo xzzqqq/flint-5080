@@ -85,7 +85,9 @@ def ssh_base_args(cfg: DevConfig) -> list[str]:
 
 
 def build_rsync_args(cfg: DevConfig, *, dry_run: bool = False) -> list[str]:
-    args = ["rsync", "-az", "--delete", "--itemize-changes"]
+    # Protocol 29 truncates mtimes to seconds. Preserve same-size fast edits and
+    # let Ninja see each changed input as newer than its last remote object.
+    args = ["rsync", "-az", "--checksum", "--no-times", "--delete", "--itemize-changes"]
     if dry_run:
         args.append("--dry-run")
     for pattern in RSYNC_EXCLUDES:

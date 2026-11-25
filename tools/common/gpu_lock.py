@@ -84,6 +84,10 @@ class GpuLeaseManager:
     def release(self, token: str | None = None, force: bool = False) -> None:
         self._call("release", token=token, force=force)
 
+    def release_unbound(self, token: str) -> None:
+        """Roll back a launch only if the execution host has not taken ownership."""
+        self._call("release", token=token, only_unbound=True)
+
     @contextmanager
     def hold(self, mode: str, ttl_sec: int | None = None, force: bool = False):
         ttl = self.cfg.gpu.lease_ttl_sec if ttl_sec is None else ttl_sec
