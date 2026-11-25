@@ -59,7 +59,7 @@ add_library(engine_model OBJECT src/model/inkling2_forward.cpp)
 set_target_properties(engine_model PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(engine_model PUBLIC engine_ops CUDA::cudart CUDA::cublas)
 
-add_library(engine STATIC src/runtime/engine_api.cpp src/runtime/sampler.cpp
+add_library(engine STATIC src/runtime/engine_api.cpp src/runtime/sampler.cpp src/runtime/prefix_cache.cpp
     $<TARGET_OBJECTS:smoke_op> $<TARGET_OBJECTS:engine_loader_obj>
     $<TARGET_OBJECTS:engine_ops> $<TARGET_OBJECTS:engine_model>)
 set_target_properties(engine PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -123,6 +123,10 @@ add_test(NAME e2e_tests COMMAND e2e_tests --forward $<TARGET_FILE:forward>)
 add_executable(sampler_tests tests/test_sampler.cpp src/runtime/sampler.cpp)
 target_include_directories(sampler_tests PRIVATE src)
 add_test(NAME sampler_tests COMMAND sampler_tests)
+add_executable(prefix_cache_tests tests/test_prefix_cache.cpp src/runtime/prefix_cache.cpp)
+target_include_directories(prefix_cache_tests PRIVATE src)
+target_link_libraries(prefix_cache_tests PRIVATE CUDA::cudart)
+add_test(NAME prefix_cache_tests COMMAND prefix_cache_tests)
 add_executable(runtime_tests tests/test_runtime_gpu.cpp)
 target_include_directories(runtime_tests PRIVATE src)
 target_link_libraries(runtime_tests PRIVATE engine CUDA::cudart)

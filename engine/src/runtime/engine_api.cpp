@@ -24,6 +24,7 @@
 #include "ops/scratch_workspace.h"
 #include "ops/stub_ops.h"
 #include "runtime/config.h"
+#include "runtime/prefix_cache.h"
 #include "runtime/sampler.h"
 
 namespace {
@@ -87,10 +88,24 @@ struct PinnedIO {
     if (logits) cudaFreeHost(logits);
   }
 };
+PrefixCache AllocatePrefixCache(RuntimeConfig& cfg, const ModelConfig& c) {
+  size_t free, total;
+  CheckCuda(cudaMemGetInfo(&free, &total));
+  size_t budget = free - std::min(free, cfg.vram_reserve_bytes);
+  size_t fixed = ComputeKvArenaSizes(c).Fixed();
+  if (cfg.prefix_cache_slots > budget / fixed)
+    throw std::invalid_argument("prefix_cache_slots exceed free VRAM budget");
+  auto capacity = KvStateArena::MaxFullSeqLenForBudget(c, budget - fixed * cfg.prefix_cache_slots);
+  if (!capacity || cfg.max_context > capacity)
+    throw std::invalid_argument("max_context exceeds free KV VRAM budget");
+  if (!cfg.max_context) cfg.max_context = capacity;
+  return PrefixCache(cfg.prefix_cache_slots, c, cfg.max_context);
+}
 struct Model {
   WeightsArena weights;
   ScratchArena scratch;
   ScratchArena io;
+  PrefixCache prefix_cache;
   PinnedIO host;
   int32_t *ids, *next;
   uint16_t* hidden;
@@ -103,7 +118,8 @@ struct Model {
         scratch(ScratchArena::Allocate(cfg.scratch_bytes)),
         io(ScratchArena::Allocate(size_t(cfg.prefill_chunk_size) *
                                       (model::kHiddenSize * sizeof(uint16_t) + sizeof(int32_t)) +
-                                  model::kUnpaddedVocabSize * sizeof(float) + 1024)) {
+                                  model::kUnpaddedVocabSize * sizeof(float) + 1024)),
+        prefix_cache(AllocatePrefixCache(cfg, weights.view().config)) {
     ops_detail::ScratchWorkspace ws(io.view());
     ids = ws.Take<int32_t>(cfg.prefill_chunk_size);
     hidden = ws.Take<uint16_t>(size_t(cfg.prefill_chunk_size) * model::kHiddenSize);
@@ -112,17 +128,6 @@ struct Model {
     CheckCuda(cudaMallocHost(&host.ids, cfg.prefill_chunk_size * sizeof(int32_t)));
     CheckCuda(cudaMallocHost(&host.logits, model::kUnpaddedVocabSize * sizeof(float)));
     const auto& c = weights.view().config;
-    size_t free, total;
-    CheckCuda(cudaMemGetInfo(&free, &total));
-    size_t budget = free - std::min(free, cfg.vram_reserve_bytes);
-    size_t fixed = ComputeKvArenaSizes(c).Fixed();
-    if (cfg.prefix_cache_slots > budget / fixed)
-      throw std::invalid_argument("prefix_cache_slots exceed free VRAM budget");
-    auto capacity =
-        KvStateArena::MaxFullSeqLenForBudget(c, budget - fixed * cfg.prefix_cache_slots);
-    if (!capacity || cfg.max_context > capacity)
-      throw std::invalid_argument("max_context exceeds free KV VRAM budget");
-    if (!cfg.max_context) cfg.max_context = capacity;
     kv.emplace(KvStateArena::Allocate(c, cfg.max_context));
     runner.emplace(weights.view(), kv->view(), scratch.view(), stream);
   }
@@ -141,6 +146,7 @@ struct EngineHandle {
   bool stopping = false;
   uint64_t submitted{}, completed{}, cancellations{};
   GraphStats graphs{};
+  PrefixCacheStats cache_stats{};  // Published with completed_requests under mutex.
   std::thread worker;
 };
 namespace {
@@ -168,6 +174,12 @@ void RunModel(EngineHandle& e, Request& r) {
   auto stream = e.stream.handle;
   auto& t = r.telemetry;
   const bool stochastic = r.params.temperature > 0;
+  auto& cache = m.prefix_cache;
+  auto sample = [&](std::span<const float> logits) {
+    return m.sampler.Sample(logits, r.params.temperature, r.params.top_k, r.params.top_p,
+                            r.params.seed);
+  };
+  const auto vocab = m.weights.view().config.unpadded_vocab_size;
   auto forward = [&](const int32_t* input, uint32_t count, uint32_t pos, bool decode, bool head) {
     std::memcpy(m.host.ids, input, count * sizeof(int32_t));
     CheckCuda(cudaMemcpyAsync(m.ids, m.host.ids, count * sizeof(int32_t), cudaMemcpyHostToDevice,
@@ -184,35 +196,56 @@ void RunModel(EngineHandle& e, Request& r) {
                        .d_logits_out = m.logits,
                        .d_next_token = m.next};
     ForwardRunOptions opts{.use_cuda_graph = decode && e.config.use_cuda_graph,
-                           .return_logits = head && stochastic};
+                           .return_logits = head && (stochastic || (!decode && cache.enabled()))};
     auto out = m.runner->Run(batch, opts);
     if (opts.use_cuda_graph) {
       std::lock_guard lock(e.mutex);
       e.graphs = m.runner->graph_stats();
     }
     if (!opts.return_logits) return out.next_token_id;
-    auto vocab = m.weights.view().config.unpadded_vocab_size;
     CheckCuda(cudaMemcpyAsync(m.host.logits, m.logits, vocab * sizeof(float),
                               cudaMemcpyDeviceToHost, stream));
     CheckCuda(cudaStreamSynchronize(stream));
-    return m.sampler.Sample({m.host.logits, vocab}, r.params.temperature, r.params.top_k,
-                            r.params.top_p, r.params.seed);
+    return stochastic ? sample({m.host.logits, vocab}) : out.next_token_id;
   };
-  uint32_t pos = 0;
+  auto start_prefill = Clock::now();
+  const std::span<const int32_t> prompt(r.prompt);
+  auto plan = cache.Match(prompt);
+  uint32_t pos = plan.matched_tokens;
+  t.cached_prefix_tokens = t.prefill_tokens = pos;
+  bool copied_state = plan.restore_slot >= 0;
+  if (copied_state) cache.Restore(plan.restore_slot, m.kv->view(), stream);
   int32_t token = 0;
-  while (pos < r.prompt.size() && !r.cancelled) {
-    auto start = Clock::now();
-    uint32_t chunk =
-        std::min(e.config.prefill_chunk_size, static_cast<uint32_t>(r.prompt.size()) - pos);
-    token = forward(r.prompt.data() + pos, chunk, pos, false, pos + chunk == r.prompt.size());
-    pos += chunk;
-    t.prefill_tokens = pos;
-    t.prefill_ms += Milliseconds(start);
+  if (plan.use_cached_logits) {
+    token = sample(cache.SlotLogits(plan.logits_slot));
+  } else {
+    cache.OnKvWrite(pos);
+    while (pos < prompt.size() && !r.cancelled) {
+      uint32_t chunk = std::min(e.config.prefill_chunk_size, uint32_t(prompt.size()) - pos);
+      if (plan.pin_pos > pos) chunk = std::min(chunk, plan.pin_pos - pos);
+      auto input = prompt.subspan(pos, chunk);
+      bool last = pos + chunk == prompt.size();
+      token = forward(input.data(), chunk, pos, false, last);
+      pos += chunk;
+      cache.AppendLive(input);
+      t.prefill_tokens = pos;
+      if (cache.enabled() && (pos == plan.pin_pos || last) && !r.cancelled) {
+        std::span<const float> logits;
+        if (last) logits = {m.host.logits, vocab};
+        cache.Save(prompt.first(pos), m.kv->view(), logits, stream);
+        copied_state = true;
+      }
+    }
   }
+  if (copied_state) CheckCuda(cudaStreamSynchronize(stream));
+  t.prefill_ms = Milliseconds(start_prefill);
   if (!r.Emit(token)) return;
   while (t.decode_tokens < r.params.max_tokens && pos < e.config.max_context && !r.cancelled) {
     auto start = Clock::now();
-    token = forward(&token, 1, pos, true, true);
+    auto fed_token = token;
+    cache.OnKvWrite(pos);
+    token = forward(&fed_token, 1, pos, true, true);
+    cache.AppendLive({&fed_token, 1});
     ++pos;
     ++t.decode_rounds;
     t.decode_ms += Milliseconds(start);
@@ -235,6 +268,7 @@ void Finish(EngineHandle& e, Request& r) {
     std::lock_guard lock(e.mutex);
     e.pending.erase(r.id);
     ++e.completed;
+    if (e.model) e.cache_stats = e.model->prefix_cache.stats();
     if (r.cancelled) r.Fail(ENGINE_ERR_CANCELLED, "request cancelled");
   }
   EngineEvent terminal{.req_id = r.id,
@@ -259,6 +293,7 @@ void Work(EngineHandle& e) {
       CheckCuda(device_status);
       Execute(e, *r);
     } catch (const std::exception& err) {
+      if (e.model) e.model->prefix_cache.InvalidateAll();
       cudaStreamSynchronize(e.stream.handle);
       r->Fail(ENGINE_ERR_INTERNAL, err.what());
       Finish(e, *r);
@@ -359,24 +394,30 @@ char* engine_stats_json(EngineHandle* e) {
     return nullptr;
   try {
     std::lock_guard lock(e->mutex);
-    return CopyString(Encode(Object{{"abi_version", FLINT_ENGINE_ABI_VERSION},
-                                    {"mode", e->model ? "model" : "smoke"},
-                                    {"gpu_name", e->gpu.name},
-                                    {"sm_major", e->gpu.major},
-                                    {"sm_minor", e->gpu.minor},
-                                    {"vram_total_bytes", total},
-                                    {"vram_free_bytes", free},
-                                    {"max_context", e->config.max_context},
-                                    {"prefill_chunk_size", e->config.prefill_chunk_size},
-                                    {"use_cuda_graph", e->config.use_cuda_graph},
-                                    {"submitted_requests", e->submitted},
-                                    {"completed_requests", e->completed},
-                                    {"cancelled_requests", e->cancellations},
-                                    {"queued_requests", e->queue.size()},
-                                    {"active_requests", e->pending.size() - e->queue.size()},
-                                    {"graph_captures", e->graphs.captures},
-                                    {"graph_launches", e->graphs.launches}})
-                          .c_str());
+    return CopyString(
+        Encode(Object{{"abi_version", FLINT_ENGINE_ABI_VERSION},
+                      {"mode", e->model ? "model" : "smoke"},
+                      {"gpu_name", e->gpu.name},
+                      {"sm_major", e->gpu.major},
+                      {"sm_minor", e->gpu.minor},
+                      {"vram_total_bytes", total},
+                      {"vram_free_bytes", free},
+                      {"max_context", e->config.max_context},
+                      {"prefill_chunk_size", e->config.prefill_chunk_size},
+                      {"use_cuda_graph", e->config.use_cuda_graph},
+                      {"prefix_cache_slots", e->model ? e->config.prefix_cache_slots : 0},
+                      {"prefix_cache_used_slots", e->cache_stats.used_slots},
+                      {"prefix_cache_hits", e->cache_stats.hits},
+                      {"prefix_cache_misses", e->cache_stats.misses},
+                      {"prefix_cache_saved_tokens", e->cache_stats.saved_tokens},
+                      {"submitted_requests", e->submitted},
+                      {"completed_requests", e->completed},
+                      {"cancelled_requests", e->cancellations},
+                      {"queued_requests", e->queue.size()},
+                      {"active_requests", e->pending.size() - e->queue.size()},
+                      {"graph_captures", e->graphs.captures},
+                      {"graph_launches", e->graphs.launches}})
+            .c_str());
   } catch (const std::exception&) {
     return nullptr;
   }
