@@ -1,4 +1,6 @@
-#include "op_params.h"
+#include <cuda_bf16.h>
+
+#include "stub_ops.h"
 
 namespace {
 constexpr unsigned kThreads = 256;
@@ -7,27 +9,30 @@ __global__ void Embed(StubParams p) {
   unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= p.count) return;
   unsigned col = i % p.width, token = static_cast<unsigned>(p.ids[i / p.width]) % p.vocab;
-  float weight = p.weight ? p.weight[size_t(token) * p.width + col] / 65536.f : 0.f;
-  p.output[i] = weight + ((token + col + p.position + i / p.width) % 1024) / 1024.f;
+  p.output[i] = __bfloat16_as_ushort(
+      __float2bfloat16_rn(((token + col + p.position + i / p.width) % 1024) / 1024.f));
 }
 
 __global__ void Visit(StubParams p) {
   unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= p.count) return;
-  float value = p.input[i] + (p.visit + 1) / 1024.f;
-  if (p.weight) value += p.weight[i % p.width] / 1048576.f;
-  if (i == 0 && p.kv && p.conv) {
-    value += (p.kv[p.visit] + p.conv[p.visit]) / 128.f;
-    p.kv[p.visit] = value;
-    p.conv[p.visit] = value / 2.f;
+  float value = __bfloat162float(__ushort_as_bfloat16(p.input[i])) + (p.visit + 1) / 1024.f;
+  if (i == 0) {
+    value += (__bfloat162float(__ushort_as_bfloat16(*p.k)) + *p.conv) / 128.f;
+    *p.k = __bfloat16_as_ushort(__float2bfloat16_rn(value));
+    *p.v = *p.k;
+    *p.conv = value / 2.f;
   }
-  p.output[i] = value;
+  p.output[i] = __bfloat16_as_ushort(__float2bfloat16_rn(value));
 }
 
 __global__ void Head(StubParams p) {
   unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= p.vocab) return;
-  int token = static_cast<unsigned>(fabsf(p.input[p.count - p.width]) * 4096.f) % p.vocab;
+  int token =
+      static_cast<unsigned>(
+          fabsf(__bfloat162float(__ushort_as_bfloat16(p.input[p.count - p.width]))) * 4096.f) %
+      p.vocab;
   if (i == 0 && p.next) *p.next = token;
   if (p.logits) p.logits[i] = -abs(int(i) - token) / 1024.f;
 }

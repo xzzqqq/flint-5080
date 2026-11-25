@@ -1,9 +1,11 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
-#include "op_params.h"
+#include "exl3_ops.h"
 
 namespace {
+// Phase 1 reference parity: preserve the 12-way split-K and 4x32 WHT reduction order.
+constexpr int kExpertKSplits = 12;
 __device__ float Read(const void* x, int i, FlintType type) {
   if (type == FLINT_F32) return static_cast<const float*>(x)[i];
   if (type == FLINT_F16) return __half2float(static_cast<const __half*>(x)[i]);
@@ -46,7 +48,7 @@ __device__ void ExpertDot(const short* trellis, const float* x, float* partial, 
   __shared__ unsigned tiles[8][words_per_tile];
   int lane = threadIdx.x % 16, tile = threadIdx.x / 16;
   int column = blockIdx.x * 128 + threadIdx.x;
-  int chunk = k / FLINT_EXPERT_K_SPLITS, start = blockIdx.y * chunk;
+  int chunk = k / kExpertKSplits, start = blockIdx.y * chunk;
   float sum = 0;
   for (int base = start; base < start + chunk; base += 16) {
     int index = (base / 16) * (n / 16) + column / 16;
@@ -68,7 +70,7 @@ __global__ void IndexedGemv(ExpertSelection selection, const float* x, float* pa
   int slot = blockIdx.z;
   const auto& expert = selection.table[selection.ids[slot]];
   x += slot * k;
-  partial += slot * FLINT_EXPERT_K_SPLITS * n;
+  partial += slot * kExpertKSplits * n;
   if (expert.k2 == 6)
     ExpertDot<6>(expert.trellis, x, partial, k, n);
   else
@@ -87,9 +89,9 @@ __global__ void Wht(WhtParams p, bool scale_in, ExpertSelection experts, bool br
   float value;
   if (experts.table && !scale_in) {
     const float* splits =
-        static_cast<const float*>(p.x) + slot * FLINT_EXPERT_K_SPLITS * p.width + i % p.width;
+        static_cast<const float*>(p.x) + slot * kExpertKSplits * p.width + i % p.width;
     value = 0;
-    for (int j = 0; j < FLINT_EXPERT_K_SPLITS; ++j) value += splits[j * p.width];
+    for (int j = 0; j < kExpertKSplits; ++j) value += splits[j * p.width];
   } else {
     value = Read(p.x, broadcast ? i % p.width : i, p.input);
   }
@@ -119,7 +121,7 @@ __global__ void Cast(CastParams p) {
 }  // namespace
 int flint_exl3_indexed_gemv(ExpertSelection experts, const float* rotated, float* partial, int k,
                             int n, void* s) {
-  IndexedGemv<<<dim3(n / 128, FLINT_EXPERT_K_SPLITS, 8), 128, 0, static_cast<cudaStream_t>(s)>>>(
+  IndexedGemv<<<dim3(n / 128, kExpertKSplits, 8), 128, 0, static_cast<cudaStream_t>(s)>>>(
       experts, rotated, partial, k, n);
   return cudaGetLastError();
 }
@@ -151,3 +153,5 @@ int flint_exl3_decode_inner_f16(DecodeParams p, void* s) {
 }
 int flint_wht128_scale_in(WhtParams p, void* s) { return Rotate(p, s, true); }
 int flint_wht128_scale_out(WhtParams p, void* s) { return Rotate(p, s, false); }
+
+int flint_exl3_indexed_gemv_k_splits(void) { return kExpertKSplits; }

@@ -8,14 +8,16 @@
 #include <iostream>
 #include <numeric>
 
+#include "common/cuda_check.h"
 #include "forge/forward_abi.h"
 #include "loader/arenas.h"
 #include "loader/safetensors.h"
+#include "model/visit_plan.h"
 #include "ops/scratch_workspace.h"
 
 namespace {
 using namespace flint;
-using ops_detail::CheckCuda;
+
 void Require(bool ok, const std::string& reason) {
   if (!ok) throw std::runtime_error(reason);
 }
@@ -43,8 +45,9 @@ struct Runner {
         run(module.symbol<decltype(run)>("flint_forward_run_layers")),
         inspect(module.symbol<decltype(inspect)>("flint_forward_run_layers_capture")),
         ctx(nullptr, module.symbol<decltype(&flint_forward_destroy)>("flint_forward_destroy")) {
-    Require(module.symbol<decltype(&flint_forward_abi_version)>("flint_forward_abi_version")() == 2,
-            "ABI v2 required");
+    Require(module.symbol<decltype(&flint_forward_abi_version)>("flint_forward_abi_version")() ==
+                FLINT_FORWARD_ABI_VERSION,
+            "current ABI required");
     ctx.reset(module.symbol<decltype(&flint_forward_create)>("flint_forward_create")(
         w, kv, &scratch, nullptr));
     Require(bool(ctx), "create context");
@@ -136,7 +139,6 @@ bool Case(Runner& run, const ModelConfig& c, const KvStateArenaView& kv,
   for (auto& tap : cap.taps) tap = ws.Take<uint16_t>(n);
   auto logits = ws.Take<float>(vocab);
   auto input = ws.Take<int>(t), next = ws.Take<int>(1);
-  unsigned blocks = 0;
   auto upload = [&](const int* p, size_t len) {
     CheckCuda(cudaMemcpy(input, p, len * sizeof(int), cudaMemcpyHostToDevice));
   };
@@ -151,7 +153,6 @@ bool Case(Runner& run, const ModelConfig& c, const KvStateArenaView& kv,
                      .d_block_in = carry,
                      .d_hidden_out = hidden,
                      .d_block_out = carry,
-                     .num_block_out = &blocks,
                      .d_logits_out = logits,
                      .d_next_token = next};
   std::cout << "case " << name << std::endl;
@@ -172,14 +173,14 @@ bool Case(Runner& run, const ModelConfig& c, const KvStateArenaView& kv,
       staged.run_lm_head = 0;
       for (unsigned end : ends) {
         staged.end_visit = end;
-        run(staged);
+        auto result = run(staged);
         Require(Read<uint16_t>(hidden, n) == Read<uint16_t>(cap.steps[end - 1], n),
                 "staged hidden mismatch at " + std::to_string(end));
         if (ends.size() == 5)
           std::cout << "staged " << staged.begin_visit << ".." << end << " exact" << std::endl;
         staged.run_embed = staged.reset_kv = 0;
         staged.begin_visit = end;
-        staged.num_block_in = blocks;
+        staged.num_block_in = result.num_block_out;
       }
       staged.run_lm_head = 1;
       run(staged);
@@ -280,13 +281,8 @@ size_t Free() {
   CheckCuda(cudaMemGetInfo(&avail, &total));
   return avail;
 }
-void Smoke(const std::string& path, bool exercise_gpu) {
-  ModelConfig c{.num_hidden_layers = 24,
-                .n_layers_per_attn_res_block = 6,
-                .loop_core_start = 6,
-                .loop_core_end = 18,
-                .loop_num_passes = 3};
-  for (int i = 5; i < 24; i += 6) c.is_full_layer[i] = 1;
+void Smoke(const std::string& path) {
+  auto c = model::MakeDefaultInklingConfig();
   auto plan = BuildVisitPlan(c);
   int full = 0, swa = 0;
   for (unsigned v = 0; v < 48; ++v) {
@@ -296,34 +292,30 @@ void Smoke(const std::string& path, bool exercise_gpu) {
                 p.pass_idx == (v < 6 || v >= 42 ? 0 : (v - 6) / 12) &&
                 p.has_messages == (v >= 18 && v < 42) && p.is_block_boundary == (layer % 6 == 0) &&
                 p.is_full_attention == (layer % 6 == 5) &&
+                p.is_loop_pass_start == (v == 18 || v == 30) && p.is_prologue_end == (v == 5) &&
+                p.mtp_tap_idx == (v == 5    ? 0
+                                  : v == 23 ? 1
+                                  : v == 41 ? 2
+                                            : -1) &&
                 p.kv_slot_idx == (p.is_full_attention ? full++ : swa++),
             "visit plan");
   }
-  if (!exercise_gpu) {
-    // Fast ABI probe, including the result contract for an uninitialized host.
-    // forge_tests exercises the full --no-model graph and eager execution in CTest.
-    Module module(path);
-    Require(module.symbol<decltype(&flint_forward_abi_version)>("flint_forward_abi_version")() == 2,
-            "forward ABI");
-    ForwardRunSpec spec{.end_visit = 48, .run_embed = 1, .seq_len = 1};
-    ForwardOptions opts{};
-    ForwardRunResult result{};
-    auto run = module.symbol<decltype(&flint_forward_run_layers)>("flint_forward_run_layers");
-    Require(run(nullptr, &spec, &opts, &result) == cudaErrorInvalidValue &&
-                result.status == cudaErrorInvalidValue && result.next_token_id == -1 &&
-                result.num_stages == 0,
-            "uninitialized forward context");
-    module.symbol<decltype(&flint_forward_destroy)>("flint_forward_destroy")(nullptr);
-    return;
-  }
-  auto scratch = ScratchArena::Allocate(32768);
-  auto io = ScratchArena::Allocate(16384);
-  auto out = static_cast<float*>(io.view().device_ptr);
-  auto id = reinterpret_cast<int*>(out + 2304);
-  CheckCuda(cudaMemset(id, 0, sizeof(int)));
-  Runner run(path, nullptr, nullptr, scratch.view());
-  run({.end_visit = 48, .run_embed = 1, .seq_len = 1, .d_input_ids = id, .d_hidden_out = out});
-  Require(Read<float>(out, 1)[0] == 1176.f / 1024, "stub hidden");
+
+  // Fast ABI probe, including the result contract for an uninitialized host.
+  // forge_tests exercises the full --no-model graph and eager execution in CTest.
+  Module module(path);
+  Require(module.symbol<decltype(&flint_forward_abi_version)>("flint_forward_abi_version")() ==
+              FLINT_FORWARD_ABI_VERSION,
+          "forward ABI");
+  ForwardRunSpec spec{.end_visit = 48, .run_embed = 1, .seq_len = 1};
+  ForwardOptions opts{};
+  ForwardRunResult result{};
+  auto run = module.symbol<decltype(&flint_forward_run_layers)>("flint_forward_run_layers");
+  Require(run(nullptr, &spec, &opts, &result) == cudaErrorInvalidValue &&
+              result.status == cudaErrorInvalidValue && result.next_token_id == -1 &&
+              result.num_stages == 0,
+          "uninitialized forward context");
+  module.symbol<decltype(&flint_forward_destroy)>("flint_forward_destroy")(nullptr);
 }
 }  // namespace
 int main(int argc, char** argv) {
@@ -341,7 +333,7 @@ int main(int argc, char** argv) {
       else
         throw std::invalid_argument(key);
     }
-    Smoke(path, !model.empty());
+    Smoke(path);
     if (model.empty()) return 0;
     Require(!golden.empty(), "missing golden directory");
     std::cout << std::setprecision(9);

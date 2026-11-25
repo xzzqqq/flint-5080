@@ -2,7 +2,7 @@
 #include <cublas_v2.h>
 
 #include "loader/model_views.h"
-#include "ops/op_params.h"
+#include "ops/op_types.h"
 namespace flint {
 // One handle per execution stream. Workspace is caller-owned for the handle lifetime.
 class Gemm {
@@ -23,7 +23,7 @@ class Gemm {
 // Promote mixed input/weight types to FP32 in scratch for C = A @ B^T.
 void RunFp32Linear(const Gemm&, ScratchArenaView, const void* x, FlintType input,
                    const void* weight, FlintType weight_type, float* out, int rows, int n, int k);
-// Matches the reference's padded 32-row reduction for either orientation of B.
+// Phase 1 reference parity uses a padded 32-row reduction for either orientation of B.
 void RunRowMatmul(const Gemm&, ScratchArenaView, const void* a, const void* b, void* c, int rows,
                   int n, int k, FlintType input, FlintType output, bool transpose);
 }  // namespace flint

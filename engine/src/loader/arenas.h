@@ -8,7 +8,7 @@
 #include <memory>
 #include <utility>
 
-#include "model/visit_plan.h"
+#include "loader/model_views.h"
 
 namespace flint {
 

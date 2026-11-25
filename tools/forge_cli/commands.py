@@ -12,13 +12,13 @@ from tools.common.gpu_lock import GpuLeaseManager
 from tools.common.remote import Executor
 from tools.dev_cli.commands import _engine_script
 
-from .host import atomic_json
+from .host import INFO, atomic_json
 
 CURRENT = "engine/build/forward.so"
 
 
-def candidate_path(name):
-    return CURRENT if name == "current" else f".forge/candidates/{name}.so"
+def candidate_path(name, current=CURRENT):
+    return current if name == "current" else f".forge/candidates/{name}.so"
 
 
 def host_call(executor, cmd, payload):
@@ -38,7 +38,7 @@ def build(cfg, executor, data, targets):
 
 def start(cfg, args, ex, lease, data):
     if not args.no_build:
-        build(cfg, ex, data, ["forge-host", "forward"])
+        build(cfg, ex, data, ["forge-host", "stub_forward" if args.no_model else "forward"])
     else:
         ex.sync()
     argv = [
@@ -47,7 +47,7 @@ def start(cfg, args, ex, lease, data):
         "--socket",
         ".forge/host.sock",
         "--baseline",
-        CURRENT,
+        "engine/build/stub_forward.so" if args.no_model else CURRENT,
         "--state-dir",
         ".forge",
     ]
@@ -87,6 +87,7 @@ def start(cfg, args, ex, lease, data):
                 "pid": data["pid"],
                 "heartbeat": data["heartbeat"],
                 "remote": cfg.remote_workspace_dir,
+                "no_model": args.no_model,
             },
         )
 
@@ -119,8 +120,12 @@ def execute(cfg, args, result):
         if not case:
             raise ValueError(f"Unknown workload case {name!r}")
         names = (args.cand_a, args.cand_b) if cmd == "ab" else (args.candidate,)
+        info = cfg.repo_root / INFO
+        no_model = info.exists() and json.loads(info.read_text()).get("no_model", False)
+        target = "stub_forward" if no_model else "forward"
+        current = f"engine/build/{target}.so"
         if "current" in names and not args.no_build:
-            build(cfg, ex, data, ["forward"])
+            build(cfg, ex, data, [target])
         begin, end = args.layers
         q = dict(
             command=cmd,
@@ -134,10 +139,12 @@ def execute(cfg, args, result):
         )
         if cmd == "ab":
             q.update(
-                so_a=candidate_path(names[0]), so_b=candidate_path(names[1]), rounds=args.rounds
+                so_a=candidate_path(names[0], current),
+                so_b=candidate_path(names[1], current),
+                rounds=args.rounds,
             )
         else:
-            q["so_path"] = candidate_path(names[0])
+            q["so_path"] = candidate_path(names[0], current)
         if cmd in {"run", "ab"}:
             q.update(
                 warmup=args.warmup if args.warmup is not None else (10 if args.full else 2),
@@ -145,6 +152,8 @@ def execute(cfg, args, result):
             )
         if cmd == "run":
             q.update(save=args.save)
+            if args.save:
+                q["current_path"] = current
         elif cmd == "profile":
             q.update(nsys=args.nsys)
         elif cmd == "dump":

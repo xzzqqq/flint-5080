@@ -10,7 +10,8 @@ enum {
   FLINT_NUM_SWA_VISITS = 40,
   FLINT_NUM_FULL_VISITS = 8,
   FLINT_NUM_EXPERTS = 128,
-  FLINT_NUM_CONTROLLERS = 4
+  FLINT_NUM_CONTROLLERS = 4,
+  FLINT_CARRY_PLANES = 8
 };
 #define FLINT_EXL3_MUL1_MAGIC 0x83DCD12Du
 
@@ -66,6 +67,8 @@ typedef struct ModelWeightsView {
 typedef struct VisitPlanEntry {
   uint8_t visit_idx, physical_layer, pass_idx, is_full_attention;
   uint8_t is_block_boundary, has_messages, kv_slot_idx;
+  uint8_t is_loop_pass_start, is_prologue_end;
+  int8_t mtp_tap_idx;
 } VisitPlanEntry;
 
 typedef struct KvStateArenaView {
@@ -73,6 +76,7 @@ typedef struct KvStateArenaView {
   size_t arena_bytes;
   uint32_t max_full_seq_len, swa_window, num_swa_visits, num_full_visits, num_total_visits;
   uint32_t num_kv_heads, head_dim, conv_state_len;
+  uint32_t hidden_size;
   void *swa_kv, *full_kv;
   float *kv_conv_state, *sublayer_conv_state;
 } KvStateArenaView;

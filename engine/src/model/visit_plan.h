@@ -2,25 +2,37 @@
 #include <array>
 #include <stdexcept>
 
-#include "loader/model_views.h"
+#include "loader/model_constants.h"
 namespace flint {
-inline std::array<VisitPlanEntry, FLINT_NUM_LOGICAL_VISITS> BuildVisitPlan(const ModelConfig& c) {
-  if (c.loop_core_start != 6 || c.loop_core_end != 18 || c.loop_num_passes != 3 ||
-      c.num_hidden_layers != 24 || c.n_layers_per_attn_res_block != 6)
+using VisitPlan = std::array<VisitPlanEntry, model::kNumLogicalVisits>;
+inline VisitPlan BuildVisitPlan(const ModelConfig& c) {
+  if (c.loop_core_start != model::kLoopCoreStart || c.loop_core_end != model::kLoopCoreEnd ||
+      c.loop_num_passes != model::kLoopNumPasses ||
+      c.num_hidden_layers != model::kNumPhysicalLayers ||
+      c.n_layers_per_attn_res_block != model::kLayersPerResBlock)
     throw std::invalid_argument("unsupported visit schedule");
-  std::array<VisitPlanEntry, FLINT_NUM_LOGICAL_VISITS> plan{};
+  VisitPlan plan{};
   uint8_t idx = 0, swa = 0, full = 0;
   auto append = [&](uint32_t begin, uint32_t end, uint8_t pass) {
     for (uint8_t i = begin; i < end; ++i) {
       auto global = c.is_full_layer[i];
-      if (global != (i % 6 == 5)) throw std::invalid_argument("invalid attention schedule");
+      if (global != ((i + 1) % model::kLayersPerResBlock == 0))
+        throw std::invalid_argument("invalid attention schedule");
+      bool prologue_end = i + 1 == c.loop_core_start;
+      // Later taps sample the first block of pass 1 and the last block of pass 2.
+      int8_t tap = -1;
+      if (prologue_end) tap = 0;
+      if (pass && i + 1 == c.loop_core_start + pass * c.n_layers_per_attn_res_block) tap = pass;
       plan[idx] = {idx,
                    i,
                    pass,
                    global,
                    i % c.n_layers_per_attn_res_block == 0,
                    pass > 0,
-                   global ? full++ : swa++};
+                   global ? full++ : swa++,
+                   pass > 0 && i == c.loop_core_start,
+                   prologue_end,
+                   tap};
       ++idx;
     }
   };

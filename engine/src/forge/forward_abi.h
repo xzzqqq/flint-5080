@@ -10,7 +10,7 @@
 extern "C" {
 #endif
 
-#define FLINT_FORWARD_ABI_VERSION 2u
+#define FLINT_FORWARD_ABI_VERSION 3u
 
 typedef struct ForwardContext ForwardContext;
 
@@ -36,15 +36,13 @@ typedef struct ForwardStageTiming {
   uint64_t traffic_bytes;
 } ForwardStageTiming;
 
-/* Real hidden and carry planes are BF16 [seq_len,hidden_size]. The stub uses
-   F32 hidden buffers. Carry slots 0..3 are active block states, slots 4/5
-   are the prologue hidden/block, slots 6/7 the previous pass hidden/block.
-   num_block_in/out count active blocks; num_block_out is a host pointer.
+/* Hidden and carry planes are BF16 [seq_len,hidden_size]. Carry slots 0..3 are active block states,
+   slots 4/5 are the prologue hidden/block, slots 6/7 the previous pass hidden/block.
+   num_block_in/out count active blocks.
    Snapshot validity is implicit in the visit boundary. */
-enum { FLINT_CARRY_PLANES = 8 };
 typedef struct ForwardCapture {
   void* embed;
-  void* steps[48];
+  void* steps[FLINT_NUM_LOGICAL_VISITS];
   void* taps[4]; /* visit inputs 5,23,41 and final norm */
 } ForwardCapture;
 typedef struct ForwardRunSpec {
@@ -57,7 +55,6 @@ typedef struct ForwardRunSpec {
   uint32_t num_block_in;
   void* d_hidden_out;
   void* d_block_out;
-  uint32_t* num_block_out;
   float* d_logits_out;
   int32_t* d_next_token;
 } ForwardRunSpec;
@@ -67,6 +64,7 @@ typedef struct ForwardRunResult {
   float elapsed_ms;
   uint64_t logical_bytes;
   int32_t next_token_id;
+  uint32_t num_block_out;
   uint32_t num_stages;
   ForwardStageTiming stages[FLINT_MAX_STAGE_TIMINGS];
 } ForwardRunResult;
@@ -82,8 +80,7 @@ ForwardContext* flint_forward_create(const ModelWeightsView* weights, const KvSt
                                      const ScratchArenaView* scratch, void* cuda_stream);
 int32_t flint_forward_run_layers(ForwardContext* context, const ForwardRunSpec* spec,
                                  const ForwardOptions* options, ForwardRunResult* result);
-/* Optional inspection entry point. The original ABI v2 spec and entry point
-   keep their binary layouts, including for previously saved forge modules. */
+/* Optional activation capture. */
 int32_t flint_forward_run_layers_capture(ForwardContext* context, const ForwardRunSpec* spec,
                                          const ForwardOptions* options, ForwardRunResult* result,
                                          const ForwardCapture* capture);
@@ -91,7 +88,7 @@ int32_t flint_forward_run_layers_capture(ForwardContext* context, const ForwardR
 int32_t flint_forward_run_smoke(ForwardContext* context, const ForwardWorkspace* workspace,
                                 const ForwardOptions* options, int32_t n_elems, float bias,
                                 ForwardSmokeOutput* result);
-/* Optional inspection symbol, including for hosts loading older ABI v2 modules. */
+/* Optional graph diagnostics. */
 typedef struct ForwardGraphStats {
   uint64_t captures, launches;
 } ForwardGraphStats;

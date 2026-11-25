@@ -1,14 +1,11 @@
 #pragma once
-#include <cuda_runtime_api.h>
 
 #include <stdexcept>
 
 #include "loader/model_views.h"
 
 namespace flint::ops_detail {
-inline void CheckCuda(int code) {
-  if (code) throw std::runtime_error(cudaGetErrorString(static_cast<cudaError_t>(code)));
-}
+
 class ScratchWorkspace {
  public:
   explicit ScratchWorkspace(ScratchArenaView v) : rest(v) {}

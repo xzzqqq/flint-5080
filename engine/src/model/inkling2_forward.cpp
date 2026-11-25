@@ -1,12 +1,29 @@
 #include "model/inkling2_forward.h"
 
-#include <cstdio>
+#include <cuda_runtime.h>
 
+#include "common/cuda_check.h"
+#include "loader/kv_layout.h"
+#include "ops/norm_ops.h"
+#include "ops/sconv_ops.h"
+
+#if __has_include(<cuda_profiler_api.h>)
+#include <cuda_profiler_api.h>
+#else
+// CUDA runtime-only toolkit installations export both APIs without the profiler header.
+extern "C" cudaError_t CUDARTAPI cudaProfilerStart(void);
+extern "C" cudaError_t CUDARTAPI cudaProfilerStop(void);
+#endif
+
+#include <cstdio>
+#include <vector>
+
+#include "model/visit_plan.h"
 #include "ops/scratch_workspace.h"
 #include "ops/submodules.h"
 
 namespace flint {
-using ops_detail::CheckCuda;
+
 using ops_detail::ScratchWorkspace;
 namespace {
 uint64_t MatrixBytes(const Exl3MatrixView& m) {
@@ -33,17 +50,89 @@ uint64_t VisitBytes(const ModelConfig& c, const LayerWeightsView& l, VisitPlanEn
   for (int e = 0; e < 2; ++e) pair += MatrixBytes(l.gate_up_proj[e]) + MatrixBytes(l.down_proj[e]);
   return bytes + pair * c.num_experts_per_tok / 2;
 }
+struct GraphKey {
+  ForwardBatch batch;
+  ForwardRunOptions options;
+  bool operator==(const GraphKey&) const = default;
+};
 }  // namespace
-void RunInkling(const Gemm& g, const std::array<VisitPlanEntry, 48>& plan,
-                const ModelWeightsView& w, const KvStateArenaView& kv, ScratchArenaView scratch,
-                const ForwardRunSpec& s, const ForwardOptions& o, ForwardRunResult& result,
-                const cudaEvent_t* marks, const ForwardCapture* capture,
-                const ExpertProjection* experts, const int32_t* d_pos) {
-  const int t = s.seq_len, h = w.config.hidden_size, n = t * h;
-  const auto stream = g.stream();
+struct InklingRunner::Impl {
+  const ModelWeightsView& weights;
+  const KvStateArenaView& kv;
+  VisitPlan plan;
+  ScratchArenaView activations{};
+  std::unique_ptr<Gemm> gemm;
+  ExpertProjection* d_experts{};
+  int32_t *d_next_token{}, *d_decode_pos{}, *host_token{};
+  cudaStream_t stream{}, owned_stream{};
+  cudaEvent_t start{}, stop{};
+  std::array<cudaEvent_t, std::extent_v<decltype(ForwardOutput::stages)> + 1> marks{};
+  cudaGraphExec_t graph{};
+  cudaGraph_t source_graph{};
+  GraphKey key{};
+  ForwardOutput graph_output{};
+  GraphStats stats{};
+  Impl(const ModelWeightsView& w, const KvStateArenaView& k)
+      : weights(w), kv(k), plan(BuildVisitPlan(w.config)) {}
+  ~Impl() {
+    if (graph) cudaGraphExecDestroy(graph);
+    if (source_graph) cudaGraphDestroy(source_graph);
+    gemm.reset();
+    if (host_token) cudaFreeHost(host_token);
+    for (auto e : marks)
+      if (e) cudaEventDestroy(e);
+    if (start) cudaEventDestroy(start);
+    if (stop) cudaEventDestroy(stop);
+    if (owned_stream) cudaStreamDestroy(owned_stream);
+  }
+  void RunInkling(const ForwardBatch&, const ForwardRunOptions&, ForwardOutput&,
+                  const CaptureBuffers*);
+  void PrepareGraph(const ForwardBatch&, const ForwardRunOptions&);
+};
+InklingRunner::InklingRunner(const ModelWeightsView& w, const KvStateArenaView& kv,
+                             ScratchArenaView scratch, cudaStream_t stream)
+    : impl_(std::make_unique<Impl>(w, kv)) {
+  auto& c = *impl_;
+  if (!scratch.device_ptr) throw std::invalid_argument("missing scratch");
+  if (!stream) CheckCuda(cudaStreamCreateWithFlags(&c.owned_stream, cudaStreamNonBlocking));
+  c.stream = stream ? stream : c.owned_stream;
+  CheckCuda(cudaEventCreate(&c.start));
+  CheckCuda(cudaEventCreate(&c.stop));
+  for (auto& e : c.marks) CheckCuda(cudaEventCreate(&e));
+  CheckCuda(cudaHostAlloc(&c.host_token, sizeof(int32_t), cudaHostAllocDefault));
   ScratchWorkspace ws(scratch);
+  constexpr size_t bytes = 4 << 20;
+  auto workspace = ws.Take<char>(bytes);
+  c.d_next_token = ws.Take<int32_t>(1);
+  c.d_decode_pos = ws.Take<int32_t>(1);
+  std::vector<ExpertProjection> descriptors;
+  descriptors.reserve(2 * model::kNumExperts * model::kNumPhysicalLayers);
+  for (const auto& layer : w.layers)
+    for (const auto* projection : {layer.gate_up_proj, layer.down_proj})
+      for (int e = 0; e < model::kNumExperts; ++e) {
+        const auto& m = projection[e];
+        if (m.k2 != 6 && m.k2 != 7) throw std::invalid_argument("unsupported expert bitrate");
+        descriptors.push_back({m.trellis, m.suh, m.svh, m.k2});
+      }
+  c.d_experts = ws.Take<ExpertProjection>(descriptors.size());
+  c.activations = ws.rest;
+  CheckCuda(cudaMemcpyAsync(c.d_experts, descriptors.data(),
+                            descriptors.size() * sizeof(ExpertProjection), cudaMemcpyHostToDevice,
+                            c.stream));
+  CheckCuda(cudaStreamSynchronize(c.stream));
+  c.gemm = std::make_unique<Gemm>(c.stream, workspace, bytes);
+}
+InklingRunner::~InklingRunner() = default;
+GraphStats InklingRunner::graph_stats() const { return impl_->stats; }
+void InklingRunner::Impl::RunInkling(const ForwardBatch& s, const ForwardRunOptions& o,
+                                     ForwardOutput& result, const CaptureBuffers* capture) {
+  const auto& g = *gemm;
+  const auto& w = weights;
+  const auto* d_pos = s.is_decode && s.seq_len == 1 ? d_decode_pos : nullptr;
+  const int t = s.seq_len, h = w.config.hidden_size, n = t * h;
+  ScratchWorkspace ws(activations);
   auto* hidden = static_cast<uint16_t*>(s.d_hidden_out);
-  auto* carry = ws.Take<uint16_t>(size_t(FLINT_CARRY_PLANES) * n);
+  auto* carry = ws.Take<uint16_t>(size_t(model::kCarryPlanes) * n);
   auto block = [&](unsigned idx) { return carry + size_t(idx) * n; };
   auto copy = [&](void* dst, const void* src, size_t bytes) {
     if (dst && dst != src)
@@ -53,18 +142,17 @@ void RunInkling(const Gemm& g, const std::array<VisitPlanEntry, 48>& plan,
   unsigned count = s.num_block_in;
   unsigned expected = 0;
   for (unsigned v = 0; v < s.begin_visit; ++v) {
-    if (v == 18 || v == 30) expected = 1;
+    if (plan[v].is_loop_pass_start) expected = 1;
     expected += plan[v].is_block_boundary;
   }
   if (count != expected || (count && !s.d_block_in) || (s.run_embed && s.begin_visit) ||
-      (s.run_lm_head && s.end_visit != 48) || s.pos_offset > kv.max_full_seq_len ||
-      s.seq_len > kv.max_full_seq_len - s.pos_offset)
+      (s.run_lm_head && s.end_visit != plan.size()))
     throw std::invalid_argument("invalid carry or range");
   if (s.reset_kv) CheckCuda(cudaMemsetAsync(kv.arena_base, 0, kv.arena_bytes, stream));
   if (count)
-    copy(carry, s.d_block_in, FLINT_CARRY_PLANES * plane);
+    copy(carry, s.d_block_in, model::kCarryPlanes * plane);
   else
-    CheckCuda(cudaMemsetAsync(carry, 0, FLINT_CARRY_PLANES * plane, stream));
+    CheckCuda(cudaMemsetAsync(carry, 0, model::kCarryPlanes * plane, stream));
   auto stage = [&](const char* name, uint64_t bytes) {
     result.logical_bytes += bytes;
     if (!o.enable_profiling) return;
@@ -94,9 +182,8 @@ void RunInkling(const Gemm& g, const std::array<VisitPlanEntry, 48>& plan,
   auto* tmp = ws.Take<uint16_t>(n);
   auto aggregate = [&](const uint16_t* blocks, int nb, const void* x, FlintType type,
                        const float* query, int q, float* dst) {
-    RunBlockResidual(
-        g, ws.rest,
-        {blocks, x, query, q == 1 ? dst : packed, nullptr, nb, t, h, q, FLINT_BF16, type});
+    RunBlockResidual(g, ws.rest,
+                     {blocks, x, query, q == 1 ? dst : packed, nb, t, h, q, FLINT_BF16, type});
     if (q > 1)
       for (int j = 0; j < q; ++j)
         CheckCuda(cudaMemcpy2DAsync(dst + size_t(j) * n, h * 4, packed + j * h, q * h * 4, h * 4, t,
@@ -108,14 +195,14 @@ void RunInkling(const Gemm& g, const std::array<VisitPlanEntry, 48>& plan,
   for (unsigned v = s.begin_visit; v < s.end_visit; ++v) {
     auto visit = plan[v];
     auto& l = w.layers[visit.physical_layer];
-    if (visit.has_messages && visit.physical_layer == w.config.loop_core_start) {
+    if (visit.is_loop_pass_start) {
       copy(block(6), hidden, plane);
       copy(block(7), block(2), plane);
       copy(hidden, block(4), plane);
       copy(block(0), block(5), plane);
       count = 1;
     }
-    if (capture && (v == 5 || v == 23 || v == 41)) copy(capture->taps[(v - 5) / 18], hidden, plane);
+    if (capture && visit.mtp_tap_idx >= 0) copy(capture->taps[visit.mtp_tap_idx], hidden, plane);
     int nq = visit.is_full_attention ? 3 : 1;
     if (visit.physical_layer) aggregate(carry, count, hidden, FLINT_BF16, l.attn_query, nq, attn);
     if (visit.has_messages) {
@@ -142,12 +229,11 @@ void RunInkling(const Gemm& g, const std::array<VisitPlanEntry, 48>& plan,
         normalized, normalized + stride, normalized + 2 * stride, tmp, t, int(s.pos_offset), visit,
         d_pos};
     (visit.is_full_attention ? RunFullAttention : RunSlidingAttention)(g, ws.rest, l, kv, batch);
-    float* history = kv.sublayer_conv_state + size_t(v) * 2 * h * kv.conv_state_len;
     auto conv = [&](const void* weight, float* state) {
       CheckCuda(flint_static_sconv({tmp, weight, nullptr, state, tmp, t, h, FLINT_BF16, FLINT_BF16},
                                    stream));
     };
-    conv(l.attn_sconv, history);
+    conv(l.attn_sconv, VisitSublayerConvState(kv, v));
     CheckCuda(flint_cast({tmp, partial, n, FLINT_BF16, FLINT_F32}, stream));
     if (visit.is_block_boundary)
       copy(block(count++), hidden, plane);
@@ -158,10 +244,10 @@ void RunInkling(const Gemm& g, const std::array<VisitPlanEntry, 48>& plan,
       RunMessageGate(g, ws.rest, l.controllers[3], attn, messages + 3 * n, attn, t);
     norm(attn, FLINT_F32, l.mlp_norm, normalized);
     RunSparseMoeBlock(g, ws.rest, l, normalized, tmp, t, nullptr, nullptr, nullptr,
-                      experts + visit.physical_layer * 2 * FLINT_NUM_EXPERTS);
-    conv(l.mlp_sconv, history + h * kv.conv_state_len);
+                      d_experts + visit.physical_layer * 2 * model::kNumExperts);
+    conv(l.mlp_sconv, VisitSublayerConvState(kv, v, 1));
     CheckCuda(flint_add_residual(partial, tmp, hidden, n, FLINT_BF16, stream));
-    if (v == 5) {
+    if (visit.is_prologue_end) {
       copy(block(4), hidden, plane);
       copy(block(5), carry, plane);
     }
@@ -170,8 +256,8 @@ void RunInkling(const Gemm& g, const std::array<VisitPlanEntry, 48>& plan,
     std::snprintf(name, sizeof(name), "visit_%02u", v);
     stage(name, VisitBytes(w.config, l, visit));
   }
-  copy(s.d_block_out, carry, plane * FLINT_CARRY_PLANES);
-  if (s.num_block_out) *s.num_block_out = count;
+  copy(s.d_block_out, carry, plane * model::kCarryPlanes);
+  result.num_block_out = count;
   if (s.run_lm_head) {
     aggregate(carry, count, hidden, FLINT_BF16, w.output_query, 1, attn);
     norm(attn, FLINT_F32, w.final_norm_weight, hidden);
@@ -188,5 +274,80 @@ void RunInkling(const Gemm& g, const std::array<VisitPlanEntry, 48>& plan,
                                          stream));
     stage("lm_head", 2ull * h * vocab + 6ull * h);
   }
+}
+
+void InklingRunner::Impl::PrepareGraph(const ForwardBatch& batch, const ForwardRunOptions& opts) {
+  // Position is uploaded before each launch. KV reset also runs outside capture.
+  auto captured = batch;
+  captured.pos_offset = 0;
+  captured.reset_kv = 0;
+  GraphKey requested{captured, opts};
+  if (graph && key == requested) return;
+  if (graph) {
+    CheckCuda(cudaGraphExecDestroy(graph));
+    graph = nullptr;
+  }
+  if (source_graph) {
+    CheckCuda(cudaGraphDestroy(source_graph));
+    source_graph = nullptr;
+  }
+  graph_output = {};
+  CheckCuda(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+  try {
+    RunInkling(captured, opts, graph_output, nullptr);
+  } catch (...) {
+    cudaStreamEndCapture(stream, &source_graph);
+    throw;
+  }
+  CheckCuda(cudaStreamEndCapture(stream, &source_graph));
+  CheckCuda(cudaGraphInstantiate(&graph, source_graph, 0));
+  key = requested;
+  ++stats.captures;
+}
+ForwardOutput InklingRunner::Run(const ForwardBatch& batch, const ForwardRunOptions& o,
+                                 const CaptureBuffers* capture) {
+  auto& c = *impl_;
+  auto s = batch;
+  if (!s.seq_len || s.begin_visit > s.end_visit || s.end_visit > c.plan.size() || !s.d_hidden_out ||
+      (s.run_embed ? !s.d_input_ids : !s.d_hidden_in) ||
+      (s.run_lm_head && o.return_logits && !s.d_logits_out) ||
+      size_t(s.seq_len) * c.weights.config.hidden_size > INT32_MAX ||
+      s.pos_offset > c.kv.max_full_seq_len || s.seq_len > c.kv.max_full_seq_len - s.pos_offset)
+    throw std::invalid_argument("invalid forward batch");
+  if (s.run_lm_head && !s.d_next_token) s.d_next_token = c.d_next_token;
+  bool decode = s.is_decode && s.seq_len == 1;
+  bool graph = o.use_cuda_graph && decode && !capture && !o.enable_profiling;
+  ForwardOutput r{};
+  if (graph) {
+    c.PrepareGraph(s, o);
+    r = c.graph_output;
+  }
+  if (o.profiler_range) CheckCuda(cudaProfilerStart());
+  try {
+    CheckCuda(cudaEventRecord(c.start, c.stream));
+    if (decode)
+      CheckCuda(cudaMemcpyAsync(c.d_decode_pos, &s.pos_offset, sizeof(int32_t),
+                                cudaMemcpyHostToDevice, c.stream));
+    if (graph) {
+      if (s.reset_kv) CheckCuda(cudaMemsetAsync(c.kv.arena_base, 0, c.kv.arena_bytes, c.stream));
+      CheckCuda(cudaGraphLaunch(c.graph, c.stream));
+      ++c.stats.launches;
+    } else
+      c.RunInkling(s, o, r, capture);
+    if (s.run_lm_head)
+      CheckCuda(cudaMemcpyAsync(c.host_token, s.d_next_token, sizeof(int32_t),
+                                cudaMemcpyDeviceToHost, c.stream));
+    CheckCuda(cudaEventRecord(c.stop, c.stream));
+    CheckCuda(cudaEventSynchronize(c.stop));
+    r.next_token_id = s.run_lm_head ? *c.host_token : -1;
+    CheckCuda(cudaEventElapsedTime(&r.elapsed_ms, c.start, c.stop));
+    for (unsigned i = 0; i < r.num_stages; ++i)
+      CheckCuda(cudaEventElapsedTime(&r.stages[i].elapsed_ms, c.marks[i], c.marks[i + 1]));
+  } catch (...) {
+    if (o.profiler_range) cudaProfilerStop();
+    throw;
+  }
+  if (o.profiler_range) CheckCuda(cudaProfilerStop());
+  return r;
 }
 }  // namespace flint

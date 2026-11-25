@@ -2,7 +2,7 @@
 #include <filesystem>
 #include <span>
 
-#include "forge/json_output.h"
+#include "common/json_output.h"
 
 namespace flint {
 struct DaemonConfig {

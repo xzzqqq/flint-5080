@@ -4,6 +4,7 @@
 #include "forge/forge_daemon.h"
 #include "forge/forward_abi.h"
 #include "loader/arenas.h"
+#include "model/visit_plan.h"
 
 namespace flint {
 struct StateSlice {
@@ -16,7 +17,7 @@ struct Recording {
   unsigned blocks{};
   std::vector<int> ids, generated;
   unsigned position{};
-  std::vector<float> hidden, reference, logits, kv, conv;
+  std::vector<float> hidden, reference, logits;
   int next{-1};
 };
 
@@ -29,14 +30,31 @@ class Replay {
 
  private:
   class Module;
+  struct Measurement {
+    unsigned begin, end, step, warmup, iters, rounds;
+    std::string name;
+    std::vector<int> ids;
+    bool e2e() const { return begin == 0 && end == model::kNumLogicalVisits; }
+  };
+  Measurement ParseMeasurement(const Json&, const std::string&) const;
+  const Recording& ResolveRecording(const Measurement&, Object&, Recording&);
+  ForwardRunResult RunSingle(Module&, const ForwardRunSpec&, const ForwardOptions&,
+                             const Recording&, unsigned, Object&);
+  ForwardRunResult RunPair(Module&, Module&, const ForwardRunSpec&, const ForwardOptions&,
+                           const Recording&, const Measurement&, Object&);
+  ForwardRunResult RunRestored(Module&, const ForwardRunSpec&, const ForwardOptions&,
+                               const Recording&);
+  static void FormatStages(const ForwardRunResult&, Object&);
+  void Dump(const Json&, const Measurement&, const Recording&, const std::vector<float>&, Object&);
+
   Object Measure(const Json& request, const std::string& command);
-  std::unique_ptr<Module> Load(const std::filesystem::path& path);
+  std::unique_ptr<Module> Load(const std::filesystem::path& path, bool independent_scratch = false);
   Recording Record(const std::vector<int>& ids, unsigned begin, unsigned end, unsigned step);
   ForwardRunSpec Spec(unsigned begin, unsigned end, unsigned length, unsigned position, bool embed,
-                      bool head);
+                      bool head, unsigned blocks = 0);
   std::vector<float> ReadHidden(size_t count) const;
   void UploadHidden(const std::vector<float>& data);
-  void Restore(const Recording& recording, unsigned begin);
+  void Restore(const Recording& recording);
   DaemonConfig config_;
   std::optional<WeightsArena> weights_;
   std::optional<KvStateArena> kv_;
@@ -44,11 +62,13 @@ class Replay {
   double weights_load_ms_{};
   int64_t warmup_vram_bytes_{};
   cudaStream_t stream_{};
-  unsigned width_{2304}, vocab_{201024}, capacity_{}, serial_{};
+  ModelConfig model_config_;
+  VisitPlan plan_;
+  unsigned width_, vocab_, capacity_{}, serial_{};
   uint16_t* carry_{};
-  unsigned blocks_{};
   int *ids_{}, *next_{};
-  float *hidden_{}, *out_{}, *logits_{};
+  uint16_t *hidden_{}, *out_{};
+  float* logits_{};
   std::map<std::string, Recording> cache_;
 };
 }  // namespace flint

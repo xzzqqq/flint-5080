@@ -1,6 +1,6 @@
 #include <cuda_bf16.h>
 
-#include "op_params.h"
+#include "attention_ops.h"
 #include "row_reduction.cuh"
 
 namespace {
@@ -102,8 +102,8 @@ __global__ void Attend(AttentionParams p) {
   denom = Reduce(buf, denom, 128);
   for (int j = c; j < n; j += 128) scores[j] = Round(scores[j] / denom);
   __syncthreads();
-  // The reference reduces the strided key axis with four accumulators.
-  // At 64 visible keys it also splits the reduction across four warps.
+  // Phase 1 reference parity: round probabilities to BF16 and reduce the strided key axis with four
+  // accumulators. At 64 visible keys it also splits the reduction across four warps.
   int groups = n >= 64 ? 4 : 1;
   float group[4] = {};
   for (int g = 0; g < groups; ++g) {
@@ -143,7 +143,9 @@ int flint_attention_forward(AttentionParams p, void* s) {
   if (p.tokens < 1 || p.position < 0 || p.capacity < 1 ||
       (!p.sliding && p.position > p.capacity - p.tokens))
     return cudaErrorInvalidValue;
-  int visible = p.d_pos ? 128 : p.position + p.tokens;
+  // Bound the graph-captured decode score grid; each block strides over visible keys.
+  constexpr int kDecodeScoreBlocks = 128;
+  int visible = p.d_pos ? kDecodeScoreBlocks : p.position + p.tokens;
   if (visible > p.capacity) visible = p.capacity;
   Score<<<dim3(visible, 24, p.tokens), 32, 0, static_cast<cudaStream_t>(s)>>>(p);
   auto status = cudaGetLastError();

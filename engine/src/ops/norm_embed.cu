@@ -1,7 +1,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
-#include "op_params.h"
+#include "norm_ops.h"
 #include "row_reduction.cuh"
 
 namespace {

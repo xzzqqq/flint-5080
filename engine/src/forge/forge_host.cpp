@@ -25,7 +25,7 @@ std::filesystem::path ParseSmokeCommand(std::span<char*> arguments) {
     throw std::runtime_error("expected --smoke");
   }
   if (forward_path.empty()) {
-    return std::filesystem::read_symlink("/proc/self/exe").parent_path() / "forward.so";
+    return std::filesystem::read_symlink("/proc/self/exe").parent_path() / "stub_forward.so";
   }
   return forward_path;
 }

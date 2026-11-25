@@ -1,7 +1,5 @@
 #pragma once
-
-// Reference row reductions consume contiguous four-element vectors before the
-// binary tree. The rounding at each operation matters before BF16 conversion.
+// Phase 1 reference parity: reduce four contiguous lanes before the binary tree.
 namespace flint::row {
 inline int Threads(int width) { return width == 2304 ? 512 : width == 128 ? 32 : 256; }
 template <class Value>

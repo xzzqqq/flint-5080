@@ -1,7 +1,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
-#include "op_params.h"
+#include "sconv_ops.h"
 
 namespace {
 __device__ float Read(const void* x, int i, FlintType type) {

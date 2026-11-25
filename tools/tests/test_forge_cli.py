@@ -99,6 +99,27 @@ class ForgeCLI(unittest.TestCase):
                 execute(["ab", "current", "baseline"])
                 ex.sync.assert_called_once()
 
+    def test_no_model_build_and_current_candidate(self):
+        cases = self.cfg.repo_root / "workloads/golden_cases.json"
+        cases.parent.mkdir()
+        cases.write_text('{"cases":[{"name":"tiny","input_ids":[0]}]}')
+        self.cfg.remote.enabled = True
+        result = RunResult("forge", True, {})
+        with (
+            patch.object(commands, "build") as build,
+            patch.object(commands, "GpuLeaseManager"),
+            patch.object(commands, "host_call", return_value={"pid": 1, "heartbeat": 2}) as call,
+        ):
+            commands.execute(self.cfg, self.parser.parse_args(["start", "--no-model"]), result)
+            self.assertEqual(build.call_args.args[-1], ["forge-host", "stub_forward"])
+            argv = call.call_args.args[-1]["argv"]
+            stub = "engine/build/stub_forward.so"
+            self.assertEqual(argv[argv.index("--baseline") + 1], stub)
+            commands.execute(self.cfg, self.parser.parse_args(["run", "--save", "trial"]), result)
+            self.assertEqual(build.call_args.args[-1], ["stub_forward"])
+            payload = call.call_args.args[-1]
+            self.assertEqual((payload["so_path"], payload["current_path"]), (stub, stub))
+
     def test_candidate_lifecycle(self):
         with chdir(self.cfg.repo_root):
             dst = Path(".forge/candidates")

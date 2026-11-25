@@ -7,6 +7,8 @@
 #include <stdexcept>
 #include <unordered_map>
 
+#include "common/cuda_check.h"
+#include "loader/kv_layout.h"
 #include "loader/safetensors.h"
 
 namespace flint {
@@ -16,13 +18,9 @@ using Shape = std::vector<int64_t>;
 constexpr size_t kAlignment = 256;
 size_t Align(size_t offset) { return (offset + kAlignment - 1) & ~(kAlignment - 1); }
 
-void Cuda(cudaError_t error, const char* op) {
-  if (error != cudaSuccess)
-    throw std::runtime_error(std::string(op) + ": " + cudaGetErrorString(error));
-}
 void* AllocateDevice(size_t bytes) {
   void* ptr = nullptr;
-  Cuda(cudaMalloc(&ptr, bytes), "allocate device arena");
+  CheckCuda(cudaMalloc(&ptr, bytes), "allocate device arena");
   return ptr;
 }
 
@@ -63,67 +61,89 @@ class Fields {
 Schema WeightSchema(ModelWeightsView& model) {
   Schema schema;
   Fields global(schema, "model.llm.");
-  global.Add("embed.weight", D::kBF16, {201024, 2304}, model.embed_weight);
-  global.Add("embed_norm.weight", D::kBF16, {2304}, model.embed_norm_weight);
-  global.Add("norm.weight", D::kBF16, {2304}, model.final_norm_weight);
-  global.Add("unembed.weight", D::kBF16, {201024, 2304}, model.unembed_weight);
-  global.Add("attn_res.output_query", D::kF32, {2304}, model.output_query);
-  global.Add("middle_cycle_cross_pass_queries", D::kF32, {24, 2304}, model.cross_pass_queries);
-  global.Add("middle_cycle_cross_pass_kv_queries", D::kF32, {24, 2304},
+  global.Add("embed.weight", D::kBF16, {model::kVocabSize, model::kHiddenSize}, model.embed_weight);
+  global.Add("embed_norm.weight", D::kBF16, {model::kHiddenSize}, model.embed_norm_weight);
+  global.Add("norm.weight", D::kBF16, {model::kHiddenSize}, model.final_norm_weight);
+  global.Add("unembed.weight", D::kBF16, {model::kVocabSize, model::kHiddenSize},
+             model.unembed_weight);
+  global.Add("attn_res.output_query", D::kF32, {model::kHiddenSize}, model.output_query);
+  global.Add("middle_cycle_cross_pass_queries", D::kF32,
+             {2 * (model::kLoopCoreEnd - model::kLoopCoreStart), model::kHiddenSize},
+             model.cross_pass_queries);
+  global.Add("middle_cycle_cross_pass_kv_queries", D::kF32,
+             {2 * (model::kLoopCoreEnd - model::kLoopCoreStart), model::kHiddenSize},
              model.cross_pass_kv_queries);
-  for (unsigned i = 0; i < FLINT_NUM_PHYSICAL_LAYERS; ++i) {
+  for (unsigned i = 0; i < model::kNumPhysicalLayers; ++i) {
     auto& layer = model.layers[i];
     layer.is_full_attention = model.config.is_full_layer[i];
     layer.is_loop_layer = i >= model.config.loop_core_start && i < model.config.loop_core_end;
     const auto id = std::to_string(i);
     Fields f(schema, "model.llm.layers." + id + ".");
     if (layer.is_full_attention) {
-      f.Add("q_input_norm.weight", D::kBF16, {2304}, layer.q_input_norm);
-      f.Add("k_input_norm.weight", D::kBF16, {2304}, layer.k_input_norm);
-      f.Add("v_input_norm.weight", D::kBF16, {2304}, layer.v_input_norm);
-      f.Add("attn.k_sconv.static_w", D::kBF16, {4, 1024}, layer.k_static_w);
-      f.Add("attn.v_sconv.static_w", D::kBF16, {4, 1024}, layer.v_static_w);
-      f.Add("attn.k_sconv.weight_proj", D::kBF16, {32, 2304}, layer.k_weight_proj);
-      f.Add("attn.v_sconv.weight_proj", D::kBF16, {32, 2304}, layer.v_weight_proj);
+      f.Add("q_input_norm.weight", D::kBF16, {model::kHiddenSize}, layer.q_input_norm);
+      f.Add("k_input_norm.weight", D::kBF16, {model::kHiddenSize}, layer.k_input_norm);
+      f.Add("v_input_norm.weight", D::kBF16, {model::kHiddenSize}, layer.v_input_norm);
+      f.Add("attn.k_sconv.static_w", D::kBF16, {model::kSconvKernelSize, model::kKvDim},
+            layer.k_static_w);
+      f.Add("attn.v_sconv.static_w", D::kBF16, {model::kSconvKernelSize, model::kKvDim},
+            layer.v_static_w);
+      f.Add("attn.k_sconv.weight_proj", D::kBF16, {model::kDynConvProjDim, model::kHiddenSize},
+            layer.k_weight_proj);
+      f.Add("attn.v_sconv.weight_proj", D::kBF16, {model::kDynConvProjDim, model::kHiddenSize},
+            layer.v_weight_proj);
     } else {
-      f.Add("attn_norm.weight", D::kBF16, {2304}, layer.attn_norm);
-      f.Add("attn.k_sconv.weight", D::kBF16, {1024, 1, 4}, layer.k_sconv);
-      f.Add("attn.v_sconv.weight", D::kBF16, {1024, 1, 4}, layer.v_sconv);
+      f.Add("attn_norm.weight", D::kBF16, {model::kHiddenSize}, layer.attn_norm);
+      f.Add("attn.k_sconv.weight", D::kBF16, {model::kKvDim, 1, model::kSconvKernelSize},
+            layer.k_sconv);
+      f.Add("attn.v_sconv.weight", D::kBF16, {model::kKvDim, 1, model::kSconvKernelSize},
+            layer.v_sconv);
     }
-    f.Add("mlp_norm.weight", D::kBF16, {2304}, layer.mlp_norm);
-    f.Add("attn_sconv.weight", D::kBF16, {2304, 1, 4}, layer.attn_sconv);
-    f.Add("mlp_sconv.weight", D::kBF16, {2304, 1, 4}, layer.mlp_sconv);
-    f.Add("attn.wr_du.weight", D::kBF16, {384, 2304}, layer.wr_du);
-    f.Add("attn.rel_logits_proj.proj", D::kBF16, {16, 1024}, layer.rel_logits_proj);
-    f.Add("attn.q_l2_clip.scale", D::kBF16, {24, 128}, layer.q_l2_clip_scale);
-    f.Add("attn.rel_l2_clip.scale", D::kBF16, {24, 16}, layer.rel_l2_clip_scale);
-    f.Add("attn.attn_sink_proj.weight", D::kBF16, {24, 2304}, layer.attn_sink_proj);
+    f.Add("mlp_norm.weight", D::kBF16, {model::kHiddenSize}, layer.mlp_norm);
+    f.Add("attn_sconv.weight", D::kBF16, {model::kHiddenSize, 1, model::kSconvKernelSize},
+          layer.attn_sconv);
+    f.Add("mlp_sconv.weight", D::kBF16, {model::kHiddenSize, 1, model::kSconvKernelSize},
+          layer.mlp_sconv);
+    f.Add("attn.wr_du.weight", D::kBF16, {model::kRelProjDim, model::kHiddenSize}, layer.wr_du);
+    f.Add("attn.rel_logits_proj.proj", D::kBF16, {model::kRelDim, model::kRelExtent},
+          layer.rel_logits_proj);
+    f.Add("attn.q_l2_clip.scale", D::kBF16, {model::kNumQHeads, model::kHeadDim},
+          layer.q_l2_clip_scale);
+    f.Add("attn.rel_l2_clip.scale", D::kBF16, {model::kNumQHeads, model::kRelDim},
+          layer.rel_l2_clip_scale);
+    f.Add("attn.attn_sink_proj.weight", D::kBF16, {model::kNumQHeads, model::kHiddenSize},
+          layer.attn_sink_proj);
     if (i > 0)
       global.Add("attn_res.attn_queries." + std::to_string(i - 1), D::kF32,
-                 layer.is_full_attention ? Shape{3, 2304} : Shape{2304}, layer.attn_query);
-    global.Add("attn_res.mlp_queries." + id, D::kF32, {2304}, layer.mlp_query);
-    f.Add("mlp.gate.weight", D::kBF16, {128, 2304}, layer.router_weight);
-    f.Add("mlp.gate.bias", D::kF32, {128}, layer.router_bias);
+                 layer.is_full_attention ? Shape{3, model::kHiddenSize} : Shape{model::kHiddenSize},
+                 layer.attn_query);
+    global.Add("attn_res.mlp_queries." + id, D::kF32, {model::kHiddenSize}, layer.mlp_query);
+    f.Add("mlp.gate.weight", D::kBF16, {model::kNumExperts, model::kHiddenSize},
+          layer.router_weight);
+    f.Add("mlp.gate.bias", D::kF32, {model::kNumExperts}, layer.router_bias);
     Fields attn(schema, id + ".self_attn.");
-    attn.Matrix("q_proj.linear", 2304, 3072, 12, layer.q_proj);
-    attn.Matrix("k_proj.linear", 2304, 1024, 12, layer.k_proj);
-    attn.Matrix("v_proj.linear", 2304, 1024, 12, layer.v_proj);
-    attn.Matrix("o_proj.gate_proj", 2304, 3072, 12, layer.o_gate_proj);
-    attn.Matrix("o_proj.linear", 3072, 2304, 12, layer.o_proj);
+    attn.Matrix("q_proj.linear", model::kHiddenSize, model::kQDim, 12, layer.q_proj);
+    attn.Matrix("k_proj.linear", model::kHiddenSize, model::kKvDim, 12, layer.k_proj);
+    attn.Matrix("v_proj.linear", model::kHiddenSize, model::kKvDim, 12, layer.v_proj);
+    attn.Matrix("o_proj.gate_proj", model::kHiddenSize, model::kQDim, 12, layer.o_gate_proj);
+    attn.Matrix("o_proj.linear", model::kQDim, model::kHiddenSize, 12, layer.o_proj);
     Fields experts(schema, id + ".experts.");
-    for (int j = 0; j < FLINT_NUM_EXPERTS; ++j) {
-      experts.Matrix("gate_up_proj." + std::to_string(j), 2304, 2304, 6 + j % 2,
-                     layer.gate_up_proj[j]);
-      experts.Matrix("down_proj." + std::to_string(j), 1152, 2304, 6 + j % 2, layer.down_proj[j]);
+    for (int j = 0; j < model::kNumExperts; ++j) {
+      experts.Matrix("gate_up_proj." + std::to_string(j), model::kHiddenSize, model::kGateUpSize,
+                     6 + j % 2, layer.gate_up_proj[j]);
+      experts.Matrix("down_proj." + std::to_string(j), model::kIntermediateSize, model::kHiddenSize,
+                     6 + j % 2, layer.down_proj[j]);
     }
     if (layer.is_loop_layer) {
       const char* names[] = {"attn", "k", "v", "mlp"};
       for (size_t j = 0; j < std::size(names); ++j) {
         auto prefix = std::string("controllers.") + names[j] + ".";
         auto& ctl = layer.controllers[j];
-        f.Add(prefix + "down_weight", D::kBF16, {64, 4608}, ctl.down_weight);
-        f.Add(prefix + "forget_weight", D::kBF16, {2304, 64}, ctl.forget_weight);
-        f.Add(prefix + "gain_weight", D::kBF16, {2304, 64}, ctl.gain_weight);
+        f.Add(prefix + "down_weight", D::kBF16, {model::kLoopGateRank, model::kMessageGateInDim},
+              ctl.down_weight);
+        f.Add(prefix + "forget_weight", D::kBF16, {model::kHiddenSize, model::kLoopGateRank},
+              ctl.forget_weight);
+        f.Add(prefix + "gain_weight", D::kBF16, {model::kHiddenSize, model::kLoopGateRank},
+              ctl.gain_weight);
       }
     }
   }
@@ -169,27 +189,27 @@ std::vector<Copy> PlanWeights(const SafetensorsFile& file, ModelWeightsView& mod
 
 struct Event {
   cudaEvent_t event{};
-  Event() { Cuda(cudaEventCreate(&event), "create transfer event"); }
+  Event() { CheckCuda(cudaEventCreate(&event), "create transfer event"); }
   ~Event() { cudaEventDestroy(event); }
 };
 
 float Upload(const std::vector<Copy>& plan, std::byte* device, cudaStream_t stream) {
   constexpr size_t capacity = 64ull << 20;
   void* host;
-  Cuda(cudaMallocHost(&host, capacity), "allocate pinned staging buffer");
+  CheckCuda(cudaMallocHost(&host, capacity), "allocate pinned staging buffer");
   std::unique_ptr<void, decltype(&cudaFreeHost)> staging(host, cudaFreeHost);
   auto* buffer = static_cast<std::byte*>(host);
   size_t sent = 0, used = 0;
   float elapsed = 0;
   Event start, finish;
   auto flush = [&] {
-    Cuda(cudaEventRecord(start.event, stream), "record transfer start");
-    Cuda(cudaMemcpyAsync(device + sent, buffer, used, cudaMemcpyHostToDevice, stream),
-         "upload weights");
-    Cuda(cudaEventRecord(finish.event, stream), "record transfer finish");
-    Cuda(cudaEventSynchronize(finish.event), "wait for staging buffer");
+    CheckCuda(cudaEventRecord(start.event, stream), "record transfer start");
+    CheckCuda(cudaMemcpyAsync(device + sent, buffer, used, cudaMemcpyHostToDevice, stream),
+              "upload weights");
+    CheckCuda(cudaEventRecord(finish.event, stream), "record transfer finish");
+    CheckCuda(cudaEventSynchronize(finish.event), "wait for staging buffer");
     float ms;
-    Cuda(cudaEventElapsedTime(&ms, start.event, finish.event), "measure transfer");
+    CheckCuda(cudaEventElapsedTime(&ms, start.event, finish.event), "measure transfer");
     elapsed += ms;
     sent += used;
     used = 0;
@@ -213,20 +233,6 @@ float Upload(const std::vector<Copy>& plan, std::byte* device, cudaStream_t stre
   return elapsed;
 }
 
-struct KvLayout {
-  size_t swa, per_token, kv_conv, sublayer_conv;
-  size_t Fixed() const { return swa + kv_conv + sublayer_conv; }
-};
-KvLayout Layout(const ModelConfig& c) {
-  if (c.num_key_value_heads != 8 || c.head_dim != 128 || c.hidden_size != 2304 ||
-      c.sconv_kernel_size != 4 || c.sliding_window_size != 1024)
-    throw std::invalid_argument("unsupported KV geometry");
-  size_t channels = c.num_key_value_heads * c.head_dim;
-  size_t kv_pair = 2 * channels * sizeof(uint16_t);
-  size_t state = FLINT_NUM_LOGICAL_VISITS * 2 * (c.sconv_kernel_size - 1) * sizeof(float);
-  return {FLINT_NUM_SWA_VISITS * c.sliding_window_size * kv_pair, FLINT_NUM_FULL_VISITS * kv_pair,
-          state * channels, state * c.hidden_size};
-}
 }  // namespace
 
 WeightsArena WeightsArena::Load(const std::filesystem::path& dir, cudaStream_t stream) {
@@ -242,13 +248,13 @@ WeightsArena WeightsArena::Load(const std::filesystem::path& dir, cudaStream_t s
 }
 
 uint32_t KvStateArena::MaxFullSeqLenForBudget(const ModelConfig& c, size_t budget) {
-  auto l = Layout(c);
+  auto l = ComputeKvArenaSizes(c);
   if (budget < l.Fixed()) return 0;
   return std::min<size_t>(UINT32_MAX, (budget - l.Fixed()) / l.per_token);
 }
 KvStateArena KvStateArena::Allocate(const ModelConfig& c, uint32_t tokens) {
   if (!tokens) throw std::invalid_argument("empty full KV context");
-  auto l = Layout(c);
+  auto l = ComputeKvArenaSizes(c);
   KvStateArena result;
   auto& v = result.view_;
   v.arena_bytes = l.Fixed() + tokens * l.per_token;
@@ -261,16 +267,17 @@ KvStateArena KvStateArena::Allocate(const ModelConfig& c, uint32_t tokens) {
   v.sublayer_conv_state = reinterpret_cast<float*>(conv + l.kv_conv);
   v.max_full_seq_len = tokens;
   v.swa_window = c.sliding_window_size;
-  v.num_swa_visits = FLINT_NUM_SWA_VISITS;
-  v.num_full_visits = FLINT_NUM_FULL_VISITS;
-  v.num_total_visits = FLINT_NUM_LOGICAL_VISITS;
+  v.num_swa_visits = model::kNumSwaVisits;
+  v.num_full_visits = model::kNumFullVisits;
+  v.num_total_visits = model::kNumLogicalVisits;
   v.num_kv_heads = c.num_key_value_heads;
+  v.hidden_size = c.hidden_size;
   v.head_dim = c.head_dim;
   v.conv_state_len = c.sconv_kernel_size - 1;
   return result;
 }
 void KvStateArena::Reset(cudaStream_t stream) {
-  Cuda(cudaMemsetAsync(view_.arena_base, 0, view_.arena_bytes, stream), "reset KV state");
+  CheckCuda(cudaMemsetAsync(view_.arena_base, 0, view_.arena_bytes, stream), "reset KV state");
 }
 ScratchArena ScratchArena::Allocate(size_t bytes) {
   if (!bytes) throw std::invalid_argument("empty scratch arena");

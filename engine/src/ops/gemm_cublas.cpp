@@ -2,6 +2,8 @@
 
 #include <stdexcept>
 
+#include "common/cuda_check.h"
+#include "ops/exl3_ops.h"
 #include "ops/scratch_workspace.h"
 namespace flint {
 namespace {
@@ -38,7 +40,7 @@ void Gemm::Multiply(const void* a, const void* b, void* c, int m, int n, int k, 
                      b, Type(operand), transpose_b ? k : n, a, Type(operand), k, &zero, c,
                      Type(output), n, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
 }
-// Mirror row_matmul in the reference: cuBLAS kernel choice (and hence BF16
+// Phase 1 reference parity: cuBLAS kernel choice (and hence BF16
 // rounding) depends on M. Pad the tail and reuse one pair of 32-row tiles.
 void RunRowMatmul(const Gemm& g, ScratchArenaView scratch, const void* a, const void* b, void* c,
                   int m, int n, int k, FlintType input, FlintType output, bool transpose) {
@@ -55,12 +57,10 @@ void RunRowMatmul(const Gemm& g, ScratchArenaView scratch, const void* a, const 
   }
   if (!m) return;
   auto padded = ws.Take<char>(32 * stride_a), out = ws.Take<char>(32 * stride_c);
-  ops_detail::CheckCuda(
-      cudaMemcpyAsync(padded, x, m * stride_a, cudaMemcpyDeviceToDevice, g.stream()));
-  ops_detail::CheckCuda(cudaMemsetAsync(padded + m * stride_a, 0, (32 - m) * stride_a, g.stream()));
+  CheckCuda(cudaMemcpyAsync(padded, x, m * stride_a, cudaMemcpyDeviceToDevice, g.stream()));
+  CheckCuda(cudaMemsetAsync(padded + m * stride_a, 0, (32 - m) * stride_a, g.stream()));
   g.Multiply(padded, b, out, 32, n, k, input, output, transpose);
-  ops_detail::CheckCuda(
-      cudaMemcpyAsync(y, out, m * stride_c, cudaMemcpyDeviceToDevice, g.stream()));
+  CheckCuda(cudaMemcpyAsync(y, out, m * stride_c, cudaMemcpyDeviceToDevice, g.stream()));
 }
 void RunFp32Linear(const Gemm& g, ScratchArenaView scratch, const void* x, FlintType input,
                    const void* weight, FlintType weight_type, float* out, int rows, int n, int k) {
@@ -68,7 +68,7 @@ void RunFp32Linear(const Gemm& g, ScratchArenaView scratch, const void* x, Flint
   auto promote = [&](const void* src, FlintType type, int count) -> const void* {
     if (type == FLINT_F32) return src;
     auto dst = ws.Take<float>(count);
-    ops_detail::CheckCuda(flint_cast({src, dst, count, type, FLINT_F32}, g.stream()));
+    CheckCuda(flint_cast({src, dst, count, type, FLINT_F32}, g.stream()));
     return dst;
   };
   auto a = promote(x, input, rows * k);

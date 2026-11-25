@@ -1,6 +1,6 @@
 #include <cuda_bf16.h>
 
-#include "op_params.h"
+#include "moe_ops.h"
 
 namespace {
 using B = __nv_bfloat16;

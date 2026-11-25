@@ -146,6 +146,8 @@ char* engine_stats_json(EngineHandle* h); // 返回 JSON 快照供 /ready 与 P1
 ```
 
 - **`forge-host` 与 `forward.so` 均为全速 Release（`-O3`、`sm_120a`、CUDA Graph 全开）构建**，绝非 Debug 构建。
+- `libengine.a` 与 `forward.so` 共用 `engine_model` 中的 `InklingRunner`。Forge 的 ABI v3 适配层负责转换请求与结果，返回的 `num_block_out` 表示活跃残差块数。
+- `forge start --no-model` 和 `forge-host --smoke` 加载 `stub_forward.so`。回放使用相同的 BF16 隐状态、carry 和按 visit 定位的 KV/卷积快照。
 - 两种形态互斥使用 5080（由单卡 lease 锁强制防撞车）。
 
 ### 6.2 整图 `forward.so` 热重载的关键机制

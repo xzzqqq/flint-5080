@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 
+#include "common/cuda_check.h"
 #include "forward_abi.h"
 
 namespace flint {
@@ -21,12 +22,6 @@ constexpr size_t kArenaBytes = 4 * 1024 * 1024;
 constexpr size_t kLeakLimitBytes = 4 * 1024 * 1024;
 constexpr int kElementCount = 4097;  // Exercise the partial final CUDA block.
 constexpr float kBias = 0.25f;
-
-void CheckCuda(cudaError_t status) {
-  if (status != cudaSuccess) {
-    throw std::runtime_error(cudaGetErrorString(status));
-  }
-}
 
 struct ScratchArena {
   ScratchArena() = default;

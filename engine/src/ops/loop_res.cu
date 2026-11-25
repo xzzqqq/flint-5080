@@ -2,7 +2,7 @@
 #include <cuda_fp16.h>
 #include <math_constants.h>
 
-#include "op_params.h"
+#include "loop_res_ops.h"
 #include "row_reduction.cuh"
 
 namespace {
@@ -20,18 +20,6 @@ __device__ void Write(void* y, int i, float v, FlintType type) {
     static_cast<__nv_bfloat16*>(y)[i] = __float2bfloat16_rn(v);
 }
 
-__device__ float Reduce(float v, float* buf) {
-  int i = threadIdx.x;
-  buf[i] = v;
-  __syncthreads();
-  for (int d = blockDim.x / 2; d; d /= 2) {
-    if (i < d) buf[i] += buf[i + d];
-    __syncthreads();
-  }
-  float sum = buf[0];
-  __syncthreads();
-  return sum;
-}
 __device__ float State(ResidualParams p, int b, int t, int i) {
   if (b == p.num_blocks) return Read(p.partial, t * p.width + i, p.partial_type);
   return Read(p.blocks, (b * p.tokens + t) * p.width + i, p.block_type);
@@ -55,40 +43,6 @@ __global__ void Softmax(float* scores, int states, float scale) {
   if (lane < states) scores[lane] = e / sum;
 }
 
-__global__ void Scores(ResidualParams p) {
-  __shared__ float buf[256];
-  int row = blockIdx.x, b = row % (p.num_blocks + 1), q = row / (p.num_blocks + 1) % p.queries,
-      t = row / (p.num_blocks + 1) / p.queries;
-  float ss = 0;
-  for (int i = threadIdx.x; i < p.width; i += 256) {
-    float x = State(p, b, t, i);
-    ss += x * x;
-  }
-  float inv = rsqrtf(Reduce(ss, buf) / p.width + 1e-6f);
-  float dot = 0;
-  for (int i = threadIdx.x; i < p.width; i += 256)
-    dot += p.query[q * p.width + i] * (State(p, b, t, i) * inv);
-  float score = Reduce(dot, buf) * rsqrtf((float)p.width);
-  if (!threadIdx.x) {
-    p.scratch[2 * row] = inv;
-    p.scratch[2 * row + 1] = score;
-  }
-}
-__global__ void Combine(ResidualParams p) {
-  int row = blockIdx.x;
-  float* stats = p.scratch + 2 * row * (p.num_blocks + 1);
-  float peak = stats[1];
-  for (int b = 1; b <= p.num_blocks; ++b) peak = fmaxf(peak, stats[2 * b + 1]);
-  float total = 0;
-  for (int b = 0; b <= p.num_blocks; ++b) total += expf(stats[2 * b + 1] - peak);
-  for (int i = threadIdx.x; i < p.width; i += 256) {
-    float y = 0;
-    for (int b = 0; b <= p.num_blocks; ++b)
-      y += (State(p, b, row / p.queries, i) * stats[2 * b]) *
-           (expf(stats[2 * b + 1] - peak) / total);
-    p.y[row * p.width + i] = y;
-  }
-}
 __global__ void Prep(PrepParams p) {
   __shared__ float buf[512];
   int t = blockIdx.x / 2;
@@ -109,13 +63,6 @@ __global__ void Merge(MergeParams p) {
   for (int i = threadIdx.x; i < p.width; i += blockDim.x) p.y[row * p.width + i] = src[i];
 }
 }  // namespace
-int flint_block_attn_residual(ResidualParams p, void* s) {
-  Scores<<<p.tokens * p.queries*(p.num_blocks + 1), 256, 0, static_cast<cudaStream_t>(s)>>>(p);
-  auto err = cudaGetLastError();
-  if (err) return err;
-  Combine<<<p.tokens * p.queries, 256, 0, static_cast<cudaStream_t>(s)>>>(p);
-  return cudaGetLastError();
-}
 int flint_message_gate_prep(PrepParams p, void* s) {
   Prep<<<p.tokens * 2, flint::row::Threads(p.width), 0, static_cast<cudaStream_t>(s)>>>(p);
   return cudaGetLastError();

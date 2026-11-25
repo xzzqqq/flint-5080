@@ -11,30 +11,30 @@
 #include <iostream>
 #include <numeric>
 
+#include "common/cuda_check.h"
 #include "forge/safetensors_writer.h"
+#include "loader/kv_layout.h"
 #include "loader/safetensors.h"
 
 namespace flint {
 namespace fs = std::filesystem;
 namespace {
-void Cuda(cudaError_t s) {
-  if (s != cudaSuccess) throw std::runtime_error(cudaGetErrorString(s));
-}
+
 size_t FreeBytes() {
   size_t free, total;
-  Cuda(cudaMemGetInfo(&free, &total));
+  CheckCuda(cudaMemGetInfo(&free, &total));
   return free;
 }
 template <class T>
 std::vector<T> Read(const T* device, size_t count) {
   std::vector<T> data(count);
-  Cuda(cudaMemcpy(data.data(), device, count * sizeof(T), cudaMemcpyDeviceToHost));
+  CheckCuda(cudaMemcpy(data.data(), device, count * sizeof(T), cudaMemcpyDeviceToHost));
   return data;
 }
 template <class T>
 void Upload(cudaStream_t stream, T* device, const std::vector<T>& data) {
-  Cuda(cudaMemcpyAsync(device, data.data(), data.size() * sizeof(T), cudaMemcpyHostToDevice,
-                       stream));
+  CheckCuda(cudaMemcpyAsync(device, data.data(), data.size() * sizeof(T), cudaMemcpyHostToDevice,
+                            stream));
 }
 Object Diff(std::span<const float> a, std::span<const float> b) {
   if (a.empty() || a.size() != b.size()) throw std::runtime_error("incompatible comparison shapes");
@@ -128,7 +128,7 @@ void Golden(Object& reply, const fs::path& dir, const std::string& name,
 
 class Replay::Module {
  public:
-  Module(Replay& host, const fs::path& path)
+  Module(Replay& host, const fs::path& path, bool independent_scratch)
       : copy_(host.config_.state_dir / "loaded" /
               (std::to_string(++host.serial_) + "_" + path.stem().string() + ".so")) {
     fs::copy_file(path, copy_, fs::copy_options::overwrite_existing);
@@ -141,9 +141,12 @@ class Replay::Module {
       destroy_ = Symbol<decltype(destroy_)>("flint_forward_destroy");
       run_ = Symbol<decltype(run_)>("flint_forward_run_layers");
       stats_ = reinterpret_cast<decltype(stats_)>(dlsym(handle_, "flint_forward_graph_stats"));
+      if (independent_scratch)
+        scratch_.emplace(ScratchArena::Allocate(host.scratch_->view().bytes));
+      const auto& scratch = scratch_ ? scratch_->view() : host.scratch_->view();
       context_ = Symbol<decltype(&flint_forward_create)>("flint_forward_create")(
-          host.weights_ ? &host.weights_->view() : nullptr, &host.kv_->view(),
-          &host.scratch_->view(), host.stream_);
+          host.weights_ ? &host.weights_->view() : nullptr, &host.kv_->view(), &scratch,
+          host.stream_);
       if (!context_) throw std::runtime_error("forward context creation failed");
     } catch (...) {
       Close();
@@ -160,10 +163,7 @@ class Replay::Module {
   ForwardRunResult Run(const ForwardRunSpec& s, const ForwardOptions& o = {}) {
     ForwardRunResult r{};
     int code = run_(context_, &s, &o, &r);
-    if (code || r.status)
-      throw std::runtime_error(
-          "run_layers: " +
-          std::string(cudaGetErrorString(static_cast<cudaError_t>(code ? code : r.status))));
+    CheckCuda(code ? code : r.status, "run_layers");
     if (r.num_stages > FLINT_MAX_STAGE_TIMINGS || !std::isfinite(r.elapsed_ms) || r.elapsed_ms < 0)
       throw std::runtime_error("invalid forward timing result");
     return r;
@@ -186,6 +186,8 @@ class Replay::Module {
     std::error_code ec;
     fs::remove(copy_, ec);
   }
+  // A/B candidates can reserve different persistent tables within their scratch.
+  std::optional<ScratchArena> scratch_;
   fs::path copy_;
   void* handle_{};
   ForwardContext* context_{};
@@ -193,59 +195,55 @@ class Replay::Module {
   decltype(&flint_forward_graph_stats) stats_{};
   decltype(&flint_forward_run_layers) run_{};
 };
-std::unique_ptr<Replay::Module> Replay::Load(const fs::path& path) {
-  return std::make_unique<Module>(*this, path);
+std::unique_ptr<Replay::Module> Replay::Load(const fs::path& path, bool independent_scratch) {
+  return std::make_unique<Module>(*this, path, independent_scratch);
 }
 Replay::Replay(DaemonConfig cfg) : config_(std::move(cfg)) {
-  Cuda(cudaSetDevice(0));
-  ModelConfig c{};
-  c.hidden_size = width_;
-  c.num_key_value_heads = 8;
-  c.head_dim = 128;
-  c.sconv_kernel_size = 4;
-  c.sliding_window_size = 1024;
+  CheckCuda(cudaSetDevice(0));
+  model_config_ = model::MakeDefaultInklingConfig();
   if (!config_.model_dir.empty()) {
     auto start = std::chrono::steady_clock::now();
     weights_.emplace(WeightsArena::Load(config_.model_dir));
     weights_load_ms_ =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-    c = weights_->view().config;
-    width_ = c.hidden_size;
-    vocab_ = c.unpadded_vocab_size;
+    model_config_ = weights_->view().config;
   }
-  kv_.emplace(KvStateArena::Allocate(c, config_.kv_seq_len));
+  plan_ = BuildVisitPlan(model_config_);
+  width_ = model_config_.hidden_size;
+  vocab_ = model_config_.unpadded_vocab_size;
+  kv_.emplace(KvStateArena::Allocate(model_config_, config_.kv_seq_len));
   scratch_.emplace(ScratchArena::Allocate(size_t(config_.scratch_mb) << 20));
-  capacity_ = std::min<size_t>(
-      {config_.kv_seq_len, 1024, scratch_->view().bytes / (width_ * sizeof(float))});
+  capacity_ = std::min<size_t>({config_.kv_seq_len, model::kSlidingWindow,
+                                scratch_->view().bytes / (width_ * sizeof(float))});
   if (!capacity_) throw std::runtime_error("scratch too small for one token");
   size_t elements = size_t(capacity_) * width_;
-  const size_t carry_bytes = weights_ ? FLINT_CARRY_PLANES * elements * sizeof(uint16_t) : 0;
-  io_.emplace(ScratchArena::Allocate(sizeof(float) * (2 * elements + capacity_ + 1 + vocab_) +
-                                     carry_bytes));
-  hidden_ = static_cast<float*>(io_->view().device_ptr);
+  auto hidden_bytes = elements * sizeof(uint16_t);
+  io_.emplace(ScratchArena::Allocate((2 + model::kCarryPlanes) * hidden_bytes +
+                                     vocab_ * sizeof(float) + (capacity_ + 1) * sizeof(int)));
+  hidden_ = static_cast<uint16_t*>(io_->view().device_ptr);
   out_ = hidden_ + elements;
-  logits_ = out_ + elements;
+  carry_ = out_ + elements;
+  logits_ = reinterpret_cast<float*>(carry_ + model::kCarryPlanes * elements);
   ids_ = reinterpret_cast<int*>(logits_ + vocab_);
   next_ = ids_ + capacity_;
-  carry_ = weights_ ? reinterpret_cast<uint16_t*>(next_ + 1) : nullptr;
   for (auto dir : {"candidates", "loaded"}) fs::create_directories(config_.state_dir / dir);
   auto baseline = config_.state_dir / "candidates/baseline.so";
   fs::copy_file(config_.baseline, baseline.string() + ".tmp", fs::copy_options::overwrite_existing);
   fs::rename(baseline.string() + ".tmp", baseline);
   config_.baseline = baseline;
-  Cuda(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
+  CheckCuda(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
   try {
     // The driver retains graph launch storage at its high-water mark for
     // the process lifetime. Warm the same two live executables as interleaved
     // A/B, then destroy both before sampling steady-state unload losses.
     if (weights_) {
-      Cuda(cudaMemsetAsync(ids_, 0, sizeof(int), stream_));
+      CheckCuda(cudaMemsetAsync(ids_, 0, sizeof(int), stream_));
       const auto free_before = FreeBytes();
-      auto spec = Spec(0, 48, 1, 0, true, true);
+      auto spec = Spec(0, model::kNumLogicalVisits, 1, 0, true, true);
       spec.is_decode = 1;
       spec.reset_kv = 1;
       {
-        auto a = Load(config_.baseline), b = Load(config_.baseline);
+        auto a = Load(config_.baseline), b = Load(config_.baseline, true);
         ForwardOptions opts{.use_cuda_graph = 1, .return_logits = 1};
         a->Run(spec, opts);
         b->Run(spec, opts);
@@ -260,9 +258,9 @@ Replay::Replay(DaemonConfig cfg) : config_(std::move(cfg)) {
 Replay::~Replay() { cudaStreamDestroy(stream_); }
 Object Replay::Status() const {
   cudaDeviceProp gpu{};
-  Cuda(cudaGetDeviceProperties(&gpu, 0));
+  CheckCuda(cudaGetDeviceProperties(&gpu, 0));
   size_t free, total;
-  Cuda(cudaMemGetInfo(&free, &total));
+  CheckCuda(cudaMemGetInfo(&free, &total));
   return {{"pid", getpid()},
           {"gpu", gpu.name},
           {"model_dir", config_.model_dir.string()},
@@ -280,7 +278,7 @@ Object Replay::Status() const {
           {"lazy_cache_entries", cache_.size()}};
 }
 ForwardRunSpec Replay::Spec(unsigned begin, unsigned end, unsigned length, unsigned pos, bool embed,
-                            bool head) {
+                            bool head, unsigned blocks) {
   return {.begin_visit = begin,
           .end_visit = end,
           .run_embed = embed,
@@ -291,10 +289,9 @@ ForwardRunSpec Replay::Spec(unsigned begin, unsigned end, unsigned length, unsig
           .d_input_ids = ids_,
           .d_hidden_in = hidden_,
           .d_block_in = carry_,
-          .num_block_in = begin ? blocks_ : 0,
+          .num_block_in = blocks,
           .d_hidden_out = out_,
           .d_block_out = carry_,
-          .num_block_out = &blocks_,
           .d_logits_out = logits_,
           .d_next_token = next_};
 }
@@ -306,43 +303,25 @@ Recording Replay::Record(const std::vector<int>& ids, unsigned begin, unsigned e
   kv_->Reset(stream_);
   Upload(stream_, ids_, ids);
   for (unsigned i = 0; i < step; ++i) {
-    auto run = baseline->Run(Spec(0, 48, r.ids.size(), r.position, true, true));
+    auto run =
+        baseline->Run(Spec(0, model::kNumLogicalVisits, r.ids.size(), r.position, true, true));
     r.position += r.ids.size();
     r.ids = {run.next_token_id};
     r.generated.push_back(run.next_token_id);
     Upload(stream_, ids_, r.ids);
   }
-  baseline->Run(Spec(0, begin, r.ids.size(), r.position, true, false));
+  r.blocks = baseline->Run(Spec(0, begin, r.ids.size(), r.position, true, false)).num_block_out;
   auto count = r.ids.size() * width_;
   r.hidden = ReadHidden(count);
-  r.blocks = blocks_;
-  if (weights_) {
-    r.carry = Read(carry_, FLINT_CARRY_PLANES * count);
-    auto save = [&](const void* ptr, size_t bytes) {
-      auto p = static_cast<const std::byte*>(ptr);
+  r.carry = Read(carry_, model::kCarryPlanes * count);
+  for (unsigned v = begin; v < end; ++v) {
+    for (auto [offset, bytes] : VisitSnapshotRanges(state, plan_[v], r.position + r.ids.size()))
       r.state.push_back(
-          {size_t(p - static_cast<const std::byte*>(state.arena_base)), Read(p, bytes)});
-    };
-    const auto plan = BuildVisitPlan(weights_->view().config);
-    for (unsigned v = begin; v < end; ++v) {
-      auto visit = plan[v];
-      auto cap = visit.is_full_attention ? state.max_full_seq_len : state.swa_window;
-      auto base = static_cast<uint16_t*>(visit.is_full_attention ? state.full_kv : state.swa_kv);
-      size_t dim = state.num_kv_heads * state.head_dim;
-      auto live = std::min<size_t>(cap, r.position + r.ids.size());
-      for (int j = 0; j < 2; ++j)
-        save(base + (2 * visit.kv_slot_idx + j) * size_t(cap) * dim, live * dim * 2);
-      size_t kc = 2 * dim * state.conv_state_len, sc = 2 * width_ * state.conv_state_len;
-      save(state.kv_conv_state + v * kc, kc * 4);
-      save(state.sublayer_conv_state + v * sc, sc * 4);
-    }
-  } else {
-    r.kv = Read(static_cast<float*>(state.swa_kv) + begin, end - begin);
-    r.conv = Read(state.kv_conv_state + begin, end - begin);
+          {offset, Read(static_cast<const std::byte*>(state.arena_base) + offset, bytes)});
   }
   UploadHidden(r.hidden);
-  bool head = begin == 0 && end == 48;
-  auto result = baseline->Run(Spec(begin, end, r.ids.size(), r.position, head, head),
+  bool head = begin == 0 && end == model::kNumLogicalVisits;
+  auto result = baseline->Run(Spec(begin, end, r.ids.size(), r.position, head, head, r.blocks),
                               {.return_logits = head});
   r.reference = ReadHidden(count);
   r.next = result.next_token_id;
@@ -350,28 +329,21 @@ Recording Replay::Record(const std::vector<int>& ids, unsigned begin, unsigned e
   return r;
 }
 std::vector<float> Replay::ReadHidden(size_t count) const {
-  if (!weights_) return Read(out_, count);
-  auto bits = Read(reinterpret_cast<uint16_t*>(out_), count);
+  auto bits = Read(out_, count);
   std::vector<float> out(count);
   for (size_t i = 0; i < count; ++i) out[i] = std::bit_cast<float>(uint32_t(bits[i]) << 16);
   return out;
 }
 void Replay::UploadHidden(const std::vector<float>& data) {
-  if (!weights_) return Upload(stream_, hidden_, data);
   std::vector<uint16_t> bits(data.size());
   for (size_t i = 0; i < data.size(); ++i) bits[i] = std::bit_cast<uint32_t>(data[i]) >> 16;
-  Upload(stream_, reinterpret_cast<uint16_t*>(hidden_), bits);
-  Cuda(cudaStreamSynchronize(stream_));
+  Upload(stream_, hidden_, bits);
+  CheckCuda(cudaStreamSynchronize(stream_));
 }
-void Replay::Restore(const Recording& r, unsigned begin) {
-  if (weights_) {
-    Upload(stream_, carry_, r.carry);
-    for (const auto& slice : r.state)
-      Upload(stream_, static_cast<std::byte*>(kv_->view().arena_base) + slice.offset, slice.bytes);
-    return;
-  }
-  Upload(stream_, static_cast<float*>(kv_->view().swa_kv) + begin, r.kv);
-  Upload(stream_, kv_->view().kv_conv_state + begin, r.conv);
+void Replay::Restore(const Recording& r) {
+  Upload(stream_, carry_, r.carry);
+  for (const auto& slice : r.state)
+    Upload(stream_, static_cast<std::byte*>(kv_->view().arena_base) + slice.offset, slice.bytes);
 }
 Object Replay::Request(const Json& q) {
   const auto cmd = q.at("command").as<std::string>();
@@ -385,7 +357,7 @@ Object Replay::Request(const Json& q) {
   } catch (const std::exception& e) {
     reply["error"] = e.what();
   }
-  Cuda(cudaDeviceSynchronize());
+  CheckCuda(cudaDeviceSynchronize());
   const auto after = FreeBytes();
   const size_t loss = before > after ? before - after : 0;
   reply["vram_loss_bytes"] = loss;
@@ -397,15 +369,14 @@ Object Replay::Request(const Json& q) {
   }
   return reply;
 }
-Object Replay::Measure(const Json& q, const std::string& cmd) {
-  auto begin = Count(q, "begin_visit", 0, 0, 47), end = Count(q, "end_visit", 48, begin + 1, 48);
-  bool e2e = begin == 0 && end == 48;
+Replay::Measurement Replay::ParseMeasurement(const Json& q, const std::string& cmd) const {
+  auto begin = Count(q, "begin_visit", 0, 0, model::kNumLogicalVisits - 1),
+       end = Count(q, "end_visit", model::kNumLogicalVisits, begin + 1, model::kNumLogicalVisits);
   const auto name = q.get<std::string>("case", "short_math");
   std::vector<int> ids;
   for (auto& id : q.at("input_ids").as<Array>()) {
     int token = id.number<int>();
-    if (token < 0 ||
-        static_cast<unsigned>(token) >= (weights_ ? weights_->view().config.vocab_size : vocab_))
+    if (token < 0 || static_cast<unsigned>(token) >= model_config_.vocab_size)
       throw std::runtime_error("invalid token id");
     ids.push_back(token);
   }
@@ -415,105 +386,87 @@ Object Replay::Measure(const Json& q, const std::string& cmd) {
   auto warmup = Count(q, "warmup", 1, 0, 10000), iters = Count(q, "iters", 5, 1, 10000);
   auto rounds = cmd == "ab" ? Count(q, "rounds", 5, 1, 10000) : 1;
   if (size_t(iters) * rounds > 100000) throw std::runtime_error("too many timed iterations");
-  Object reply;
-  using Clock = std::chrono::steady_clock;
-  auto elapsed_ms = [](Clock::time_point start) {
-    return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
-  };
-  auto record_start = Clock::now();
-  Recording uncached;
-  const Recording* rec;
-  if (e2e) {
-    uncached = Record(ids, begin, end, step);
-    rec = &uncached;
-  } else {
-    auto key = Encode(Array{name, q.at("input_ids"), begin, end, step});
-    auto it = cache_.find(key);
-    reply["lazy_cache_hit"] = it != cache_.end();
-    if (it == cache_.end()) it = cache_.emplace(key, Record(ids, begin, end, step)).first;
-    rec = &it->second;
+  return {begin, end, step, warmup, iters, rounds, name, std::move(ids)};
+}
+const Recording& Replay::ResolveRecording(const Measurement& m, Object& reply,
+                                          Recording& uncached) {
+  if (m.e2e()) {
+    uncached = Record(m.ids, m.begin, m.end, m.step);
+    return uncached;
   }
-  reply["recording_ms"] = elapsed_ms(record_start);
-  const auto& r = *rec;
-  blocks_ = r.blocks;
-  auto spec = Spec(begin, end, r.ids.size(), r.position, e2e, e2e);
-  UploadHidden(r.hidden);
-  Upload(stream_, ids_, r.ids);
-  ForwardOptions options{.use_cuda_graph = q.get("use_cuda_graph", true),
-                         .use_speculative = q.get("use_speculative", true),
-                         .return_logits = e2e,
-                         .enable_profiling = cmd == "profile" || q.get("enable_profiling", false)};
-  auto load_start = Clock::now();
-  auto a = Load(q.at(cmd == "ab" ? "so_a" : "so_path").as<std::string>());
-  auto b = cmd == "ab" ? Load(q.at("so_b").as<std::string>()) : nullptr;
-  reply["module_load_ms"] = elapsed_ms(load_start);
-  auto run = [&](Module& module) {
-    Restore(r, begin);
-    return module.Run(spec, options);
-  };
-  for (unsigned i = 0; i < warmup; ++i) {
-    run(*a);
-    if (b) run(*b);
-  }
+  Array ids;
+  for (auto id : m.ids) ids.emplace_back(id);
+  auto key = Encode(Array{m.name, std::move(ids), m.begin, m.end, m.step});
+  auto it = cache_.find(key);
+  reply["lazy_cache_hit"] = it != cache_.end();
+  if (it == cache_.end()) it = cache_.emplace(key, Record(m.ids, m.begin, m.end, m.step)).first;
+  return it->second;
+}
+ForwardRunResult Replay::RunRestored(Module& module, const ForwardRunSpec& spec,
+                                     const ForwardOptions& opts, const Recording& r) {
+  Restore(r);
+  return module.Run(spec, opts);
+}
+ForwardRunResult Replay::RunSingle(Module& a, const ForwardRunSpec& spec,
+                                   const ForwardOptions& opts, const Recording& r, unsigned iters,
+                                   Object& reply) {
+  std::vector<double> times_a;
   ForwardRunResult last{};
-  options.profiler_range = q.get("profiler_range", false);
+  for (unsigned i = 0; i < iters; ++i) {
+    last = RunRestored(a, spec, opts, r);
+    times_a.push_back(last.elapsed_ms);
+  }
+  double median = Median(times_a), bw = last.logical_bytes / (1e6 * median);
+  reply["elapsed_ms"] =
+      Object{{"median", median},
+             {"min", *std::min_element(times_a.begin(), times_a.end())},
+             {"max", *std::max_element(times_a.begin(), times_a.end())},
+             {"mean", std::accumulate(times_a.begin(), times_a.end(), 0.) / times_a.size()}};
+  reply["logical_bytes"] = last.logical_bytes;
+  reply["effective_bw_gbs"] = bw;
+  reply["sol_pct"] = bw / 9.6;
+  reply["traffic_basis"] = "model.md 6.1 single-token logical weight budget, mean expert bitrate";
+  return last;
+}
+ForwardRunResult Replay::RunPair(Module& a, Module& b, const ForwardRunSpec& spec,
+                                 const ForwardOptions& opts, const Recording& r,
+                                 const Measurement& m, Object& reply) {
+  ForwardRunResult last{};
   Array pairs;
-  std::vector<double> times_a, round_a, round_b;
+  std::vector<double> round_a, round_b;
   std::vector<float> a_output, a_logits;
   int a_next = -1;
-  for (unsigned round = 0; round < rounds; ++round) {
+  for (unsigned round = 0; round < m.rounds; ++round) {
     std::vector<double> group_a, group_b;
-    for (unsigned i = 0; i < iters; ++i) {
-      last = run(*a);
-      times_a.push_back(last.elapsed_ms);
-      if (!b) continue;
+    for (unsigned i = 0; i < m.iters; ++i) {
+      last = RunRestored(a, spec, opts, r);
       group_a.push_back(last.elapsed_ms);
-      if (round + 1 == rounds && i + 1 == iters) {
+      if (round + 1 == m.rounds && i + 1 == m.iters) {
         a_output = ReadHidden(r.hidden.size());
-        if (e2e) a_logits = Read(logits_, vocab_);
+        if (m.e2e()) a_logits = Read(logits_, vocab_);
         a_next = last.next_token_id;
       }
-      last = run(*b);
+      last = RunRestored(b, spec, opts, r);
       group_b.push_back(last.elapsed_ms);
     }
-    if (b) {
-      round_a.push_back(Median(group_a));
-      round_b.push_back(Median(group_b));
-      pairs.emplace_back(Object{{"a_ms", round_a.back()}, {"b_ms", round_b.back()}});
-    }
+    round_a.push_back(Median(group_a));
+    round_b.push_back(Median(group_b));
+    pairs.emplace_back(Object{{"a_ms", round_a.back()}, {"b_ms", round_b.back()}});
   }
-  auto output = ReadHidden(r.hidden.size());
-  auto logits = e2e ? Read(logits_, vocab_) : std::vector<float>{};
-  if (b) {
-    double am = Median(round_a), bm = Median(round_b);
-    reply["rounds"] = std::move(pairs);
-    reply["a_median_ms"] = am;
-    reply["b_median_ms"] = bm;
-    reply["delta_ms"] = am - bm;
-    reply["speedup"] = am / bm;
-    reply["numerical_error"] = Diff(a_output, output);
-    if (e2e) {
-      reply["logits_error"] = Diff(a_logits, logits);
-      reply["next_token_match"] = a_next == last.next_token_id;
-    }
-  } else {
-    double median = Median(times_a), bw = last.logical_bytes / (1e6 * median);
-    reply["elapsed_ms"] =
-        Object{{"median", median},
-               {"min", *std::min_element(times_a.begin(), times_a.end())},
-               {"max", *std::max_element(times_a.begin(), times_a.end())},
-               {"mean", std::accumulate(times_a.begin(), times_a.end(), 0.) / times_a.size()}};
-    reply["logical_bytes"] = last.logical_bytes;
-    reply["effective_bw_gbs"] = bw;
-    reply["sol_pct"] = bw / 9.6;
-    reply["traffic_basis"] = "model.md 6.1 single-token logical weight budget, mean expert bitrate";
-    reply["numerical_error"] = Diff(r.reference, output);
-    if (e2e) {
-      reply["logits_error"] = Diff(r.logits, logits);
-      reply["next_token_id"] = last.next_token_id;
-      reply["next_token_match"] = last.next_token_id == r.next;
-    }
+  double am = Median(round_a), bm = Median(round_b);
+  reply["rounds"] = std::move(pairs);
+  reply["a_median_ms"] = am;
+  reply["b_median_ms"] = bm;
+  reply["delta_ms"] = am - bm;
+  reply["speedup"] = am / bm;
+  reply["numerical_error"] = Diff(a_output, ReadHidden(r.hidden.size()));
+  if (m.e2e()) {
+    reply["logits_error"] = Diff(a_logits, Read(logits_, vocab_));
+    reply["next_token_match"] = a_next == last.next_token_id;
   }
+  return last;
+}
+void Replay::FormatStages(const ForwardRunResult& last, Object& reply) {
   if (last.num_stages) {
     reply["profile_elapsed_ms"] = last.elapsed_ms;
     Array stages;
@@ -529,45 +482,86 @@ Object Replay::Measure(const Json& q, const std::string& cmd) {
     }
     reply["stages"] = std::move(stages);
   }
+}
+void Replay::Dump(const Json& q, const Measurement& m, const Recording& r,
+                  const std::vector<float>& output, Object& reply) {
+  Array shape{r.ids.size(), width_};
+  std::vector<DumpTensor> tensors{
+      {"input_ids", "I32", {r.ids.size()}, std::as_bytes(std::span(r.ids))},
+      {"hidden_in", "F32", shape, std::as_bytes(std::span(r.hidden))},
+      {"ref_hidden_out", "F32", shape, std::as_bytes(std::span(r.reference))},
+      {"cand_hidden_out", "F32", shape, std::as_bytes(std::span(output))}};
+  const std::array<uint32_t, 5> layout{m.begin, m.end, r.position, r.blocks,
+                                       kv_->view().max_full_seq_len};
+  if (q.get("with_state", false)) {
+    // Absolute byte offsets below use this full-KV capacity and the loader arena layout.
+    const char* names[] = {"begin_visit", "end_visit", "pos_offset", "num_block_in",
+                           "max_full_seq_len"};
+    for (size_t i = 0; i < layout.size(); ++i)
+      tensors.push_back({names[i], "U32", {}, std::as_bytes(std::span(layout).subspan(i, 1))});
+    tensors.push_back({"carry",
+                       "BF16",
+                       {int(model::kCarryPlanes), r.ids.size(), width_},
+                       std::as_bytes(std::span(r.carry))});
+    for (const auto& slice : r.state)
+      tensors.push_back({"state_offset_" + std::to_string(slice.offset),
+                         "U8",
+                         {slice.bytes.size()},
+                         slice.bytes});
+  }
+  auto dump = WriteDump(q.at("out").as<std::string>(), tensors);
+  reply.merge(dump);
+}
+Object Replay::Measure(const Json& q, const std::string& cmd) {
+  auto m = ParseMeasurement(q, cmd);
+  bool e2e = m.e2e();
+  Object reply;
+  using Clock = std::chrono::steady_clock;
+  auto elapsed_ms = [](Clock::time_point start) {
+    return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+  };
+  auto record_start = Clock::now();
+  Recording uncached;
+  const auto& r = ResolveRecording(m, reply, uncached);
+  reply["recording_ms"] = elapsed_ms(record_start);
+  auto spec = Spec(m.begin, m.end, r.ids.size(), r.position, e2e, e2e, r.blocks);
+  UploadHidden(r.hidden);
+  Upload(stream_, ids_, r.ids);
+  ForwardOptions options{.use_cuda_graph = q.get("use_cuda_graph", true),
+                         .use_speculative = q.get("use_speculative", true),
+                         .return_logits = e2e,
+                         .enable_profiling = cmd == "profile" || q.get("enable_profiling", false)};
+  auto load_start = Clock::now();
+  auto a = Load(q.at(cmd == "ab" ? "so_a" : "so_path").as<std::string>());
+  auto b = cmd == "ab" ? Load(q.at("so_b").as<std::string>(), true) : nullptr;
+  reply["module_load_ms"] = elapsed_ms(load_start);
+  for (unsigned i = 0; i < m.warmup; ++i) {
+    RunRestored(*a, spec, options, r);
+    if (b) RunRestored(*b, spec, options, r);
+  }
+  options.profiler_range = q.get("profiler_range", false);
+  auto last = b ? RunPair(*a, *b, spec, options, r, m, reply)
+                : RunSingle(*a, spec, options, r, m.iters, reply);
+  auto output = ReadHidden(r.hidden.size());
+  auto logits = e2e ? Read(logits_, vocab_) : std::vector<float>{};
+  if (!b) {
+    reply["numerical_error"] = Diff(r.reference, output);
+    if (e2e) {
+      reply["logits_error"] = Diff(r.logits, logits);
+      reply["next_token_id"] = last.next_token_id;
+      reply["next_token_match"] = last.next_token_id == r.next;
+    }
+  }
+  FormatStages(last, reply);
   a->ReportGraphStats(reply, b ? "graph_a" : "graph");
   if (b) b->ReportGraphStats(reply, "graph_b");
   auto unload_start = Clock::now();
   b.reset();
   a.reset();
   reply["module_unload_ms"] = elapsed_ms(unload_start);
-  Golden(reply, config_.golden_dir, name, ids, r, end, e2e, e2e ? logits : output, width_,
+  Golden(reply, config_.golden_dir, m.name, m.ids, r, m.end, e2e, e2e ? logits : output, width_,
          last.next_token_id);
-  if (cmd == "dump") {
-    Array shape{r.ids.size(), width_};
-    std::vector<DumpTensor> tensors{
-        {"input_ids", "I32", {r.ids.size()}, std::as_bytes(std::span(r.ids))},
-        {"hidden_in", "F32", shape, std::as_bytes(std::span(r.hidden))},
-        {"ref_hidden_out", "F32", shape, std::as_bytes(std::span(r.reference))},
-        {"cand_hidden_out", "F32", shape, std::as_bytes(std::span(output))}};
-    const std::array<uint32_t, 5> layout{begin, end, r.position, r.blocks,
-                                         kv_->view().max_full_seq_len};
-    if (q.get("with_state", false) && weights_) {
-      // Absolute byte offsets below use this full-KV capacity and the loader arena layout.
-      const char* names[] = {"begin_visit", "end_visit", "pos_offset", "num_block_in",
-                             "max_full_seq_len"};
-      for (size_t i = 0; i < layout.size(); ++i)
-        tensors.push_back({names[i], "U32", {}, std::as_bytes(std::span(layout).subspan(i, 1))});
-      tensors.push_back({"carry",
-                         "BF16",
-                         {int(FLINT_CARRY_PLANES), r.ids.size(), width_},
-                         std::as_bytes(std::span(r.carry))});
-      for (const auto& slice : r.state)
-        tensors.push_back({"state_offset_" + std::to_string(slice.offset),
-                           "U8",
-                           {slice.bytes.size()},
-                           slice.bytes});
-    } else if (q.get("with_state", false)) {
-      tensors.push_back({"kv_state", "F32", {end - begin}, std::as_bytes(std::span(r.kv))});
-      tensors.push_back({"conv_state", "F32", {end - begin}, std::as_bytes(std::span(r.conv))});
-    }
-    auto dump = WriteDump(q.at("out").as<std::string>(), tensors);
-    reply.merge(dump);
-  }
+  if (cmd == "dump") Dump(q, m, r, output, reply);
   return reply;
 }
 }  // namespace flint

@@ -1,4 +1,4 @@
-#include "op_params.h"
+#include "stub_ops.h"
 
 namespace {
 constexpr int kThreadsPerBlock = 256;

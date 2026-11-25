@@ -14,6 +14,7 @@
 #include <tuple>
 
 #include "common/json.h"
+#include "loader/model_constants.h"
 
 namespace flint {
 namespace {
@@ -146,38 +147,41 @@ ModelConfig LoadModelConfig(const std::filesystem::path& path) {
   Check(quant.at("quant_method").as<std::string>() == "exl3" &&
             quant.at("codebook").as<std::string>() == "mul1",
         "unsupported quantization");
+  const auto defaults = model::MakeDefaultInklingConfig();
   ModelConfig c{};
-  c.hidden_size = Expected(t, "hidden_size", 2304u);
-  c.num_hidden_layers = Expected(t, "num_hidden_layers", 24u);
-  c.vocab_size = Expected(t, "vocab_size", 201024u);
-  c.unpadded_vocab_size = Expected(t, "unpadded_vocab_size", 200058u);
-  c.num_attention_heads = Expected(t, "num_attention_heads", 24u);
-  c.num_key_value_heads = Expected(t, "num_key_value_heads", 8u);
-  c.head_dim = Expected(t, "head_dim", 128u);
-  c.sliding_window_size = Expected(t, "sliding_window_size", 1024u);
-  c.d_rel = Expected(t, "d_rel", 16u);
-  c.rel_extent = Expected(t, "rel_extent", 1024u);
-  c.log_scaling_n_floor = Expected(t, "log_scaling_n_floor", 8192u);
-  c.sconv_kernel_size = Expected(t, "sconv_kernel_size", 4u);
-  c.n_layers_per_attn_res_block = Expected(t, "n_layers_per_attn_res_block", 6u);
-  c.n_routed_experts = Expected(t, "n_routed_experts", 128u);
-  c.num_experts_per_tok = Expected(t, "num_experts_per_tok", 8u);
-  c.intermediate_size = Expected(t, "intermediate_size", 1152u);
-  c.log_scaling_alpha = Expected(t, "log_scaling_alpha", 0.1f);
-  c.rms_norm_eps = Expected(t, "rms_norm_eps", 1e-6f);
-  c.qk_l2_clip_threshold = Expected(t, "qk_l2_clip_threshold", 22.627416997969522f);
-  c.rel_l2_clip_threshold = Expected(t, "rel_l2_clip_threshold", 8.f);
-  c.route_scale = Expected(t, "route_scale", 8.f);
-  c.mlp_gate_softcap = Expected(t, "mlp_gate_softcap", 4.f);
-  c.mlp_up_softcap = Expected(t, "mlp_up_softcap", 25.f);
-  c.final_logit_softcapping = Expected(t, "final_logit_softcapping", 30.f);
-  c.loop_core_start = Expected(loop, "core_start", 6u);
-  c.loop_core_end = Expected(loop, "core_end", 18u);
-  c.loop_num_passes = Expected(loop, "num_passes", 3u);
-  c.loop_gate_rank = Expected(loop, "gate_rank", 64u);
-  c.eos_token_id = Expected(root, "eos_token_id", 200006u);
+  c.hidden_size = Expected(t, "hidden_size", defaults.hidden_size);
+  c.num_hidden_layers = Expected(t, "num_hidden_layers", defaults.num_hidden_layers);
+  c.vocab_size = Expected(t, "vocab_size", defaults.vocab_size);
+  c.unpadded_vocab_size = Expected(t, "unpadded_vocab_size", defaults.unpadded_vocab_size);
+  c.num_attention_heads = Expected(t, "num_attention_heads", defaults.num_attention_heads);
+  c.num_key_value_heads = Expected(t, "num_key_value_heads", defaults.num_key_value_heads);
+  c.head_dim = Expected(t, "head_dim", defaults.head_dim);
+  c.sliding_window_size = Expected(t, "sliding_window_size", defaults.sliding_window_size);
+  c.d_rel = Expected(t, "d_rel", defaults.d_rel);
+  c.rel_extent = Expected(t, "rel_extent", defaults.rel_extent);
+  c.log_scaling_n_floor = Expected(t, "log_scaling_n_floor", defaults.log_scaling_n_floor);
+  c.sconv_kernel_size = Expected(t, "sconv_kernel_size", defaults.sconv_kernel_size);
+  c.n_layers_per_attn_res_block =
+      Expected(t, "n_layers_per_attn_res_block", defaults.n_layers_per_attn_res_block);
+  c.n_routed_experts = Expected(t, "n_routed_experts", defaults.n_routed_experts);
+  c.num_experts_per_tok = Expected(t, "num_experts_per_tok", defaults.num_experts_per_tok);
+  c.intermediate_size = Expected(t, "intermediate_size", defaults.intermediate_size);
+  c.log_scaling_alpha = Expected(t, "log_scaling_alpha", defaults.log_scaling_alpha);
+  c.rms_norm_eps = Expected(t, "rms_norm_eps", defaults.rms_norm_eps);
+  c.qk_l2_clip_threshold = Expected(t, "qk_l2_clip_threshold", defaults.qk_l2_clip_threshold);
+  c.rel_l2_clip_threshold = Expected(t, "rel_l2_clip_threshold", defaults.rel_l2_clip_threshold);
+  c.route_scale = Expected(t, "route_scale", defaults.route_scale);
+  c.mlp_gate_softcap = Expected(t, "mlp_gate_softcap", defaults.mlp_gate_softcap);
+  c.mlp_up_softcap = Expected(t, "mlp_up_softcap", defaults.mlp_up_softcap);
+  c.final_logit_softcapping =
+      Expected(t, "final_logit_softcapping", defaults.final_logit_softcapping);
+  c.loop_core_start = Expected(loop, "core_start", defaults.loop_core_start);
+  c.loop_core_end = Expected(loop, "core_end", defaults.loop_core_end);
+  c.loop_num_passes = Expected(loop, "num_passes", defaults.loop_num_passes);
+  c.loop_gate_rank = Expected(loop, "gate_rank", defaults.loop_gate_rank);
+  c.eos_token_id = Expected(root, "eos_token_id", defaults.eos_token_id);
   // The locked checkpoint omits pad_token_id; its tokenizer uses <|endoftext|>.
-  c.pad_token_id = 199999;
+  c.pad_token_id = defaults.pad_token_id;
   for (const Json* obj : {&root, &t})
     if (obj->as<Json::Object>().contains("pad_token_id"))
       Expected(*obj, "pad_token_id", c.pad_token_id);
@@ -196,7 +200,7 @@ ModelConfig LoadModelConfig(const std::filesystem::path& path) {
     c.is_full_layer[i] = 0;
   }
   for (unsigned i = 0; i < c.num_hidden_layers; ++i)
-    Check(c.is_full_layer[i] == (i % 6 == 5), "unsupported local layer schedule");
+    Check(c.is_full_layer[i] == defaults.is_full_layer[i], "unsupported local layer schedule");
   return c;
 }
 }  // namespace flint

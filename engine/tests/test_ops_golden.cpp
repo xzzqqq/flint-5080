@@ -17,6 +17,11 @@
 
 #include "loader/arenas.h"
 #include "loader/safetensors.h"
+#include "model/visit_plan.h"
+#include "ops/attention_ops.h"
+#include "ops/moe_ops.h"
+#include "ops/norm_ops.h"
+#include "ops/sconv_ops.h"
 #include "ops/submodules.h"
 
 namespace {
@@ -263,7 +268,7 @@ void Golden(const char* dir, const char* file, const Gemm& g) {
     std::string p = layer == 6 ? "message_residual.layer_6_pass_1."
                                : "block_residual.layer_" + std::to_string(layer) + ".";
     int queries = layer == 1 ? 1 : layer == 5 ? 3 : 4;
-    Buffer<float> out(t * queries * 2304), stats(t * queries * 4), merged(4 * 2304);
+    Buffer<float> out(t * queries * 2304), merged(4 * 2304);
     const float* q = m.layers[layer].attn_query;
     if (layer == 6) {
       Check(flint_merge_cross_pass_queries(
@@ -273,9 +278,9 @@ void Golden(const char* dir, const char* file, const Gemm& g) {
     std::vector<float> qhost(queries * 2304);
     Check(cudaMemcpy(qhost.data(), q, qhost.size() * 4, cudaMemcpyDeviceToHost));
     Require(qhost == f.host<float>(p + "query"), p + "query order");
-    Check(flint_block_attn_residual({f.data(p + "block"), f.data(p + "partial"), q, out.get(),
-                                     stats.get(), 1, t, 2304, queries, FLINT_BF16, FLINT_BF16},
-                                    nullptr));
+    RunBlockResidual(g, ws.view(),
+                     {f.data(p + "block"), f.data(p + "partial"), q, out.get(), 1, t, 2304, queries,
+                      FLINT_BF16, FLINT_BF16});
     Compare(p + "y", out.read(), f.host<float>(p + "y"), 1e-5, 1.2e-7);
   }
   int j = 0;
@@ -539,16 +544,17 @@ void SyntheticMoe() {
     Require(result[c] == B(sum), "MoE accumulation");
   }
 }
-void SyntheticLoop() {
+void SyntheticLoop(const Gemm& g) {
+  auto ws = ScratchArena::Allocate(4096);
   const std::vector<float> block{1, 2, 5, -3}, partial{3, 4};
   Buffer<float> blocks(block), last(partial);
   for (int qs : {1, 3, 4}) {
     std::vector<float> query(2 * qs);
     std::iota(query.begin(), query.end(), -2.f);
-    Buffer<float> q(query), stats(qs * 3 * 2), out(qs * 2);
-    Check(flint_block_attn_residual({blocks.get(), last.get(), q.get(), out.get(), stats.get(), 2,
-                                     1, 2, qs, FLINT_F32, FLINT_F32},
-                                    nullptr));
+    Buffer<float> q(query), out(qs * 2);
+    RunBlockResidual(
+        g, ws.view(),
+        {blocks.get(), last.get(), q.get(), out.get(), 2, 1, 2, qs, FLINT_F32, FLINT_F32});
     auto got = out.read();
     for (int j = 0; j < qs; ++j) {
       float den = 0, sum[2]{};
@@ -647,7 +653,7 @@ void Synthetic(const Gemm& g) {
   SyntheticConv();
   SyntheticAttention();
   SyntheticMoe();
-  SyntheticLoop();
+  SyntheticLoop(g);
   Buffer<float> x(std::vector<float>{1, 2, 3, 3, 100}), logits(4);
   Buffer<int> id(1);
   Check(flint_logit_softcap_argmax({x.get(), logits.get(), id.get(), 1, 4, 5, FLINT_F32}, nullptr));

@@ -4,13 +4,15 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
 #include <cstring>
 #include <iostream>
 #include <thread>
 
-#include "forge/json_output.h"
+#include "common/json_output.h"
 #include "loader/safetensors.h"
+#include "model/visit_plan.h"
 
 namespace {
 using namespace flint;
@@ -95,6 +97,21 @@ void Test(const char* host, const char* forward) {
       e2e.at("next_token_match").as<bool>() && e2e.at("logits_error").at("exact_match").as<bool>(),
       "e2e logits");
   Require(e2e.at("logical_bytes").number<size_t>() == 3407910336ull, "logical roofline budget");
+  auto probe = q;
+  probe["command"] = "dump";
+  probe["input_ids"] = Array{0};
+  probe["out"] = (f.root / "stub_probe.safetensors").string();
+  f.Call(probe);
+  auto probe_file = SafetensorsFile::Open(f.root / "stub_probe.safetensors");
+  float actual;
+  auto values = probe_file.Bytes(*probe_file.Find("cand_hidden_out"));
+  std::memcpy(&actual, values.data(), sizeof(actual));
+  float expected = 0;
+  for (unsigned v = 0; v < model::kNumLogicalVisits; ++v) {
+    auto bits = std::bit_cast<uint32_t>(expected + (v + 1) / 1024.f);
+    expected = std::bit_cast<float>((bits + 0x7fff + ((bits >> 16) & 1)) & 0xffff0000u);
+  }
+  Require(actual == expected, "stub BF16 hidden");
   q["end_visit"] = 4;
   Require(!f.Call(q).at("lazy_cache_hit").as<bool>(), "first partial hit");
   q["use_cuda_graph"] = false;
@@ -124,14 +141,20 @@ void Test(const char* host, const char* forward) {
   q["out"] = path.string();
   f.Call(q);
   auto file = SafetensorsFile::Open(path);
-  for (auto name :
-       {"input_ids", "hidden_in", "ref_hidden_out", "cand_hidden_out", "kv_state", "conv_state"})
+  for (auto name : {"input_ids", "hidden_in", "ref_hidden_out", "cand_hidden_out", "begin_visit",
+                    "end_visit", "pos_offset", "num_block_in", "max_full_seq_len", "carry"})
     Require(file.Find(name) != nullptr, "missing tensor");
   auto ref = file.Bytes(*file.Find("ref_hidden_out")),
        cand = file.Bytes(*file.Find("cand_hidden_out"));
   Require(ref.size() == 2304 * sizeof(float) && !std::memcmp(ref.data(), cand.data(), ref.size()),
           "dump mismatch");
-  auto kv = file.Bytes(*file.Find("kv_state"));
+  auto config = model::MakeDefaultInklingConfig();
+  auto plan = BuildVisitPlan(config);
+  size_t offset = size_t(plan[2].kv_slot_idx) * 2 * config.sliding_window_size * model::kKvDim *
+                  sizeof(uint16_t);
+  auto* slice = file.Find("state_offset_" + std::to_string(offset));
+  Require(slice && slice->dtype == TensorDType::kU8, "missing visit K slice");
+  auto kv = file.Bytes(*slice);
   Require(std::any_of(kv.begin(), kv.end(), [](auto v) { return v != std::byte{}; }),
           "empty decode state");
   Require(fs::is_empty(f.root / "loaded"), "leftover DSO");

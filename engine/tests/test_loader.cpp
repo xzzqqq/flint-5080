@@ -14,6 +14,7 @@
 
 #include "loader/arenas.h"
 #include "loader/safetensors.h"
+#include "model/visit_plan.h"
 
 namespace {
 using namespace flint;

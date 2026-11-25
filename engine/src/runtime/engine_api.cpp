@@ -7,15 +7,14 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
-#include <iomanip>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <new>
 #include <span>
-#include <sstream>
 
-#include "ops/op_params.h"
+#include "common/json_output.h"
+#include "ops/stub_ops.h"
 
 struct EngineHandle {
   EngineHandle() = default;
@@ -258,14 +257,15 @@ char* engine_stats_json(EngineHandle* engine) {
     return nullptr;
   }
   try {
-    std::ostringstream json;
-    json << "{\"abi_version\":" << FLINT_ENGINE_ABI_VERSION
-         << ",\"gpu_name\":" << std::quoted(engine->gpu.name)
-         << ",\"sm_major\":" << engine->gpu.major << ",\"sm_minor\":" << engine->gpu.minor
-         << ",\"vram_total_bytes\":" << total_bytes << ",\"vram_free_bytes\":" << available_bytes
-         << ",\"submitted_requests\":" << engine->submitted.load()
-         << ",\"cancelled_requests\":" << engine->cancellations.load() << "}";
-    return CopyString(json.str().c_str());
+    auto json = flint::Encode(flint::Object{{"abi_version", FLINT_ENGINE_ABI_VERSION},
+                                            {"gpu_name", engine->gpu.name},
+                                            {"sm_major", engine->gpu.major},
+                                            {"sm_minor", engine->gpu.minor},
+                                            {"vram_total_bytes", total_bytes},
+                                            {"vram_free_bytes", available_bytes},
+                                            {"submitted_requests", engine->submitted.load()},
+                                            {"cancelled_requests", engine->cancellations.load()}});
+    return CopyString(json.c_str());
   } catch (const std::bad_alloc&) {
     return nullptr;
   }

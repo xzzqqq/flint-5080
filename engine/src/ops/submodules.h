@@ -1,6 +1,8 @@
 #pragma once
 #include "loader/model_views.h"
+#include "ops/exl3_ops.h"
 #include "ops/gemm_cublas.h"
+#include "ops/loop_res_ops.h"
 namespace flint {
 void RunExl3Linear(const Gemm&, ScratchArenaView, const Exl3MatrixView&, const void* x, void* y,
                    int rows, FlintType input = FLINT_BF16, FlintType output = FLINT_BF16);
