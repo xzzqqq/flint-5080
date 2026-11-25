@@ -6,7 +6,7 @@ import shlex
 import shutil
 import subprocess
 from dataclasses import asdict, replace
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from tools.common.config import ConfigError, load_config
 from tools.common.gpu_lock import GpuLeaseManager, GpuLockError
@@ -300,31 +300,80 @@ def _check_local(cfg, checks):
     checks["hygiene"] = {"status": "failed" if errors else "passed", "errors": errors}
 
 
+def _gpu_check_commands(model_dir, golden_dir):
+    def require(flag, path, message):
+        test = shlex.join(["test", flag, str(path)])
+        return f"{test} || {{ echo {shlex.quote(message)} >&2; exit 1; }}"
+
+    def build(flag, path):
+        return require(flag, path, f"Missing {path}. Run dev build first.")
+
+    def golden(flag, path):
+        return require(flag, path, f"Missing {path}. Run weights golden first.")
+
+    model = require(
+        "-d", model_dir, f"Missing model directory {model_dir}. Check model.weights_dir."
+    )
+    ops_file = golden_dir / "ops_golden.safetensors"
+    ops = "engine/build/ops_tests"
+    e2e = "engine/build/e2e_tests"
+    forward = "engine/build/forward.so"
+    return {
+        "ctest": [
+            build("-f", "engine/build/CTestTestfile.cmake"),
+            "ctest --test-dir engine/build --output-on-failure --no-tests=error",
+        ],
+        "ops-golden": [
+            build("-x", ops),
+            model,
+            golden("-f", ops_file),
+            shlex.join([ops, "--model-dir", str(model_dir), "--golden-file", str(ops_file)]),
+        ],
+        "e2e-golden": [
+            build("-x", e2e),
+            build("-f", forward),
+            model,
+            golden("-d", golden_dir),
+            *(
+                golden("-f", golden_dir / f"e2e_short_{case}.safetensors")
+                for case in ("math", "sky", "code")
+            ),
+            shlex.join(
+                [
+                    e2e,
+                    "--forward",
+                    forward,
+                    "--model-dir",
+                    str(model_dir),
+                    "--golden-dir",
+                    str(golden_dir),
+                ]
+            ),
+        ],
+        "forge-host": [build("-x", "engine/build/forge-host"), "engine/build/forge-host --smoke"],
+        "server": [
+            'server="server/target/${CARGO_BUILD_TARGET:+$CARGO_BUILD_TARGET/}release/server"',
+            'test -x "$server" || { echo "Missing $server. Run dev build first." >&2; exit 1; }',
+            '"$server" --smoke',
+        ],
+    }
+
+
 def check(cfg, args, result):
     result.data["mode"] = "local" if args.local else "gpu"
     checks = result.data["checks"] = {}
     if args.local:
         _check_local(cfg, checks)
     else:
+        if not cfg.model.weights_dir:
+            raise ValueError("Set model.weights_dir in .dev.toml for GPU acceptance checks")
+        model_dir = PurePosixPath(cfg.shared.models_dir) / cfg.model.weights_dir
+        golden_dir = PurePosixPath(cfg.weights.golden_dir or ".forge/golden") / model_dir.name
         executor = Executor(cfg)
         executor.sync()
-        server_bin = "server/target/${CARGO_BUILD_TARGET:+$CARGO_BUILD_TARGET/}release/server"
         with GpuLeaseManager(cfg, executor).hold("dev-check"):
-            for name, path, test, run in (
-                (
-                    "ctest",
-                    "engine/build/CTestTestfile.cmake",
-                    "-f",
-                    "ctest --test-dir engine/build --output-on-failure --no-tests=error",
-                ),
-                ("forge-host", "engine/build/forge-host", "-x", "engine/build/forge-host --smoke"),
-                ("server", server_bin, "-x", f'"{server_bin}" --smoke'),
-            ):
-                command = (
-                    f'if test {test} "{path}"; then {run}; else '
-                    f'echo "Missing {path}. Run dev build first." >&2; exit 1; fi'
-                )
-                _check_step(executor, checks, name, command)
+            for name, lines in _gpu_check_commands(model_dir, golden_dir).items():
+                _check_step(executor, checks, name, "\n".join(lines))
     failed = [name for name, detail in checks.items() if detail["status"] == "failed"]
     if failed:
         result.ok, result.error = False, "Failed checks: " + ", ".join(failed)

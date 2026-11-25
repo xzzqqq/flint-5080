@@ -169,11 +169,13 @@ char* engine_stats_json(EngineHandle* h); // 返回 JSON 快照供 /ready 与 P1
 | 原语 | 职责 | 典型用法 |
 |---|---|---|
 | **`start` / `stop` / `status`** | 拉起/关闭/查询 `forge-host` 常驻宿主并占/释 5080 lease 锁（自动冻结 `baseline.so`，检测到 `nsys` 时预武装 profiler-API 采集） | `forge start` / `forge status` / `forge stop` |
-| **`run`** | 自动增量编并热加载 `forward.so`，输出耗时、5080 SOL 占比与数值误差（支持 `--save <name>` 保存不可变 `.so` 候选） | `forge run --layers 0..4`<br>`forge run --e2e [--full] [--no-graph] [--no-spec]`<br>`forge run --e2e --save fast-v1` |
+| **`run`** | 自动增量编并热加载 `forward.so`，输出耗时、5080 SOL 占比与数值误差（`--save <name>` 测量所选候选的快照，成功后保存同一份 `.so`） | `forge run --layers 0..4`<br>`forge run --e2e [--full] [--no-graph] [--no-spec]`<br>`forge run --e2e --save fast-v1` |
 | **`ab`** | 同常驻会话内交替加载两个候选 `.so` 做 A-B-A-B 交错测量，消除热机与频率漂移 | `forge ab baseline current --layers 0..4`<br>`forge ab fast-v1 fast-v2 --e2e --full` |
 | **`profile`** | 默认零重启开启轻量 CUDA Event 阶段标尺，输出分阶段耗时与 960 GB/s Roofline 占比；加 `--nsys` 采集 Nsight Systems timeline | `forge profile --layers 0..1`<br>`forge profile --e2e --nsys` |
 | **`dump`** | 指定输入请求（`--case` / `--prompt`）按需导出真实输入、参考/候选输出及可选状态为 `.safetensors`，供 Python 排错或独立 `ncu` 单算子微调 | `forge dump --case short_bug`<br>`forge dump --case long_64k --layers 17..18 --step 5 --with-state` |
 | **`ls` / `rm`** | 列出或清理保存在远程 `.forge/candidates/` 下的候选 `.so` | `forge ls` / `forge rm fast-v1` |
+
+`run` 和 `ab` 在计时结束后通过 `state_error` 报告活跃块数、carry、KV 和卷积状态的写回差异。`run` 与录制的基准比较，`ab` 比较两个候选。端到端回放优先对照完整 logits，缺少时按夹具保存的 top-64 ID 比较 logits，并独立核对下一 token。
 
 ---
 
@@ -192,7 +194,7 @@ char* engine_stats_json(EngineHandle* h); // 返回 JSON 快照供 /ready 与 P1
 
 | 命令 | 依赖边界 | 职责 |
 |---|---|---|
-| **`dev`** | 纯 stdlib | 工程骨架与服务运维：`status`（5080 占用/温度/显存/同步状态）、`build`（`--engine`/`--server`/`--all`）、`serve`（`start`/`stop`/`logs`）、`check`（`--local` Mac 秒级单测 + `--gpu` 远程验收）、`ssh`（逃生舱）。 |
+| **`dev`** | 纯 stdlib | 工程骨架与服务运维：`status`（5080 占用/温度/显存/同步状态）、`build`（`--engine`/`--server`/`--all`）、`serve`（`start`/`stop`/`logs`）、`check`（`--local` 本地检查；`--gpu` 持锁运行 CTest、真实权重的算子和端到端 golden 检查，以及 forge-host 和 server 的 smoke 检查）、`ssh`（逃生舱）。 |
 | **`forge`** | 纯 stdlib | 驱动远端/本机 `forge-host` 的全部调优原语（`start/stop/status/run/ab/profile/dump/ls/rm`）。 |
 | **`bench`** | 轻量异步 HTTP & 统计 | 纯黑盒 HTTP 压测器（支持 `--url` 测自研或任意 OpenAI 兼容竞品）：固定 coding-agent trace、TTFT、Canary 回归、paired geometric mean + bootstrap CI 报表。以服务端计时为主、客户端校准为辅。 |
 | **`weights`** | 纯 stdlib 前端；离线生成子进程通过 `weights.python` 指向独立 PyTorch 环境 | 低频离线权重与参考对齐：`inspect`、`repack`（输出 `safetensors`）、`golden`（持单卡 lease 生成算子与 48 逻辑步 prefill/decode 黄金夹具，详见 [model.md](model.md)）、`kld`（调用常驻引擎做 teacher-forcing KLD 评测）。 |

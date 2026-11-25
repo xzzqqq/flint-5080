@@ -203,14 +203,10 @@ def candidates():
 def run_and_save(q, name):
     dst = STATE / "candidates" / (name + ".so")
     with tempfile.NamedTemporaryFile(dir=dst.parent, suffix=".tmp") as tmp:
-        current = q.pop("current_path", "engine/build/forward.so")
-        with Path(current).open("rb") as src:
+        with Path(q["so_path"]).open("rb") as src:
             shutil.copyfileobj(src, tmp)
         tmp.flush()
-        if q["so_path"] == current:
-            q = dict(q, so_path=tmp.name)
-        data = ipc(q)
-        # Publish the current snapshot even if another build has since finished.
+        data = ipc(dict(q, so_path=tmp.name))
         os.link(tmp.name, dst)
     return dict(data, saved=name)
 

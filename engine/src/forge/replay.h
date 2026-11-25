@@ -11,7 +11,15 @@ struct StateSlice {
   size_t offset;
   std::vector<std::byte> bytes;
 };
+struct PostState {
+  unsigned blocks{};
+  std::vector<uint16_t> carry;
+  std::vector<StateSlice> state;
+};
+Object CompareState(const PostState& reference, const PostState& actual);
+
 struct Recording {
+  PostState post;
   std::vector<StateSlice> state;
   std::vector<uint16_t> carry;
   unsigned blocks{};
@@ -54,6 +62,7 @@ class Replay {
                       bool head, unsigned blocks = 0);
   std::vector<float> ReadHidden(size_t count) const;
   void UploadHidden(const std::vector<float>& data);
+  PostState ReadPostState(const Recording& recording, unsigned blocks) const;
   void Restore(const Recording& recording);
   DaemonConfig config_;
   std::optional<WeightsArena> weights_;

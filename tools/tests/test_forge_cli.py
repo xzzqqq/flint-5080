@@ -118,7 +118,8 @@ class ForgeCLI(unittest.TestCase):
             commands.execute(self.cfg, self.parser.parse_args(["run", "--save", "trial"]), result)
             self.assertEqual(build.call_args.args[-1], ["stub_forward"])
             payload = call.call_args.args[-1]
-            self.assertEqual((payload["so_path"], payload["current_path"]), (stub, stub))
+            self.assertEqual(payload["so_path"], stub)
+            self.assertNotIn("current_path", payload)
 
     def test_candidate_lifecycle(self):
         with chdir(self.cfg.repo_root):
@@ -143,6 +144,24 @@ class ForgeCLI(unittest.TestCase):
             self.assertEqual(host.dispatch("ls", {})["candidates"], ["baseline", "trial"])
             host.dispatch("rm", {"name": "trial"})
             self.assertEqual(host.candidates(), ["baseline"])
+
+    def test_save_named_candidate_measures_snapshot(self):
+        with chdir(self.cfg.repo_root):
+            baseline = Path(".forge/candidates/baseline.so")
+            baseline.parent.mkdir(parents=True)
+            baseline.write_bytes(b"baseline")
+            current = Path(commands.CURRENT)
+            current.parent.mkdir(parents=True)
+            current.write_bytes(b"current")
+
+            def measure(q):
+                baseline.write_bytes(b"replacement")
+                self.assertEqual(Path(q["so_path"]).read_bytes(), b"baseline")
+                return {}
+
+            with patch.object(host, "ipc", measure):
+                host.dispatch("run", {"save": "trial", "so_path": str(baseline)})
+            self.assertEqual((baseline.parent / "trial.so").read_bytes(), b"baseline")
 
     def test_lease_handoff_and_release(self):
         lock = self.cfg.shared.lock_file

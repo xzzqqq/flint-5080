@@ -152,8 +152,6 @@ def execute(cfg, args, result):
             )
         if cmd == "run":
             q.update(save=args.save)
-            if args.save:
-                q["current_path"] = current
         elif cmd == "profile":
             q.update(nsys=args.nsys)
         elif cmd == "dump":

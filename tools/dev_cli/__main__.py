@@ -37,7 +37,10 @@ def build_parser() -> argparse.ArgumentParser:
     build.add_argument(
         "--no-sync", action="store_true", help="Use sources already on the build host."
     )
-    check = sub("check", "Run local tests or the GPU smoke checks.")
+    check = sub(
+        "check",
+        "Run local tests or the GPU acceptance checks with model weights and golden fixtures.",
+    )
     modes = check.add_mutually_exclusive_group(required=True)
     modes.add_argument("--local", action="store_true")
     modes.add_argument("--gpu", action="store_true")

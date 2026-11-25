@@ -8,9 +8,12 @@
 #include <chrono>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <thread>
 
 #include "common/json_output.h"
+#include "forge/replay.h"
+#include "forge/safetensors_writer.h"
 #include "loader/safetensors.h"
 #include "model/visit_plan.h"
 
@@ -43,7 +46,7 @@ struct Fixture {
     Require(pid >= 0, "fork");
     if (!pid) {
       execl(host, host, "--daemon", "--socket", socket.c_str(), "--state-dir", root.c_str(),
-            "--baseline", forward, "--no-model", nullptr);
+            "--baseline", forward, "--no-model", "--golden-dir", root.c_str(), nullptr);
       _exit(127);
     }
   }
@@ -81,6 +84,68 @@ struct Fixture {
   }
 };
 
+void TestStateError() {
+  PostState ref{2, {0x3f80}, {}};
+  for (size_t size : {2, 2, 4, 4}) ref.state.push_back({0, std::vector<std::byte>(size)});
+  auto changed = ref;
+  changed.blocks = 1;
+  changed.carry[0] = 0x4000;  // BF16 1 -> 2
+  uint16_t v = 0x4040;        // BF16 0 -> 3
+  std::memcpy(changed.state[1].bytes.data(), &v, sizeof(v));
+  float conv = -4.5f;
+  std::memcpy(changed.state[3].bytes.data(), &conv, sizeof(conv));
+  auto error = CompareState(ref, changed);
+  Require(!error.at("exact_match").as<bool>() && !error.at("blocks_match").as<bool>(),
+          "block count");
+  for (auto [key, expected] : {std::pair{"carry", 1.0}, {"kv", 3.0}, {"conv", 4.5}}) {
+    const auto& group = error.at(key);
+    Require(!group.at("exact_match").as<bool>() &&
+                group.at("max_abs_err").as<double>() == expected &&
+                group.at("nonfinite").as<uint64_t>() == 0,
+            "state writeback delta");
+  }
+  changed = ref;
+  conv = std::numeric_limits<float>::quiet_NaN();
+  std::memcpy(changed.state[2].bytes.data(), &conv, sizeof(conv));
+  error = CompareState(ref, changed);
+  Require(!error.at("exact_match").as<bool>() && error.at("blocks_match").as<bool>() &&
+              error.at("conv").at("nonfinite").as<uint64_t>() == 1,
+          "nonfinite conv writeback");
+}
+
+void TestDecodeGolden(Fixture& f, Object q, int first_token) {
+  q["step"] = 1;
+  int second_token = f.Call(q).at("next_token_id").number<int>();
+  q["step"] = 2;
+  int next_token = f.Call(q).at("next_token_id").number<int>();
+  std::array<int, 3> prompt{1, 42, 123}, generated{first_token, second_token, next_token};
+  std::array<int, 64> ids;
+  std::array<float, 64> logits;
+  for (int i = 0; i < 64; ++i) {
+    // The stub head scores tokens by distance from its greedy token.
+    ids[i] = next_token + (i % 2 ? -(i + 1) / 2 : i / 2);
+    logits[i] = -std::abs(ids[i] - next_token) / 1024.f;
+  }
+  q["case"] = "stub";
+  auto path = f.root / "e2e_stub.safetensors";
+  std::vector<DumpTensor> tensors{
+      {"input_ids", "I32", {3}, std::as_bytes(std::span(prompt))},
+      {"generated_ids", "I32", {3}, std::as_bytes(std::span(generated))}};
+  WriteDump(path, tensors);
+  auto token = f.Call(q).at("golden");
+  Require(!token.as<Object>().contains("tensor") && token.at("next_token_match").as<bool>(),
+          "standalone golden token");
+  tensors.push_back({"decode_1.top64_ids", "I32", {64}, std::as_bytes(std::span(ids))});
+  tensors.push_back({"decode_1.top64_logits", "F32", {64}, std::as_bytes(std::span(logits))});
+  WriteDump(path, tensors);
+  auto golden = f.Call(q).at("golden");
+  Require(golden.at("tensor").as<std::string>() == "decode_1.top64_logits" &&
+              golden.at("exact_match").as<bool>() && golden.at("top_k").number<int>() == 64 &&
+              golden.at("expected_next_token_id").number<int>() == next_token &&
+              golden.at("next_token_match").as<bool>(),
+          "decode top64 golden");
+}
+
 void Test(const char* host, const char* forward) {
   Fixture f;
   f.Launch(host, forward);
@@ -97,6 +162,8 @@ void Test(const char* host, const char* forward) {
       e2e.at("next_token_match").as<bool>() && e2e.at("logits_error").at("exact_match").as<bool>(),
       "e2e logits");
   Require(e2e.at("logical_bytes").number<size_t>() == 3407910336ull, "logical roofline budget");
+  Require(e2e.at("state_error").at("exact_match").as<bool>(), "e2e writeback");
+  TestDecodeGolden(f, q, e2e.at("next_token_id").number<int>());
   auto probe = q;
   probe["command"] = "dump";
   probe["input_ids"] = Array{0};
@@ -122,6 +189,7 @@ void Test(const char* host, const char* forward) {
   q["rounds"] = 3;
   auto ab = f.Call(q);
   Require(ab.at("speedup").number<double>() > 0, "speedup");
+  Require(ab.at("state_error").at("exact_match").as<bool>(), "A/B writeback");
   const auto& pairs = ab.at("rounds").as<Array>();
   Require(pairs.size() == 3, "round count");
   for (auto& p : pairs)
@@ -168,6 +236,7 @@ void Test(const char* host, const char* forward) {
 int main(int argc, char** argv) {
   try {
     Require(argc == 3, "expected host and forward paths");
+    TestStateError();
     Test(argv[1], argv[2]);
     return 0;
   } catch (const std::exception& e) {

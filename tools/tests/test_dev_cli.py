@@ -234,12 +234,65 @@ def test_local_bad_hygiene(repo, entry, executor, capsys):
     assert "bin/bench" in errors[0] and ".dev.toml.example" in errors[1]
 
 
+def test_gpu_missing_weights_config(cfg, entry, capsys, monkeypatch):
+    cfg.model.weights_dir = ""
+    monkeypatch.setattr(commands, "GpuLeaseManager", lambda *_: pytest.fail("lease requested"))
+    assert entry(["check", "--gpu", "--json"]) == 1
+    assert "Set model.weights_dir" in json.loads(capsys.readouterr().out)["error"]
+
+
 def test_gpu_missing_builds_and_cleanup(cfg, entry, capsys):
+    cfg.model.weights_dir = "tiny"
     assert entry(["check", "--gpu", "--json"]) == 1
     checks = json.loads(capsys.readouterr().out)["data"]["checks"]
-    assert set(checks) == {"ctest", "server", "forge-host"}
+    assert set(checks) == {"ctest", "ops-golden", "e2e-golden", "server", "forge-host"}
     assert all("dev build" in check["error"] for check in checks.values())
     assert not Path(cfg.shared.lock_file).exists()
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "forward.so",
+        "model",
+        "golden",
+        "ops_golden.safetensors",
+        "e2e_short_math.safetensors",
+        "e2e_short_sky.safetensors",
+        "e2e_short_code.safetensors",
+    ],
+)
+def test_gpu_missing_golden_prerequisite(cfg, entry, capsys, missing):
+    cfg.shared.models_dir = str(cfg.repo_root / "models")
+    cfg.model.weights_dir = "tiny"
+    build = cfg.repo_root / "engine/build"
+    build.mkdir(parents=True)
+    for name in ("ops_tests", "e2e_tests"):
+        (build / name).write_text("#!/bin/sh\nexit 0\n")
+        (build / name).chmod(0o755)
+    if missing != "forward.so":
+        (build / "forward.so").touch()
+    if missing != "model":
+        (Path(cfg.shared.models_dir) / "tiny").mkdir(parents=True)
+    golden = cfg.repo_root / ".forge/golden/tiny"
+    if missing != "golden":
+        golden.mkdir(parents=True)
+        for name in ("ops_golden", "e2e_short_math", "e2e_short_sky", "e2e_short_code"):
+            path = golden / (name + ".safetensors")
+            if path.name != missing:
+                path.touch()
+    assert entry(["check", "--gpu", "--json"]) == 1
+    checks = json.loads(capsys.readouterr().out)["data"]["checks"]
+    if missing == "model":
+        for name in ("ops-golden", "e2e-golden"):
+            assert "Missing model directory" in checks[name]["error"]
+    elif missing == "forward.so":
+        assert "Missing engine/build/forward.so. Run dev build" in checks["e2e-golden"]["error"]
+    else:
+        name = "ops-golden" if missing.startswith("ops") else "e2e-golden"
+        error = checks[name]["error"]
+        assert (".forge/golden/tiny" if missing == "golden" else missing) in error
+        assert "Run weights golden" in error
 
 
 @pytest.mark.parametrize("action", ["start", "stop", "status", "logs"])
@@ -256,6 +309,11 @@ def test_ssh_argv(entry, capsys):
 
 @pytest.mark.parametrize("interrupted", [False, True])
 def test_gpu_steps_run_under_lease(cfg, entry, executor, capsys, interrupted):
+    cfg.model.weights_dir = "model's weights"
+    cfg.shared.models_dir = "/shared models"
+    cfg.weights.golden_dir = "golden fixtures"
+    model = "/shared models/model's weights"
+    golden = "golden fixtures/model's weights"
     runs = []
 
     def run(cmd, **kwargs):
@@ -274,11 +332,33 @@ def test_gpu_steps_run_under_lease(cfg, entry, executor, capsys, interrupted):
     if interrupted:
         assert result["error"] == "interrupted transport"
     else:
-        assert len(runs) == 3
-        for cmd, expected in zip(
-            runs, ["ctest --test-dir", "forge-host --smoke", 'server" --smoke'], strict=True
-        ):
-            assert expected in cmd
+        assert set(result["data"]["checks"]) == {
+            "ctest",
+            "ops-golden",
+            "e2e-golden",
+            "forge-host",
+            "server",
+        }
+        assert len(runs) == 5
+        assert "ctest --test-dir" in runs[0]
+        assert shlex.split(runs[1].splitlines()[-1]) == [
+            "engine/build/ops_tests",
+            "--model-dir",
+            model,
+            "--golden-file",
+            golden + "/ops_golden.safetensors",
+        ]
+        assert shlex.split(runs[2].splitlines()[-1]) == [
+            "engine/build/e2e_tests",
+            "--forward",
+            "engine/build/forward.so",
+            "--model-dir",
+            model,
+            "--golden-dir",
+            golden,
+        ]
+        assert "forge-host --smoke" in runs[3]
+        assert '"$server" --smoke' in runs[4]
 
 
 def test_missing_required_config(repo, monkeypatch, capsys):
