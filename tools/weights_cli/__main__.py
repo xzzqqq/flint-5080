@@ -35,6 +35,14 @@ def build_parser():
     golden.add_argument("--steps", type=int, help="Override the number of cached decode steps.")
     golden.add_argument("--skip-ops", action="store_true")
     golden.add_argument("--skip-e2e", action="store_true")
+    chat = subs.add_parser("chat-golden", help="Generate offline HF chat and tokenizer references.")
+    chat.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help=json_help)
+    chat.add_argument("--local", action="store_true", help="Run on this host.")
+    chat.add_argument("--path", help="Checkpoint directory on the execution host.")
+    chat.add_argument("--python", help="Interpreter with transformers installed.")
+    chat.add_argument(
+        "--out", default="workloads/chat_golden.json", help="Caller-side output file."
+    )
     return parser
 
 
@@ -45,7 +53,7 @@ def main(argv=None):
     root = find_repo_root(Path(__file__))
     try:
         cfg = load_config(repo_root=root, allow_missing=args.local)
-        getattr(commands, args.command)(cfg, args, result)
+        getattr(commands, args.command.replace("-", "_"))(cfg, args, result)
     except (OSError, RuntimeError, ValueError) as exc:
         result.ok, result.error = False, str(exc)
     result.duration_ms = (time.monotonic() - start) * 1000

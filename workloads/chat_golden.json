@@ -1,0 +1,1257 @@
+{
+  "provenance": {
+    "model_name": "Maxrio--Inkling-2-Mini-exl3--3.3bpw",
+    "transformers_version": "5.20.2",
+    "chat_template_sha256": "53a9035f3255945704b5857657cfb00c1165090c0641c4f782a0cbf268cc16dc",
+    "tokenizer_sha256": "7f332727f9a3f093dd452a39cc978e6757627e5dad1b0673aa4e75174f236dd6",
+    "tokenizer_config_sha256": "bf09342d285139fd37ce10c70878af1d52cb390e9901e10248654293a80ee636"
+  },
+  "chat_template": "{%- set effort_map = {\"none\": 0.0, \"minimal\": 0.1, \"low\": 0.2, \"medium\": 0.7, \"high\": 0.9, \"xhigh\": 0.99, \"max\": 0.99} -%}\n{%- set role_token = {\"user\": \"<|message_user|>\", \"assistant\": \"<|message_model|>\", \"system\": \"<|message_system|>\", \"tool\": \"<|message_tool|>\"} -%}\n\n{%- macro emit_thinking_effort() -%}\n    {%- set eff = reasoning_effort if reasoning_effort is defined and reasoning_effort is not none else 0.9 -%}\n    {%- if eff is string -%}\n        {%- set key = eff | trim -%}\n        {%- if key not in effort_map -%}\n            {{- raise_exception(\"Unknown reasoning_effort: \" ~ eff) -}}\n        {%- endif -%}\n        {%- set num = effort_map[key] -%}\n    {%- else -%}\n        {%- set num = eff | float -%}\n    {%- endif -%}\n    {%- if num < 0.0 or num > 0.99 -%}\n        {{- raise_exception(\"reasoning_effort must be in [0.0, 0.99]\") -}}\n    {%- endif -%}\n    {{- \"<|message_system|><|content_text|>Thinking effort level: \" -}}\n    {%- if num == 0.0 -%}0{%- else -%}{{ num }}{%- endif -%}\n    {{- \"<|end_message|>\" -}}\n{%- endmacro -%}\n\n{%- if tools -%}\n    {%- set tool_state = namespace(specs=[]) -%}\n    {%- for tool in tools -%}\n        {%- set fn = tool.function if tool.function is defined else tool -%}\n        {%- set spec = {\n            \"description\": (fn.description if fn.description is defined and fn.description else \"\"),\n            \"name\": fn.name,\n            \"parameters\": (fn.parameters if fn.parameters is defined and fn.parameters else {}),\n            \"type\": (tool.type if tool.type is defined and tool.type else \"function\"),\n        } -%}\n        {%- set tool_state.specs = tool_state.specs + [spec] -%}\n    {%- endfor -%}\n    {{- \"<|message_system|>tool_declare<|content_xml|>\" -}}\n    {{- tool_state.specs | tojson(sort_keys=true, separators=(\",\", \":\")) -}}\n    {{- \"<|end_message|>\" -}}\n{%- endif -%}\n\n{%- set state = namespace(effort_emitted=false) -%}\n{%- for message in messages -%}\n    {%- if message.role not in role_token -%}\n        {{- raise_exception(\"Unknown message role: \" ~ message.role) -}}\n    {%- endif -%}\n    {%- if not state.effort_emitted and message.role != \"system\" -%}\n        {{- emit_thinking_effort() -}}\n        {%- set state.effort_emitted = true -%}\n    {%- endif -%}\n\n    {%- set header = namespace(text=role_token[message.role]) -%}\n    {%- if message.role == \"tool\" -%}\n        {%- if message.name is defined and message.name -%}\n            {%- set header.text = header.text ~ message.name -%}\n        {%- elif message.tool_call_id is defined and message.tool_call_id -%}\n            {%- for prev in messages -%}\n                {%- if prev.role == \"assistant\" and prev.tool_calls -%}\n                    {%- for tc in prev.tool_calls -%}\n                        {%- if tc.id is defined and tc.id == message.tool_call_id and tc.function.name is defined -%}\n                            {%- set header.text = header.text ~ tc.function.name -%}\n                        {%- endif -%}\n                    {%- endfor -%}\n                {%- endif -%}\n            {%- endfor -%}\n        {%- endif -%}\n    {%- elif message.role == \"assistant\" and message.name is defined and message.name -%}\n        {%- set header.text = header.text ~ message.name -%}\n    {%- endif -%}\n    {%- set rtok = header.text -%}\n    {%- set rendered -%}\n\n    {%- if message.role == \"assistant\" and message.reasoning_content is defined and message.reasoning_content -%}\n        {{- rtok ~ \"<|content_thinking|>\" ~ message.reasoning_content ~ \"<|end_message|>\" -}}\n    {%- endif -%}\n\n    {%- if message.content is string and (message.content or not (message.role == \"assistant\" and (message.tool_calls or message.reasoning_content))) -%}\n        {{- rtok ~ \"<|content_text|>\" ~ message.content ~ \"<|end_message|>\" -}}\n    {%- elif message.content -%}\n        {%- for part in message.content -%}\n            {%- if part is string -%}\n                {{- rtok ~ \"<|content_text|>\" ~ part ~ \"<|end_message|>\" -}}\n            {%- elif part.type is not defined or part.type in (\"text\", \"input_text\") -%}\n                {%- set text_part = (part.text if part.text is defined and part.text is string else \"\") -%}\n                {{- rtok ~ \"<|content_text|>\" ~ text_part ~ \"<|end_message|>\" -}}\n            {%- elif part.type in (\"image\", \"input_image\", \"image_url\") -%}\n                {%- if message.role not in (\"user\", \"tool\") -%}\n                    {{- raise_exception(\"Image content is only supported for user and tool messages\") -}}\n                {%- endif -%}\n                {{- rtok ~ \"<|content_image|><|unused_200054|><|end_message|>\" -}}\n            {%- elif part.type in (\"audio\", \"input_audio\", \"audio_url\") -%}\n                {{- raise_exception(\"Inkling 2 does not accept audio input\") -}}\n            {%- else -%}\n                {{- raise_exception(\"Unsupported content part type: \" ~ part.type) -}}\n            {%- endif -%}\n        {%- endfor -%}\n    {%- endif -%}\n\n    {%- if message.role == \"assistant\" and message.tool_calls -%}\n        {%- for tc in message.tool_calls -%}\n            {%- set fn = tc.function -%}\n            {%- if fn.name is not defined or fn.name is not string -%}\n                {{- raise_exception(\"tool call function name must be a string\") -}}\n            {%- endif -%}\n            {%- if message.name is defined and message.name and message.name != fn.name -%}\n                {{- raise_exception(\"assistant name \" ~ message.name ~ \" does not match its tool call \" ~ fn.name) -}}\n            {%- endif -%}\n            {%- set args = fn.arguments if fn.arguments is defined and fn.arguments else {} -%}\n            {%- if args is string -%}\n                {{- raise_exception(\"tool call arguments must be a parsed object, not a JSON string; canonicalize upstream\") -}}\n            {%- endif -%}\n            {%- if args is not mapping -%}\n                {{- raise_exception(\"tool call arguments must be an object\") -}}\n            {%- endif -%}\n            {{- \"<|message_model|>\" ~ fn.name ~ \"<|content_invoke_tool_json|>\" -}}\n            {{- '{\"name\":' ~ (fn.name | tojson(sort_keys=true, separators=(\",\", \":\"))) ~ ',\"args\":' -}}\n            {{- \"{\" -}}\n            {%- for key, value in args | dictsort(case_sensitive=true) -%}\n                {{- (key | tojson) ~ \":\" ~ (value | tojson(separators=(\",\", \":\"))) -}}\n                {%- if not loop.last -%},{%- endif -%}\n            {%- endfor -%}\n            {{- \"}}<|end_message|>\" -}}\n        {%- endfor -%}\n    {%- endif -%}\n\n    {%- if message.role == \"assistant\" -%}\n        {{- \"<|content_model_end_sampling|>\" -}}\n    {%- endif -%}\n    {%- endset -%}\n    {%- if message.role == \"assistant\" -%}\n        {%- generation -%}{{- rendered -}}{%- endgeneration -%}\n    {%- else -%}\n        {{- rendered -}}\n    {%- endif -%}\n{%- endfor -%}\n\n{%- if not state.effort_emitted -%}\n    {{- emit_thinking_effort() -}}\n{%- endif -%}\n",
+  "special_tokens": {
+    "endoftext": 199999,
+    "message_user": 200000,
+    "message_model": 200001,
+    "message_system": 200002,
+    "message_tool": 200003,
+    "content_text": 200004,
+    "content_image": 200005,
+    "content_model_end_sampling": 200006,
+    "content_thinking": 200008,
+    "end_message": 200010,
+    "content_tool_error": 200022,
+    "content_xml": 200024,
+    "begin_of_text": 200028,
+    "content_invoke_tool_json": 200049,
+    "content_invoke_tool_text": 200057,
+    "eos_token_id": 200006,
+    "pad_token_id": 199999
+  },
+  "template_cases": [
+    {
+      "name": "short_math",
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is 17 * 23? Answer with just the number."
+        }
+      ],
+      "reasoning_effort": "none",
+      "rendered": "<|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>What is 17 * 23? Answer with just the number.<|end_message|>",
+      "input_ids": [
+        200002,
+        200004,
+        34182,
+        279,
+        154554,
+        150628,
+        25,
+        220,
+        15,
+        200010,
+        200000,
+        200004,
+        1775,
+        149884,
+        220,
+        68107,
+        196987,
+        220,
+        68169,
+        30,
+        154710,
+        149899,
+        150239,
+        149876,
+        150107,
+        13,
+        200010
+      ]
+    },
+    {
+      "name": "short_sky",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Explain in one sentence why the sky is usually blue."
+        }
+      ],
+      "reasoning_effort": "none",
+      "rendered": "<|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Explain in one sentence why the sky is usually blue.<|end_message|>",
+      "input_ids": [
+        200002,
+        200004,
+        34182,
+        279,
+        154554,
+        150628,
+        25,
+        220,
+        15,
+        200010,
+        200000,
+        200004,
+        100887,
+        149881,
+        150011,
+        156021,
+        151661,
+        149876,
+        158808,
+        149884,
+        152978,
+        152778,
+        13,
+        200010
+      ]
+    },
+    {
+      "name": "short_code",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Write a one-line Python function that squares its argument."
+        }
+      ],
+      "reasoning_effort": "none",
+      "rendered": "<|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Write a one-line Python function that squares its argument.<|end_message|>",
+      "input_ids": [
+        200002,
+        200004,
+        34182,
+        279,
+        154554,
+        150628,
+        25,
+        220,
+        15,
+        200010,
+        200000,
+        200004,
+        3711,
+        149878,
+        150011,
+        12,
+        909,
+        152743,
+        150131,
+        149890,
+        165839,
+        150114,
+        152701,
+        13,
+        200010
+      ]
+    },
+    {
+      "name": "default_effort",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hello"
+        }
+      ],
+      "rendered": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hello<|end_message|>",
+      "input_ids": [
+        200002,
+        200004,
+        34182,
+        279,
+        154554,
+        150628,
+        25,
+        220,
+        15,
+        13,
+        24,
+        200010,
+        200000,
+        200004,
+        32269,
+        200010
+      ]
+    },
+    {
+      "name": "effort_None",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hello"
+        }
+      ],
+      "reasoning_effort": null,
+      "rendered": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hello<|end_message|>",
+      "input_ids": [
+        200002,
+        200004,
+        34182,
+        279,
+        154554,
+        150628,
+        25,
+        220,
+        15,
+        13,
+        24,
+        200010,
+        200000,
+        200004,
+        32269,
+        200010
+      ]
+    },
+    {
+      "name": "effort_minimal",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hello"
+        }
+      ],
+      "reasoning_effort": "minimal",
+      "rendered": "<|message_system|><|content_text|>Thinking effort level: 0.1<|end_message|><|message_user|><|content_text|>Hello<|end_message|>",
+      "input_ids": [
+        200002,
+        200004,
+        34182,
+        279,
+        154554,
+        150628,
+        25,
+        220,
+        15,
+        13,
+        16,
+        200010,
+        200000,
+        200004,
+        32269,
+        200010
+      ]
+    },
+    {
+      "name": "effort_low",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hello"
+        }
+      ],
+      "reasoning_effort": "low",
+      "rendered": "<|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|><|message_user|><|content_text|>Hello<|end_message|>",
+      "input_ids": [
+        200002,
+        200004,
+        34182,
+        279,
+        154554,
+        150628,
+        25,
+        220,
+        15,
+        13,
+        17,
+        200010,
+        200000,
+        200004,
+        32269,
+        200010
+      ]
+    },
+    {
+      "name": "effort_medium",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hello"
+        }
+      ],
+      "reasoning_effort": "medium",
+      "rendered": "<|message_system|><|content_text|>Thinking effort level: 0.7<|end_message|><|message_user|><|content_text|>Hello<|end_message|>",
+      "input_ids": [
+        200002,
+        200004,
+        34182,
+        279,
+        154554,
+        150628,
+        25,
+        220,
+        15,
+        13,
+        22,
+        200010,
+        200000,
+        200004,
+        32269,
+        200010
+      ]
+    },
+    {
+      "name": "effort_high",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hello"
+        }
+      ],
+      "reasoning_effort": "high",
+      "rendered": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hello<|end_message|>",
+      "input_ids": [
+        200002,
+        200004,
+        34182,
+        279,
+        154554,
+        150628,
+        25,
+        220,
+        15,
+        13,
+        24,
+        200010,
+        200000,
+        200004,
+        32269,
+        200010
+      ]
+    },
+    {
+      "name": "effort_xhigh",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hello"
+        }
+      ],
+      "reasoning_effort": "xhigh",
+      "rendered": "<|message_system|><|content_text|>Thinking effort level: 0.99<|end_message|><|message_user|><|content_text|>Hello<|end_message|>",
+      "input_ids": [
+        200002,
+        200004,
+        34182,
+        279,
+        154554,
+        150628,
+        25,
+        220,
+        15,
+        13,
+        68436,
+        200010,
+        200000,
+        200004,
+        32269,
+        200010
+      ]
+    },
+    {
+      "name": "effort_max",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hello"
+        }
+      ],
+      "reasoning_effort": "max",
+      "rendered": "<|message_system|><|content_text|>Thinking effort level: 0.99<|end_message|><|message_user|><|content_text|>Hello<|end_message|>",
+      "input_ids": [
+        200002,
+        200004,
+        34182,
+        279,
+        154554,
+        150628,
+        25,
+        220,
+        15,
+        13,
+        68436,
+        200010,
+        200000,
+        200004,
+        32269,
+        200010
+      ]
+    },
+    {
+      "name": "effort_0.5",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hello"
+        }
+      ],
+      "reasoning_effort": 0.5,
+      "rendered": "<|message_system|><|content_text|>Thinking effort level: 0.5<|end_message|><|message_user|><|content_text|>Hello<|end_message|>",
+      "input_ids": [
+        200002,
+        200004,
+        34182,
+        279,
+        154554,
+        150628,
+        25,
+        220,
+        15,
+        13,
+        20,
+        200010,
+        200000,
+        200004,
+        32269,
+        200010
+      ]
+    },
+    {
+      "name": "effort_1e-06",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hello"
+        }
+      ],
+      "reasoning_effort": 1e-06,
+      "rendered": "<|message_system|><|content_text|>Thinking effort level: 1e-06<|end_message|><|message_user|><|content_text|>Hello<|end_message|>",
+      "input_ids": [
+        200002,
+        200004,
+        34182,
+        279,
+        154554,
+        150628,
+        25,
+        220,
+        16,
+        68,
+        12,
+        68573,
+        200010,
+        200000,
+        200004,
+        32269,
+        200010
+      ]
+    },
+    {
+      "name": "system_only",
+      "messages": [
+        {
+          "role": "system",
+          "content": "Brief answers."
+        }
+      ],
+      "rendered": "<|message_system|><|content_text|>Brief answers.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>",
+      "input_ids": [
+        200002,
+        200004,
+        33347,
+        154609,
+        13,
+        200010,
+        200002,
+        200004,
+        34182,
+        279,
+        154554,
+        150628,
+        25,
+        220,
+        15,
+        13,
+        24,
+        200010
+      ]
+    },
+    {
+      "name": "conversation",
+      "messages": [
+        {
+          "role": "system",
+          "content": "Be precise."
+        },
+        {
+          "role": "user",
+          "content": "Hello"
+        },
+        {
+          "role": "assistant",
+          "content": "你好",
+          "name": "helper",
+          "reasoning_content": "Think first"
+        },
+        {
+          "role": "user",
+          "content": "Hello"
+        }
+      ],
+      "rendered": "<|message_system|><|content_text|>Be precise.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hello<|end_message|><|message_model|>helper<|content_thinking|>Think first<|end_message|><|message_model|>helper<|content_text|>你好<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>Hello<|end_message|>",
+      "input_ids": [
+        200002,
+        200004,
+        1618,
+        160207,
+        13,
+        200010,
+        200002,
+        200004,
+        34182,
+        279,
+        154554,
+        150628,
+        25,
+        220,
+        15,
+        13,
+        24,
+        200010,
+        200000,
+        200004,
+        32269,
+        200010,
+        200001,
+        96009,
+        200008,
+        34182,
+        150135,
+        200010,
+        200001,
+        96009,
+        200004,
+        11739,
+        23643,
+        200010,
+        200006,
+        200000,
+        200004,
+        32269,
+        200010
+      ]
+    },
+    {
+      "name": "parts",
+      "messages": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "text",
+              "text": "a"
+            },
+            {
+              "type": "input_text",
+              "text": "b"
+            },
+            "c",
+            {},
+            {
+              "type": "image_url"
+            }
+          ]
+        }
+      ],
+      "rendered": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>a<|end_message|><|message_user|><|content_text|>b<|end_message|><|message_user|><|content_text|>c<|end_message|><|message_user|><|content_text|><|end_message|><|message_user|><|content_image|><|unused_200054|><|end_message|>",
+      "input_ids": [
+        200002,
+        200004,
+        34182,
+        279,
+        154554,
+        150628,
+        25,
+        220,
+        15,
+        13,
+        24,
+        200010,
+        200000,
+        200004,
+        64,
+        200010,
+        200000,
+        200004,
+        65,
+        200010,
+        200000,
+        200004,
+        66,
+        200010,
+        200000,
+        200004,
+        200010,
+        200000,
+        200005,
+        200054,
+        200010
+      ]
+    },
+    {
+      "name": "parallel_tools",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hello"
+        },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "one",
+              "type": "function",
+              "function": {
+                "name": "lookup",
+                "arguments": "{\"a\":{\"z\":1,\"A\":\"你好🚀\"},\"B\":[\"<>&\",true,1e-7,1e20]}"
+              }
+            },
+            {
+              "id": "two",
+              "type": "function",
+              "function": {
+                "name": "ping",
+                "arguments": ""
+              }
+            }
+          ]
+        },
+        {
+          "role": "tool",
+          "content": "first",
+          "name": "lookup"
+        },
+        {
+          "role": "tool",
+          "content": "second",
+          "tool_call_id": "two"
+        },
+        {
+          "role": "assistant",
+          "content": "Done."
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "lookup",
+            "description": "查找 <x> & \"y\"",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "城市": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "name": "ping"
+        }
+      ],
+      "rendered": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"查找 <x> & \\\"y\\\"\",\"name\":\"lookup\",\"parameters\":{\"properties\":{\"城市\":{\"items\":{\"type\":\"string\"},\"type\":\"array\"}},\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"\",\"name\":\"ping\",\"parameters\":{},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hello<|end_message|><|message_model|>lookup<|content_invoke_tool_json|>{\"name\":\"lookup\",\"args\":{\"B\":[\"<>&\",true,1e-07,1e+20],\"a\":{\"z\":1,\"A\":\"你好🚀\"}}}<|end_message|><|message_model|>ping<|content_invoke_tool_json|>{\"name\":\"ping\",\"args\":{}}<|end_message|><|content_model_end_sampling|><|message_tool|>lookup<|content_text|>first<|end_message|><|message_tool|>ping<|content_text|>second<|end_message|><|message_model|><|content_text|>Done.<|end_message|><|content_model_end_sampling|>",
+      "input_ids": [
+        200002,
+        2251,
+        62,
+        76529,
+        200024,
+        58,
+        90,
+        1,
+        70469,
+        1,
+        25,
+        1,
+        7632,
+        13538,
+        196982,
+        87,
+        29,
+        196992,
+        196978,
+        1,
+        88,
+        59,
+        68723,
+        11,
+        1,
+        930,
+        1,
+        25,
+        1,
+        104024,
+        1,
+        11,
+        1,
+        71968,
+        1,
+        25,
+        90,
+        1,
+        71961,
+        1,
+        25,
+        90,
+        1,
+        129657,
+        1,
+        25,
+        90,
+        1,
+        70681,
+        1,
+        25,
+        90,
+        1,
+        1008,
+        1,
+        25,
+        1,
+        1485,
+        1,
+        92,
+        11,
+        1,
+        1008,
+        1,
+        25,
+        1,
+        1525,
+        1,
+        92,
+        92,
+        11,
+        1,
+        1008,
+        1,
+        25,
+        1,
+        3156,
+        1,
+        92,
+        11,
+        1,
+        1008,
+        1,
+        25,
+        1,
+        36404,
+        1,
+        92,
+        11,
+        90,
+        1,
+        70469,
+        1,
+        25,
+        68723,
+        11,
+        1,
+        930,
+        1,
+        25,
+        1,
+        2725,
+        1,
+        11,
+        1,
+        71968,
+        1,
+        25,
+        70044,
+        11,
+        1,
+        1008,
+        1,
+        25,
+        1,
+        36404,
+        1,
+        92,
+        60,
+        200010,
+        200002,
+        200004,
+        34182,
+        279,
+        154554,
+        150628,
+        25,
+        220,
+        15,
+        13,
+        24,
+        200010,
+        200000,
+        200004,
+        32269,
+        200010,
+        200001,
+        104024,
+        200049,
+        90,
+        1,
+        930,
+        1,
+        25,
+        1,
+        104024,
+        1,
+        11,
+        1,
+        70747,
+        1,
+        25,
+        90,
+        1,
+        33,
+        1,
+        25,
+        58,
+        1,
+        27,
+        29,
+        5,
+        1,
+        11,
+        1750,
+        11,
+        16,
+        68,
+        12,
+        68620,
+        11,
+        16,
+        68,
+        10,
+        68020,
+        60,
+        11,
+        1,
+        64,
+        1,
+        25,
+        90,
+        1,
+        89,
+        1,
+        25,
+        16,
+        11,
+        1,
+        32,
+        1,
+        25,
+        1,
+        11739,
+        23643,
+        108185,
+        1,
+        92,
+        92,
+        92,
+        200010,
+        200001,
+        2725,
+        200049,
+        90,
+        1,
+        930,
+        1,
+        25,
+        1,
+        2725,
+        1,
+        11,
+        1,
+        70747,
+        1,
+        25,
+        70044,
+        92,
+        200010,
+        200006,
+        200003,
+        104024,
+        200004,
+        1276,
+        200010,
+        200003,
+        2725,
+        200004,
+        1604,
+        200010,
+        200001,
+        200004,
+        35755,
+        13,
+        200010,
+        200006
+      ]
+    },
+    {
+      "name": "named_call",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hello"
+        },
+        {
+          "role": "assistant",
+          "content": null,
+          "name": "ping",
+          "tool_calls": [
+            {
+              "id": "one",
+              "type": "function",
+              "function": {
+                "name": "ping",
+                "arguments": {}
+              }
+            }
+          ]
+        }
+      ],
+      "rendered": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>Hello<|end_message|><|message_model|>ping<|content_invoke_tool_json|>{\"name\":\"ping\",\"args\":{}}<|end_message|><|content_model_end_sampling|>",
+      "input_ids": [
+        200002,
+        200004,
+        34182,
+        279,
+        154554,
+        150628,
+        25,
+        220,
+        15,
+        13,
+        24,
+        200010,
+        200000,
+        200004,
+        32269,
+        200010,
+        200001,
+        2725,
+        200049,
+        90,
+        1,
+        930,
+        1,
+        25,
+        1,
+        2725,
+        1,
+        11,
+        1,
+        70747,
+        1,
+        25,
+        70044,
+        92,
+        200010,
+        200006
+      ]
+    }
+  ],
+  "template_error_cases": [
+    {
+      "name": "unknown_role",
+      "messages": [
+        {
+          "role": "other",
+          "content": "x"
+        }
+      ],
+      "error": "Unknown message role: other"
+    },
+    {
+      "name": "invalid_effort_unknown",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hello"
+        }
+      ],
+      "reasoning_effort": "unknown",
+      "error": "Unknown reasoning_effort: unknown"
+    },
+    {
+      "name": "invalid_effort_1.5",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hello"
+        }
+      ],
+      "reasoning_effort": 1.5,
+      "error": "reasoning_effort must be in [0.0, 0.99]"
+    },
+    {
+      "name": "invalid_effort_-0.1",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Hello"
+        }
+      ],
+      "reasoning_effort": -0.1,
+      "error": "reasoning_effort must be in [0.0, 0.99]"
+    },
+    {
+      "name": "audio",
+      "messages": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "audio"
+            }
+          ]
+        }
+      ],
+      "error": "Inkling 2 does not accept audio input"
+    },
+    {
+      "name": "assistant_image",
+      "messages": [
+        {
+          "role": "assistant",
+          "content": [
+            {
+              "type": "image"
+            }
+          ]
+        }
+      ],
+      "error": "Image content is only supported for user and tool messages"
+    },
+    {
+      "name": "unknown_part",
+      "messages": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "type": "unknown"
+            }
+          ]
+        }
+      ],
+      "error": "Unsupported content part type: unknown"
+    },
+    {
+      "name": "invalid_name",
+      "messages": [
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "one",
+              "type": "function",
+              "function": {
+                "name": null,
+                "arguments": {}
+              }
+            }
+          ]
+        }
+      ],
+      "error": "tool call function name must be a string"
+    },
+    {
+      "name": "name_mismatch",
+      "messages": [
+        {
+          "role": "assistant",
+          "content": "",
+          "name": "a",
+          "tool_calls": [
+            {
+              "id": "one",
+              "type": "function",
+              "function": {
+                "name": "b",
+                "arguments": {}
+              }
+            }
+          ]
+        }
+      ],
+      "error": "assistant name a does not match its tool call b"
+    },
+    {
+      "name": "non_object",
+      "messages": [
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "one",
+              "type": "function",
+              "function": {
+                "name": "a",
+                "arguments": "[1]"
+              }
+            }
+          ]
+        }
+      ],
+      "error": "tool call arguments must be an object"
+    },
+    {
+      "name": "invalid_json",
+      "messages": [
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "one",
+              "type": "function",
+              "function": {
+                "name": "a",
+                "arguments": "{"
+              }
+            }
+          ]
+        }
+      ],
+      "error": "Expecting property name enclosed in double quotes: line 1 column 2 (char 1)"
+    }
+  ],
+  "tokenizer_cases": [
+    {
+      "name": "ascii",
+      "text": "The quick brown fox jumps.",
+      "token_ids": [
+        371,
+        157021,
+        161319,
+        220,
+        32329,
+        160581,
+        82,
+        13
+      ],
+      "decoded_keep_special": "The quick brown fox jumps.",
+      "decoded_skip_special": "The quick brown fox jumps."
+    },
+    {
+      "name": "python",
+      "text": "def f(x):\n\treturn x * 2\n",
+      "token_ids": [
+        1719,
+        149983,
+        7,
+        87,
+        8,
+        25,
+        198,
+        197,
+        65108,
+        149924,
+        196987,
+        220,
+        17,
+        198
+      ],
+      "decoded_keep_special": "def f(x):\n\treturn x * 2\n",
+      "decoded_skip_special": "def f(x):\n\treturn x * 2\n"
+    },
+    {
+      "name": "rust",
+      "text": "fn main() {\n    println!(\"hi\");\n}\n",
+      "token_ids": [
+        3446,
+        150520,
+        68078,
+        196983,
+        198,
+        149862,
+        182323,
+        0,
+        7,
+        1,
+        1910,
+        1,
+        8,
+        26,
+        198,
+        92,
+        198
+      ],
+      "decoded_keep_special": "fn main() {\n    println!(\"hi\");\n}\n",
+      "decoded_skip_special": "fn main() {\n    println!(\"hi\");\n}\n"
+    },
+    {
+      "name": "chinese",
+      "text": "你好，世界！测试多字节UTF-8",
+      "token_ids": [
+        11739,
+        23643,
+        6633,
+        110174,
+        6622,
+        116305,
+        24632,
+        17423,
+        12625,
+        146531,
+        12,
+        23
+      ],
+      "decoded_keep_special": "你好，世界！测试多字节UTF-8",
+      "decoded_skip_special": "你好，世界！测试多字节UTF-8"
+    },
+    {
+      "name": "emoji",
+      "text": "🚀✨🔥",
+      "token_ids": [
+        108185,
+        114999,
+        111681
+      ],
+      "decoded_keep_special": "🚀✨🔥",
+      "decoded_skip_special": "🚀✨🔥"
+    },
+    {
+      "name": "special",
+      "text": "<|message_model|><|content_text|>hi<|end_message|>",
+      "token_ids": [
+        200001,
+        200004,
+        1910,
+        200010
+      ],
+      "decoded_keep_special": "<|message_model|><|content_text|>hi<|end_message|>",
+      "decoded_skip_special": "hi"
+    },
+    {
+      "name": "spaces",
+      "text": "  Well... yes?!  ",
+      "token_ids": [
+        220,
+        155493,
+        145038,
+        156053,
+        30,
+        0,
+        149859
+      ],
+      "decoded_keep_special": "  Well... yes?!  ",
+      "decoded_skip_special": "  Well... yes?!  "
+    },
+    {
+      "name": "empty",
+      "text": "",
+      "token_ids": [],
+      "decoded_keep_special": "",
+      "decoded_skip_special": ""
+    }
+  ]
+}

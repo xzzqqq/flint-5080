@@ -3,8 +3,19 @@ title = "flint-5080 gitleaks config"
 [extend]
 useDefault = true
 
-[allowlist]
+[[allowlists]]
 description = "Ignore example templates and non-secret placeholder values"
 paths = [
   '''^\.dev\.toml\.example$''',
+]
+
+[[allowlists]]
+description = "Allow SHA-256 provenance digests for tokenizer files in chat golden fixtures"
+condition = "AND"
+paths = [
+  '''^workloads/chat_golden\.json$''',
+]
+regexTarget = "line"
+regexes = [
+  '''"tokenizer(?:_config)?_sha256":\s*"[0-9a-f]{64}"''',
 ]

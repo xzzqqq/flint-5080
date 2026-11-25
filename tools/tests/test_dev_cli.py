@@ -373,8 +373,18 @@ def test_gpu_steps_run_under_lease(cfg, entry, executor, capsys, interrupted):
             golden,
         ]
         assert "forge-host --smoke" in runs[4]
-        assert runs[5].splitlines()[-2] == '"$server" --smoke'
-        server, smoke, flag, config = shlex.split(runs[5].splitlines()[-1])
+        assert runs[5].splitlines()[-3] == '"$server" --smoke'
+        assert shlex.split(runs[5].splitlines()[-1]) == [
+            "$server",
+            "--check-chat-golden",
+            "--model-dir",
+            model,
+            "--golden",
+            "workloads/chat_golden.json",
+            "--golden-cases",
+            "workloads/golden_cases.json",
+        ]
+        server, smoke, flag, config = shlex.split(runs[5].splitlines()[-2])
         assert (server, smoke, flag) == ("$server", "--smoke", "--config-json")
         assert json.loads(config) == {"model_dir": model, "max_context": 2048}
 

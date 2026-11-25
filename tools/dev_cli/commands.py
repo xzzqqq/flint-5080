@@ -365,6 +365,18 @@ def _gpu_check_commands(model_dir, golden_dir):
             'test -x "$server" || { echo "Missing $server. Run dev build first." >&2; exit 1; }',
             '"$server" --smoke',
             '"$server" --smoke --config-json ' + shlex.quote(model_config),
+            '"$server" '
+            + shlex.join(
+                [
+                    "--check-chat-golden",
+                    "--model-dir",
+                    str(model_dir),
+                    "--golden",
+                    "workloads/chat_golden.json",
+                    "--golden-cases",
+                    "workloads/golden_cases.json",
+                ]
+            ),
         ],
     }
 

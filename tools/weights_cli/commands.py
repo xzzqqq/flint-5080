@@ -77,10 +77,34 @@ def golden(cfg, args, result):
     result.data.update(json.loads(reply.stdout))
 
 
+def chat_golden(cfg, args, result):
+    if args.local:
+        cfg = replace(cfg, remote=replace(cfg.remote, enabled=False))
+    if not args.path and not cfg.model.weights_dir:
+        raise ConfigError("Set model.weights_dir in .dev.toml or pass --path.")
+    path = args.path or str(Path(cfg.shared.models_dir) / cfg.model.weights_dir)
+    python = args.python or cfg.weights.python or ("python3" if cfg.is_remote else sys.executable)
+    executor = Executor(cfg)
+    if cfg.is_remote:
+        executor.sync()
+    command = shlex.join([python, "-m", "tools.weights_cli._chat_golden", path])
+    reply = executor.run(command, check=True, stream_stderr=True, echo_stdout=False)
+    data = json.loads(reply.stdout)
+    counts = {
+        key: len(data[key]) for key in ("template_cases", "template_error_cases", "tokenizer_cases")
+    }
+    out = cfg.repo_root / args.out
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(reply.stdout, encoding="utf-8")
+    result.data.update(out=str(out), **counts)
+
+
 def human_format(result):
     if not result.ok:
         return f"{result.command} FAILED\n{result.error}"
     data = result.data
+    if result.command == "weights chat-golden":
+        return f"weights chat-golden OK  {data['out']}"
     if result.command == "weights golden":
         lines = [f"weights golden OK  {data['out_dir']}", *data["files"]]
         for case in data["cases"]:
