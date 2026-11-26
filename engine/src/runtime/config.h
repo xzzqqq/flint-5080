@@ -8,6 +8,7 @@ struct RuntimeConfig {
   size_t scratch_bytes = 450ull << 20, vram_reserve_bytes = 512ull << 20;
   uint32_t prefix_cache_slots = 3;
   bool use_cuda_graph = true;
+  bool use_speculative = true;
 
   static RuntimeConfig Parse(const char* input) {
     if (!input) throw std::invalid_argument("config_json is null");
@@ -29,6 +30,7 @@ struct RuntimeConfig {
     read("vram_reserve_bytes", c.vram_reserve_bytes);
     read("prefix_cache_slots", c.prefix_cache_slots);
     read("use_cuda_graph", c.use_cuda_graph);
+    read("use_speculative", c.use_speculative);
     if (!c.prefill_chunk_size || c.prefill_chunk_size > 2048)
       throw std::invalid_argument("prefill_chunk_size must be in [1, 2048]");
     if (c.scratch_bytes < (64ull << 20))

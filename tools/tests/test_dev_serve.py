@@ -100,6 +100,7 @@ def test_serve_lifecycle(local, monkeypatch):
         "--request-timeout-sec",
         "0",
         "--no-cuda-graph",
+        "--no-spec",
     )
     assert data["running"]
     ready = data["ready"]
@@ -115,6 +116,7 @@ def test_serve_lifecycle(local, monkeypatch):
         "--request-timeout-sec",
         "0",
         "--no-cuda-graph",
+        "--no-spec",
     ]
     time.sleep(1.1)  # Outlive the original lease and verify renewal by the execution host.
     status = run("status")

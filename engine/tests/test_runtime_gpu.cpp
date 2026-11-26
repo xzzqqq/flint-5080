@@ -29,6 +29,7 @@ Engine Create(const std::string& config) {
 }
 struct Result {
   std::vector<int32_t> ids;
+  std::vector<size_t> batches;
   EngineTelemetry t{};
   EngineStatus status{};
   EngineStopReason stop_reason{};
@@ -42,6 +43,7 @@ struct Capture {
   static void Callback(const EngineEvent* event, void* data) {
     auto& c = *static_cast<Capture*>(data);
     if (event->kind == ENGINE_EVENT_TOKENS) {
+      c.result.batches.push_back(event->n_tokens);
       c.result.ids.insert(c.result.ids.end(), event->token_ids, event->token_ids + event->n_tokens);
       if (c.result.ids.size() == c.cancel_at) engine_cancel(c.engine, event->req_id);
     } else {
@@ -71,14 +73,15 @@ Result Run(EngineHandle* e, const std::vector<int32_t>& prompt, RequestParams p,
   return result.get();
 }
 void Success(const Result& r) { Require(r.status == ENGINE_OK, r.error); }
-uint64_t Counter(EngineHandle* e, const char* key);
+template <class T = uint64_t>
+T Counter(EngineHandle* e, const char* key);
 void ConfigSmoke() {
   auto defaults = RuntimeConfig::Parse("{}");
-  Require(defaults.model_dir.empty() && !defaults.max_context &&
-              defaults.prefill_chunk_size == 256 && defaults.use_cuda_graph &&
-              defaults.prefix_cache_slots == 3 && defaults.scratch_bytes == (450ull << 20) &&
-              defaults.vram_reserve_bytes == (512ull << 20),
-          "config defaults");
+  Require(
+      defaults.model_dir.empty() && !defaults.max_context && defaults.prefill_chunk_size == 256 &&
+          defaults.use_speculative && defaults.use_cuda_graph && defaults.prefix_cache_slots == 3 &&
+          defaults.scratch_bytes == (450ull << 20) && defaults.vram_reserve_bytes == (512ull << 20),
+      "config defaults");
   for (const char* bad :
        {"", "null", "[]", "{}x", "{\"model_dir\":true}", "{\"max_context\":-1}",
         "{\"max_context\":4294967296}", "{\"prefix_cache_slots\":1.2}",
@@ -93,6 +96,9 @@ void ConfigSmoke() {
   auto r = Run(e.get(), {1}, {.max_tokens = 1});
   Success(r);
   Require(r.ids == std::vector<int32_t>{42}, "smoke token");
+  Require(
+      Counter<bool>(e.get(), "use_speculative") && !Counter<bool>(e.get(), "speculative_active"),
+      "smoke AR fallback");
   for (const char* key : {"prefix_cache_slots", "prefix_cache_used_slots", "prefix_cache_hits",
                           "prefix_cache_misses", "prefix_cache_saved_tokens"})
     Require(Counter(e.get(), key) == 0, key);
@@ -116,11 +122,51 @@ size_t FreeBytes() {
   CheckCuda(cudaMemGetInfo(&available, &total));
   return available;
 }
-uint64_t Counter(EngineHandle* e, const char* key) {
+template <class T>
+T Counter(EngineHandle* e, const char* key) {
   std::unique_ptr<char, decltype(&engine_string_free)> stats(engine_stats_json(e),
                                                              engine_string_free);
   Require(bool(stats), "stats unavailable");
-  return json::Parser(stats.get()).Parse().at(key).number<uint64_t>();
+  auto root = json::Parser(stats.get()).Parse();
+  if constexpr (std::is_same_v<T, bool>)
+    return root.at(key).as<bool>();
+  else
+    return root.at(key).number<T>();
+}
+void SpecBoundaries(EngineHandle* e, const std::vector<int32_t>& prompt,
+                    const std::vector<int32_t>& gold, int32_t eos_id) {
+  // short_math starts with three accepted drafts followed by the target bonus.
+  for (unsigned limit : {1, 3, 5}) {
+    auto r = Run(e, prompt, {.max_tokens = limit, .ignore_eos = 1});
+    Success(r);
+    Require(r.ids == std::vector<int32_t>(gold.begin(), gold.begin() + limit) &&
+                r.t.decode_tokens == limit && r.t.spec_accepted == std::min(limit - 1, 3u) &&
+                r.t.decode_rounds == unsigned(limit > 1) && r.stop_reason == ENGINE_STOP_MAX_TOKENS,
+            "budget within speculative batch");
+  }
+  RequestParams p{.max_tokens = uint32_t(gold.size()),
+                  .stop_token_ids = &gold[2],
+                  .n_stop_token_ids = 1,
+                  .ignore_eos = 1};
+  auto stopped = Run(e, prompt, p);
+  Success(stopped);
+  Require(stopped.ids == std::vector<int32_t>(gold.begin(), gold.begin() + 2) &&
+              stopped.t.spec_accepted == 1 && stopped.t.decode_rounds == 1 &&
+              stopped.stop_reason == ENGINE_STOP_STOP_TOKEN,
+          "stop inside accepted drafts");
+  p.stop_token_ids = nullptr;
+  p.n_stop_token_ids = 0;
+  p.ignore_eos = 0;
+  auto eos = Run(e, prompt, p);
+  Success(eos);
+  Require(eos.ids == std::vector<int32_t>(gold.begin(), std::ranges::find(gold, eos_id)) &&
+              eos.stop_reason == ENGINE_STOP_EOS,
+          "spec EOS");
+  auto cancelled = Run(e, prompt, p, 5);
+  Require(cancelled.status == ENGINE_ERR_CANCELLED &&
+              cancelled.batches == std::vector<size_t>{1, 4} && cancelled.t.spec_accepted == 3 &&
+              cancelled.t.decode_rounds == 1,
+          "cancel on batched callback");
 }
 void PrefixTests(const std::filesystem::path& model_dir, const std::vector<int32_t>& math,
                  const std::vector<int32_t>& gold) {
@@ -134,7 +180,7 @@ void PrefixTests(const std::filesystem::path& model_dir, const std::vector<int32
   RequestParams greedy{.max_tokens = 16, .ignore_eos = 1};
   RequestParams full{.max_tokens = uint32_t(gold.size()), .ignore_eos = 1};
   RequestParams stochastic{.max_tokens = 16,
-                           .temperature = 0.8f,
+                           .temperature = 0.7f,
                            .top_p = 0.9f,
                            .top_k = 40,
                            .seed = 12345,
@@ -180,6 +226,9 @@ void PrefixTests(const std::filesystem::path& model_dir, const std::vector<int32
   {
     auto cache = create(3);
     auto* e = cache.get();
+    Require(Counter<bool>(e, "speculative_active") && Counter<bool>(e, "use_speculative"),
+            "DSpark active");
+    uint64_t total_prompt = 0, total_decode = 0, total_rounds = 0, total_accepted = 0;
     uint64_t hits = 0, misses = 0, saved = 0;
     auto run = [&](const Tokens& prompt, RequestParams params, size_t expected) {
       auto r = Run(e, prompt, params);
@@ -192,6 +241,10 @@ void PrefixTests(const std::filesystem::path& model_dir, const std::vector<int32
       else
         ++misses;
       saved += expected;
+      total_prompt += r.t.prefill_tokens;
+      total_decode += r.t.decode_tokens;
+      total_rounds += r.t.decode_rounds;
+      total_accepted += r.t.spec_accepted;
       return r;
     };
     auto parity = [&](const char* name, const Result& r, const Result& reference) {
@@ -202,8 +255,18 @@ void PrefixTests(const std::filesystem::path& model_dir, const std::vector<int32
     Require(math.size() == 27 && gold.size() == 49, "short_math fixture shape");
     parity("first", run(math, full, 0), cold_math);
     size_t resident = FreeBytes();
+    auto chunks = Counter(e, "total_prefill_chunks");
     auto repeat = run(math, full, math.size());
+    Require(chunks == (math.size() + 7) / 8 && Counter(e, "total_prefill_chunks") == chunks,
+            "exact hit skips every target prefill chunk");
     parity("exact", repeat, cold_math);
+    Require(repeat.t.spec_accepted > 0 && repeat.t.spec_accepted == cold_math.t.spec_accepted &&
+                repeat.t.decode_rounds == cold_math.t.decode_rounds &&
+                repeat.t.decode_rounds < repeat.t.decode_tokens,
+            "exact speculative rounds");
+    std::cout << "DSpark short_math parity=" << repeat.ids.size() << "/" << gold.size()
+              << " accepted=" << repeat.t.spec_accepted << " rounds=" << repeat.t.decode_rounds
+              << " tokens=" << repeat.t.decode_tokens << std::endl;
     std::cout << "short_math cold prefill_ms=" << cold_math.t.prefill_ms
               << " exact prefill_ms=" << repeat.t.prefill_ms << std::endl;
     Require(repeat.t.prefill_ms < cold_math.t.prefill_ms / 2, "exact prefill speedup");
@@ -224,6 +287,13 @@ void PrefixTests(const std::filesystem::path& model_dir, const std::vector<int32
             "prefix cache stats");
     std::cout << "prefix hits=" << hits << " misses=" << misses << " saved_tokens=" << saved
               << " used_slots=2" << std::endl;
+    Require(Counter(e, "total_prefill_tokens") == total_prompt &&
+                Counter(e, "total_cached_prefix_tokens") == saved &&
+                Counter(e, "total_decode_tokens") == total_decode &&
+                Counter(e, "total_decode_rounds") == total_rounds &&
+                Counter(e, "total_spec_accepted") == total_accepted,
+            "lifetime telemetry totals");
+    SpecBoundaries(e, math, gold, LoadModelConfig(model_dir / "config.json").eos_token_id);
     auto after = FreeBytes();
     std::cout << "resident VRAM delta=" << int64_t(resident) - int64_t(after) << " B" << std::endl;
     Require(resident == after, "resident prefix cache VRAM drift");
@@ -233,18 +303,41 @@ void PrefixTests(const std::filesystem::path& model_dir, const std::vector<int32
             << std::endl;
   Require(before == after, "prefix cache VRAM drift after destroy");
 }
+Engine CreateWithoutMtpFile(const std::filesystem::path& model_dir) {
+  namespace fs = std::filesystem;
+  auto path = (fs::temp_directory_path() / "flint-runtime-XXXXXX").string();
+  Require(mkdtemp(path.data()) != nullptr, "create AR checkpoint directory");
+  struct Cleanup {
+    fs::path dir;
+    ~Cleanup() {
+      std::error_code ec;
+      fs::remove_all(dir, ec);
+    }
+  } tmp{path};
+  for (auto name : {"config.json", "model.safetensors"})
+    fs::create_symlink(fs::absolute(model_dir / name), tmp.dir / name);
+  return Create(Encode(Object{{"model_dir", path}, {"prefill_chunk_size", 8}}));
+}
 void ModelTests(const std::filesystem::path& model_dir, const std::filesystem::path& golden_dir) {
   constexpr unsigned kMaxContext = 521;
-  auto config = Encode(Object{
-      {"model_dir", model_dir.string()}, {"max_context", kMaxContext}, {"prefill_chunk_size", 8}});
+  auto config = Encode(Object{{"model_dir", model_dir.string()},
+                              {"max_context", kMaxContext},
+                              {"prefill_chunk_size", 8},
+                              {"use_speculative", false}});
   auto file = [&](std::string name) {
     return SafetensorsFile::Open(golden_dir / ("e2e_short_" + name + ".safetensors"));
   };
   auto prompt = Ids(file("math"), "input_ids");
   RequestParams p{.max_tokens = 4, .ignore_eos = 1};
-  {
+  for (bool speculative : {true, false}) {
+    p.temperature = 0;
     auto warm =
-        Create(Encode(Object{{"model_dir", model_dir.string()}, {"prefill_chunk_size", 8}}));
+        speculative
+            ? Create(Encode(Object{{"model_dir", model_dir.string()}, {"prefill_chunk_size", 8}}))
+            : CreateWithoutMtpFile(model_dir);
+    Require(Counter<bool>(warm.get(), "use_speculative") &&
+                Counter<bool>(warm.get(), "speculative_active") == speculative,
+            "automatic MTP selection");
     Require(Counter(warm.get(), "max_context") >= prompt.size(), "auto-sized context");
     Success(Run(warm.get(), prompt, p));
     p.temperature = 0.8f;
@@ -253,6 +346,9 @@ void ModelTests(const std::filesystem::path& model_dir, const std::filesystem::p
   size_t before = FreeBytes();
   auto engine = Create(config);
   auto* e = engine.get();
+  Require(!Counter<bool>(e, "speculative_active") && !Counter<bool>(e, "use_speculative"),
+          "explicit AR");
+  std::vector<std::pair<std::vector<int32_t>, Result>> ar_runs;
   unsigned total = 0;
   p.temperature = 0;
   for (auto name : {"math", "sky", "code"}) {
@@ -266,6 +362,7 @@ void ModelTests(const std::filesystem::path& model_dir, const std::filesystem::p
     std::cout << name << " chunk=8 greedy=" << hits << "/" << gold.size() << std::endl;
     Require(r.ids == gold && r.stop_reason == ENGINE_STOP_MAX_TOKENS, "greedy mismatch");
     total += hits;
+    ar_runs.emplace_back(Ids(f, "input_ids"), std::move(r));
   }
   auto graphs = Counter(e, "graph_captures"), launches = Counter(e, "graph_launches");
   std::cout << "greedy=" << total << "/288 graph_captures=" << graphs
@@ -367,7 +464,32 @@ void ModelTests(const std::filesystem::path& model_dir, const std::filesystem::p
   size_t after = FreeBytes();
   std::cout << "VRAM delta=" << int64_t(before) - int64_t(after) << " B" << std::endl;
   Require(before == after, "VRAM drift after destroy");
+  {
+    auto spec = Create(Encode(Object{{"model_dir", model_dir.string()},
+                                     {"max_context", kMaxContext},
+                                     {"prefill_chunk_size", 8},
+                                     {"use_speculative", true}}));
+    for (const auto& [ids, ar] : ar_runs) {
+      auto r = Run(spec.get(), ids, {.max_tokens = ar.t.decode_tokens, .ignore_eos = 1});
+      Success(r);
+      Require(r.ids == ar.ids && r.t.spec_accepted > 0 && r.t.decode_rounds < r.t.decode_tokens,
+              "greedy speculative vs AR");
+      std::cout << "DSpark vs AR " << r.ids.size() << "/" << ar.ids.size()
+                << " rounds=" << r.t.decode_rounds << " accepted=" << r.t.spec_accepted
+                << std::endl;
+    }
+  }
   PrefixTests(model_dir, prompt, gold);
+  for (unsigned room : {1, 5}) {
+    auto edge = Create(Encode(Object{{"model_dir", model_dir.string()},
+                                     {"max_context", prompt.size() + room},
+                                     {"prefill_chunk_size", 3}}));
+    auto r = Run(edge.get(), prompt, {.max_tokens = 16, .ignore_eos = 1});
+    Success(r);
+    Require(r.ids == std::vector<int32_t>(gold.begin(), gold.begin() + room + 1) &&
+                r.stop_reason == ENGINE_STOP_CONTEXT_LIMIT,
+            "bounded verify at context limit");
+  }
 }
 }  // namespace
 int main(int argc, char** argv) {

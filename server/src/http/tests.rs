@@ -52,13 +52,21 @@ fn script_engine(text: &str, end_reason: EngineStopReason) -> Engine {
             ..Default::default()
         };
         let mut reason = end_reason;
+        let mut batch = Vec::new();
         for id in ids.iter().copied().take(req.max_tokens as usize) {
             if id == eos && !req.ignore_eos {
                 reason = EngineStopReason::Eos;
                 break;
             }
             t.decode_tokens += 1;
-            tx.send(Ok(EngineEvent::Tokens(vec![id], t))).unwrap();
+            batch.push(id);
+            if batch.len() == 8 {
+                tx.send(Ok(EngineEvent::Tokens(std::mem::take(&mut batch), t)))
+                    .unwrap();
+            }
+        }
+        if !batch.is_empty() {
+            tx.send(Ok(EngineEvent::Tokens(batch, t))).unwrap();
         }
         if t.decode_tokens >= req.max_tokens {
             reason = EngineStopReason::MaxTokens;
@@ -229,9 +237,9 @@ async fn parallel_tools_and_length_priority() {
 async fn stop_truncates_across_tokens_and_uses_terminal_or_latest_telemetry() {
     for terminal in [true, false] {
         let app = state(Engine::with_stub(move |_, tx| {
-            for b in "好了🚀ENDsecret".bytes() {
+            for batch in "好了🚀ENDsecret".as_bytes().chunks(8) {
                 tx.send(Ok(EngineEvent::Tokens(
-                    vec![b.into()],
+                    batch.iter().map(|&b| b.into()).collect(),
                     Telemetry {
                         decode_tokens: 12,
                         decode_ms: 3.0,

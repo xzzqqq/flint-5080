@@ -127,6 +127,7 @@ char* engine_stats_json(EngineHandle* h); // 返回 JSON 快照供 /ready 与 P1
 **接口契约要点**：
 - **Rust 侧对底层完全无知**：不感知层数、KV 格式/页表、投机解码细节或 Host KV-RAM。
 - **回调事件**：Request ABI v2 的 `DONE` 携带最终遥测（`prefill_tokens`、`cached_prefix_tokens`、`decode_tokens`、`prefill_ms`、`decode_ms`、`decode_rounds`、`spec_accepted`）和 `EngineStopReason`。引擎区分模型 EOS、调用方停止 token、输出 token 上限和上下文上限，Rust 结合停止字符串与工具调用生成 HTTP `finish_reason`。`TOKENS` 和 `ERROR` 的 `stop_reason` 均为 `ENGINE_STOP_NONE`，错误码（`ContextOverflow` / `InvalidInput` / `Cancelled` / `Internal`）由 `ERROR.status` 返回。
+- 生产引擎默认在 checkpoint 含 MTP 权重时启用 DSpark。`dev serve start --no-spec` 切换至 AR。前缀快照包含目标与草拟器的滑窗 KV、目标卷积状态，以及完整提示末位的 logits 和 18 KiB BF16 tap。精确命中可直接开始草拟，部分命中只处理剩余提示。`/ready` 的引擎统计同时报告配置开关、实际启用状态与已结束请求的累计遥测。
 - **零热路径开销**：每轮 decode（10–20 ms）仅回调一次推送本轮产出的 1~K 个 token IDs，Rust 侧转发至 `tokio::sync::mpsc` 驱动 SSE。
 
 ---

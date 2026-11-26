@@ -30,6 +30,8 @@ async def probe_ready(url, timeout):
         "max_context",
         "prefix_cache_slots",
         "use_cuda_graph",
+        "use_speculative",
+        "speculative_active",
         "prefill_chunk_size",
         "mode",
         "abi_version",

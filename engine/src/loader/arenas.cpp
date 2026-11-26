@@ -294,8 +294,7 @@ WeightsArena WeightsArena::Load(const std::filesystem::path& dir, cudaStream_t s
   view.mapped_tensor_count = file.tensors().size();
   std::optional<SafetensorsFile> draft;
   std::array<float, 16> alpha{};
-  if (load_mtp && std::filesystem::exists(dir / "model-mtp.safetensors")) {
-    if (!view.config.has_mtp) throw std::runtime_error("missing mtp_config");
+  if (load_mtp && view.config.has_mtp && std::filesystem::exists(dir / "model-mtp.safetensors")) {
     draft.emplace(SafetensorsFile::Open(dir / "model-mtp.safetensors"));
     PlanWeights(*draft, view, MtpSchema(view.mtp), plan);
     auto src = draft->Bytes(*draft->Find("fuse_weight"));

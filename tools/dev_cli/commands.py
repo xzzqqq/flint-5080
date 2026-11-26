@@ -395,6 +395,8 @@ def serve(cfg, args, result):
                 argv.extend(["--" + key.replace("_", "-"), str(value)])
         if args.no_cuda_graph:
             argv.append("--no-cuda-graph")
+        if args.no_spec:
+            argv.append("--no-spec")
         record = lease.acquire("serve")
         try:
             with lease.heartbeat(record, cfg.gpu.lease_ttl_sec):

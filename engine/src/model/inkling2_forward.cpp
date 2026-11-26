@@ -278,10 +278,11 @@ void InklingRunner::Impl::RunInkling(const ForwardRunSpec& s, const ForwardOptio
   }
   copy(s.d_block_out, carry, plane * model::kCarryPlanes);
   result.num_block_out = count;
-  if (s.run_lm_head) {
+  if (s.run_lm_head || (s.d_taps_out && s.end_visit == plan.size())) {
     aggregate(carry, count, hidden, FLINT_BF16, w.output_query, 1, attn);
     norm(attn, FLINT_F32, w.final_norm_weight, hidden);
     tap(3);
+    if (!s.run_lm_head) return;
     int rows = s.all_token_logits ? t : 1;
     int vocab = w.config.unpadded_vocab_size;
     // The parity GEMM uses 32-row tiles. Reuse one tile even when all logits

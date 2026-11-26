@@ -26,6 +26,8 @@ pub struct Options {
     pub prefix_cache_slots: Option<u32>,
     #[arg(long, num_args=0..=1, require_equals=true, default_missing_value="true")]
     pub no_cuda_graph: Option<bool>,
+    #[arg(long, num_args=0..=1, require_equals=true, default_missing_value="true")]
+    pub no_spec: Option<bool>,
     #[arg(long)]
     pub default_max_tokens: Option<u32>,
     #[arg(long)]
@@ -43,6 +45,7 @@ pub struct Config {
     pub prefill_chunk_size: u32,
     pub prefix_cache_slots: u32,
     pub use_cuda_graph: bool,
+    pub use_speculative: bool,
     pub default_max_tokens: u32,
     pub request_timeout: Option<Duration>,
     pub log_level: String,
@@ -106,6 +109,7 @@ impl Options {
                 .prefix_cache_slots
                 .or(file.prefix_cache_slots)
                 .unwrap_or(3),
+            use_speculative: !self.no_spec.or(file.no_spec).unwrap_or(false),
             use_cuda_graph: !self.no_cuda_graph.or(file.no_cuda_graph).unwrap_or(false),
             default_max_tokens: self
                 .default_max_tokens
@@ -124,6 +128,6 @@ impl Config {
     pub fn engine_json(&self) -> String {
         json!({"model_dir": self.model_dir, "max_context": self.max_context,
             "prefill_chunk_size": self.prefill_chunk_size, "prefix_cache_slots": self.prefix_cache_slots,
-            "use_cuda_graph": self.use_cuda_graph}).to_string()
+            "use_speculative": self.use_speculative, "use_cuda_graph": self.use_cuda_graph}).to_string()
     }
 }

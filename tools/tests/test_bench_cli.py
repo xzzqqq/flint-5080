@@ -44,6 +44,8 @@ class Endpoint:
                         "max_context": 4096,
                         "prefix_cache_slots": 3,
                         "use_cuda_graph": True,
+                        "use_speculative": True,
+                        "speculative_active": True,
                         "completed_requests": 101,
                     },
                 },
@@ -198,6 +200,8 @@ def test_suites(suite, harness, monkeypatch):
         max_context=4096,
         prefix_cache_slots=3,
         use_cuda_graph=True,
+        use_speculative=True,
+        speculative_active=True,
     )
     assert data["metadata"]["canary_passed"] == (True if "canary" in suites else None)
     if "short" in suites:

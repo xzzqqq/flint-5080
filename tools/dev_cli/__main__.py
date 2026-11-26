@@ -61,6 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
     for flag in ("max-context", "prefill-chunk-size", "prefix-cache-slots", "request-timeout-sec"):
         start.add_argument("--" + flag, type=int)
     start.add_argument("--no-cuda-graph", action="store_true")
+    start.add_argument("--no-spec", action="store_true")
     start.add_argument("--build", action="store_true", help="Rebuild the engine and server first.")
     stop.add_argument("--force", action="store_true")
     logs.add_argument("--lines", type=int, default=100)
