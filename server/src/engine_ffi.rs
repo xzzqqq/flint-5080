@@ -114,6 +114,10 @@ pub use backend::Engine;
 pub type EventReceiver = UnboundedReceiver<Result<Event, EngineError>>;
 
 impl Engine {
+    pub fn max_context(&self) -> Option<u32> {
+        self.max_context
+    }
+
     pub fn submit(&self, req: &Request<'_>) -> Result<(u64, Vec<Event>), EngineError> {
         let (id, mut rx) = self.submit_stream(req)?;
         let mut events = Vec::new();
@@ -153,6 +157,7 @@ mod backend {
     type Handler = dyn Fn(&Request<'_>, UnboundedSender<Result<Event, EngineError>>) + Send + Sync;
 
     pub struct Engine {
+        pub(super) max_context: Option<u32>,
         submitted: AtomicU64,
         cancellations: Mutex<Vec<u64>>,
         handler: Box<Handler>,
@@ -181,10 +186,15 @@ mod backend {
             + 'static,
         ) -> Self {
             Self {
+                max_context: None,
                 submitted: AtomicU64::new(0),
                 cancellations: Mutex::default(),
                 handler: Box::new(handler),
             }
+        }
+        pub fn with_max_context(mut self, max_context: u32) -> Self {
+            self.max_context = Some(max_context);
+            self
         }
         pub fn cancelled_ids(&self) -> Vec<u64> {
             self.cancellations.lock().unwrap().clone()
@@ -304,7 +314,10 @@ mod backend {
         let _ = tx.send(message);
     }
 
-    pub struct Engine(NonNull<EngineHandle>);
+    pub struct Engine {
+        handle: NonNull<EngineHandle>,
+        pub(super) max_context: Option<u32>,
+    }
     // The runtime serializes GPU execution and synchronizes all shared request state.
     // Drop requires exclusive ownership and joins the worker before releasing the handle.
     unsafe impl Send for Engine {}
@@ -322,15 +335,30 @@ mod backend {
                 }
                 let mut err = ptr::null_mut();
                 let h = engine_create(config.as_ptr(), &mut err);
-                NonNull::new(h).map(Self).ok_or_else(|| EngineError {
+                let handle = NonNull::new(h).ok_or_else(|| EngineError {
                     status: EngineStatus::Internal,
                     telemetry: Telemetry::default(),
                     message: take_string(err).unwrap_or_else(|| "engine creation failed".into()),
-                })
+                })?;
+                #[derive(serde::Deserialize)]
+                struct Limits {
+                    max_context: u32,
+                }
+                let mut engine = Self {
+                    handle,
+                    max_context: None,
+                };
+                engine.max_context = engine
+                    .stats_json()
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<Limits>(&s).ok())
+                    .map(|limits| limits.max_context)
+                    .filter(|&n| n > 0);
+                Ok(engine)
             }
         }
         pub fn stats_json(&self) -> Result<String, EngineError> {
-            unsafe { take_string(engine_stats_json(self.0.as_ptr())) }
+            unsafe { take_string(engine_stats_json(self.handle.as_ptr())) }
                 .ok_or_else(|| EngineError::new(EngineStatus::Internal, "engine stats unavailable"))
         }
         pub fn submit_stream(
@@ -351,7 +379,7 @@ mod backend {
             let state = Box::into_raw(Box::new(tx));
             let id = unsafe {
                 engine_submit(
-                    self.0.as_ptr(),
+                    self.handle.as_ptr(),
                     &params,
                     req.token_ids.as_ptr(),
                     req.token_ids.len(),
@@ -371,12 +399,12 @@ mod backend {
             Ok((id, rx))
         }
         pub fn cancel(&self, id: u64) {
-            unsafe { engine_cancel(self.0.as_ptr(), id) }
+            unsafe { engine_cancel(self.handle.as_ptr(), id) }
         }
     }
     impl Drop for Engine {
         fn drop(&mut self) {
-            unsafe { engine_destroy(self.0.as_ptr()) }
+            unsafe { engine_destroy(self.handle.as_ptr()) }
         }
     }
 }

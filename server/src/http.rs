@@ -125,7 +125,11 @@ struct ChatRequest {
     n: Option<u32>,
 }
 impl ChatRequest {
-    fn generation(self, cfg: &Config) -> Result<GenerationRequest, GenerationError> {
+    fn generation(
+        self,
+        cfg: &Config,
+        call_id_prefix: String,
+    ) -> Result<GenerationRequest, GenerationError> {
         if self.model.as_ref().is_some_and(|m| m.trim().is_empty())
             || self.n.is_some_and(|n| n != 1)
         {
@@ -143,6 +147,7 @@ impl ChatRequest {
             return Err(GenerationError::Validation("invalid tool_choice".into()));
         }
         Ok(GenerationRequest {
+            call_id_prefix,
             messages: self.messages,
             tools: self.tools,
             tool_choice: self.tool_choice,
@@ -308,11 +313,9 @@ async fn chat(State(s): State<Arc<AppState>>, request: Request) -> Response {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
+    let seq = SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let mut completion = Completion {
-        id: format!(
-            "chatcmpl-{created}-{}",
-            SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ),
+        id: format!("chatcmpl-{created}-{seq}"),
         created,
         model: s.config.model_name.clone(),
         streaming: false,
@@ -331,7 +334,7 @@ async fn chat(State(s): State<Arc<AppState>>, request: Request) -> Response {
             .stream_options
             .as_ref()
             .is_some_and(|o| o.include_usage);
-        let req = body.generation(&s.config)?;
+        let req = body.generation(&s.config, format!("call_{created}_{seq}"))?;
         let (_, stream) = start_generation(
             s.engine.clone(),
             s.tokenizer.clone(),

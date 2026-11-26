@@ -33,8 +33,12 @@ fn state(engine: Engine) -> AppState {
 }
 
 fn script(text: &str) -> AppState {
+    state(script_engine(text))
+}
+
+fn script_engine(text: &str) -> Engine {
     let ids = byte_tokenizer().encode(text).unwrap();
-    state(Engine::with_stub(move |req, tx| {
+    Engine::with_stub(move |req, tx| {
         let mut t = Telemetry {
             prefill_tokens: req.token_ids.len() as u32,
             cached_prefix_tokens: 2,
@@ -47,7 +51,7 @@ fn script(text: &str) -> AppState {
             tx.send(Ok(EngineEvent::Tokens(vec![id], t))).unwrap();
         }
         tx.send(Ok(EngineEvent::Done(t))).unwrap();
-    }))
+    })
 }
 fn chat_request(extra: Value, telemetry: Option<&str>) -> HttpRequest<Body> {
     let mut body = json!({"messages":[{"role":"user","content":"hello"}]});
@@ -167,32 +171,33 @@ async fn parallel_tools_and_length_priority() {
             )
             .await;
             assert_eq!(status, 200);
-            let calls = if stream {
+            let (frame, calls) = if stream {
                 let mut frames = chunks(&body);
-                assert_eq!(
-                    frames.pop().unwrap()["choices"][0]["finish_reason"],
-                    expected
-                );
-                frames
+                let frame = frames.pop().unwrap();
+                let calls = frames
                     .into_iter()
                     .filter_map(|c| {
                         c["choices"][0]["delta"]["tool_calls"]
                             .as_array()
                             .map(|a| a[0].clone())
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                (frame, calls)
             } else {
                 let body: Value = serde_json::from_str(&body).unwrap();
-                assert_eq!(body["choices"][0]["finish_reason"], expected);
-                body["choices"][0]["message"]["tool_calls"]
+                let calls = body["choices"][0]["message"]["tool_calls"]
                     .as_array()
                     .unwrap()
-                    .clone()
+                    .clone();
+                (body, calls)
             };
+            assert_eq!(frame["choices"][0]["finish_reason"], expected);
+            let (_, seq) = frame["id"].as_str().unwrap().rsplit_once('-').unwrap();
+            let created = frame["created"].as_u64().unwrap();
             assert_eq!(calls.len(), 2);
             for (i, call) in calls.iter().enumerate() {
                 assert_eq!(call["type"], "function");
-                assert_eq!(call["id"], format!("call_{i}"));
+                assert_eq!(call["id"], format!("call_{created}_{seq}_{i}"));
                 assert_eq!(call["index"].as_u64(), stream.then_some(i as u64));
             }
             assert_eq!(
@@ -554,4 +559,62 @@ async fn eos_at_token_limit_finishes_with_stop() {
     let body: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(body["choices"][0]["finish_reason"], "stop");
     assert_eq!(body["choices"][0]["message"]["content"], "a");
+}
+
+#[tokio::test]
+async fn tool_call_ids_resolve_across_turns() {
+    let replies = ["lookup", "ping"].map(|name| {
+        let call = format!(
+            r#"<|content_invoke_tool_json|>{{"name":"{name}","args":{{}}}}<|end_message|>"#
+        );
+        byte_tokenizer().encode(&call).unwrap()
+    });
+    let replies = Mutex::new(replies.into_iter());
+    let mut app = state(Engine::with_stub(move |_, tx| {
+        let ids = replies.lock().unwrap().next().unwrap();
+        tx.send(Ok(EngineEvent::Tokens(ids, Telemetry::default())))
+            .unwrap();
+        tx.send(Ok(EngineEvent::Done(Telemetry::default())))
+            .unwrap();
+    }));
+    let golden: Value =
+        serde_json::from_str(include_str!("../../../workloads/chat_golden.json")).unwrap();
+    let template =
+        Arc::new(ChatTemplate::from_str(golden["chat_template"].as_str().unwrap()).unwrap());
+    app.template = template.clone();
+    let router = build_router(Arc::new(app));
+    let mut history = vec![json!({"role":"user","content":"check both"})];
+    let mut ids = Vec::new();
+    for result in ["found", "pong"] {
+        let (status, body) = query(
+            router.clone(),
+            chat_request(json!({"messages":history}), None),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let body: Value = serde_json::from_str(&body).unwrap();
+        let message = &body["choices"][0]["message"];
+        let id = &message["tool_calls"][0]["id"];
+        ids.push(id.as_str().unwrap().to_owned());
+        history.push(message.clone());
+        history.push(json!({"role":"tool","tool_call_id":id,"content":result}));
+    }
+    assert_ne!(ids[0], ids[1]);
+    let prompt = template.render(&history, None, None).unwrap();
+    assert!(prompt.contains("<|message_tool|>lookup<|content_text|>found<|end_message|>"));
+    assert!(prompt.contains("<|message_tool|>ping<|content_text|>pong<|end_message|>"));
+}
+
+#[tokio::test]
+async fn context_window_finish_reason() {
+    // "hello" uses five prompt tokens. The engine omits its sampled stop token.
+    for (reply, reason) in [("ab", "length"), ("a", "stop")] {
+        let router = build_router(Arc::new(state(script_engine(reply).with_max_context(6))));
+        let (status, body) = query(router, chat_request(json!({"max_tokens":10}), None)).await;
+        assert_eq!(status, 200);
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["usage"]["prompt_tokens"], 5);
+        assert_eq!(body["usage"]["completion_tokens"], reply.len());
+        assert_eq!(body["choices"][0]["finish_reason"], reason);
+    }
 }

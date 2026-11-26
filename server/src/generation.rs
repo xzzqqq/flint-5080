@@ -18,6 +18,7 @@ use tokio::time::{Instant, timeout_at};
 use tokio_stream::StreamExt;
 
 pub struct GenerationRequest {
+    pub call_id_prefix: String,
     pub messages: Vec<Value>,
     pub tools: Option<Vec<Value>>,
     pub tool_choice: Option<Value>,
@@ -251,13 +252,19 @@ pub async fn start_generation(
         stop_token_ids: &[tokenizer.special.eos_token_id],
         ignore_eos: false,
     })?;
+    let max_context = engine.max_context();
     let mut guard = CancelGuard::new(engine, id, deadline);
     // Before committing SSE headers, observe the first worker callback so
     // prompt admission errors and prefill timeouts can set the HTTP status.
     let first = receive(&mut rx, deadline, &mut guard).await?;
     let stream = async_stream::try_stream! {
         let mut event = first;
-        let mut parser = ResponseParser::new(tokenizer.special.clone());
+        let prefix = if req.call_id_prefix.is_empty() {
+            "call".into()
+        } else {
+            req.call_id_prefix
+        };
+        let mut parser = ResponseParser::with_id_prefix(tokenizer.special.clone(), prefix);
         let mut decoder = tokenizer.stream_decoder();
         let mut filter = StopFilter { stops: req.stop_strings, pending: String::new(), matched: false };
         let mut calls = false;
@@ -300,9 +307,16 @@ pub async fn start_generation(
         if !filter.pending.is_empty() && !filter.matched {
             yield GenerationEvent::Delta(ParseDelta::Content(filter.pending));
         }
+        // Prefill emits the first output token before decode consumes another context slot.
+        let hit_context_limit = max_context.is_some_and(|limit| {
+            limit > 0
+                && telemetry.decode_tokens > 0
+                && u64::from(telemetry.prefill_tokens) + u64::from(telemetry.decode_tokens)
+                    > u64::from(limit)
+        });
         let finish_reason = if filter.matched {
             FinishReason::Stop
-        } else if !eos && telemetry.decode_tokens >= req.max_tokens {
+        } else if !eos && (telemetry.decode_tokens >= req.max_tokens || hit_context_limit) {
             FinishReason::Length
         } else if calls {
             FinishReason::ToolCalls

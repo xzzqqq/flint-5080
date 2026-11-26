@@ -70,6 +70,7 @@ enum State {
 }
 
 pub struct ResponseParser {
+    id_prefix: String,
     special: SpecialTokens,
     state: State,
     next_index: usize,
@@ -77,7 +78,12 @@ pub struct ResponseParser {
 
 impl ResponseParser {
     pub fn new(special: SpecialTokens) -> Self {
+        Self::with_id_prefix(special, "call")
+    }
+
+    pub fn with_id_prefix(special: SpecialTokens, id_prefix: impl Into<String>) -> Self {
         Self {
+            id_prefix: id_prefix.into(),
             special,
             state: State::Idle,
             next_index: 0,
@@ -150,7 +156,7 @@ impl ResponseParser {
                 let index = self.next_index;
                 Some(ParsedToolCall {
                     index,
-                    id: format!("call_{index}"),
+                    id: format!("{}_{index}", self.id_prefix),
                     name: name.into(),
                     arguments,
                 })
