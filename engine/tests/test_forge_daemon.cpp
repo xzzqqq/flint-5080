@@ -41,10 +41,22 @@ struct Fixture {
     }
     fs::remove_all(root);
   }
-  void Launch(const char* host, const char* forward) {
+  void Shutdown() {
+    Call({{"command", "shutdown"}});
+    int code;
+    Require(waitpid(pid, &code, 0) == pid, "waitpid");
+    pid = -1;
+    Require(WIFEXITED(code) && !WEXITSTATUS(code) && !fs::exists(socket), "clean shutdown");
+  }
+  void Launch(const char* host, const char* forward, const char* model = nullptr) {
     pid = fork();
     Require(pid >= 0, "fork");
     if (!pid) {
+      if (model) {
+        execl(host, host, "--daemon", "--socket", socket.c_str(), "--state-dir", root.c_str(),
+              "--baseline", forward, "--model-dir", model, "--kv-seq-len", "32", nullptr);
+        _exit(127);
+      }
       execl(host, host, "--daemon", "--socket", socket.c_str(), "--state-dir", root.c_str(),
             "--baseline", forward, "--no-model", "--golden-dir", root.c_str(), nullptr);
       _exit(127);
@@ -60,7 +72,7 @@ struct Fixture {
     std::strcpy(addr.sun_path, socket.c_str());
     for (unsigned i = 0; connect(client.fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
          ++i) {
-      Require(i < 500, "socket startup timed out");
+      Require(i < 9000, "socket startup timed out");
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     std::string line = Encode(q) + "\n";
@@ -78,11 +90,37 @@ struct Fixture {
     if (parsed.as<Object>().contains("vram_loss_bytes")) {
       Require(parsed.at("vram_loss_bytes").number<size_t>() <= (4u << 20), "VRAM leak");
       Require(!parsed.at("vram_leak_warn").as<bool>(), "VRAM warning");
-      Require(parsed.at("numerical_error").at("exact_match").as<bool>(), "replay mismatch");
+      if (q.at("command").as<std::string>() != "kld")
+        Require(parsed.at("numerical_error").at("exact_match").as<bool>(), "replay mismatch");
     }
     return parsed;
   }
 };
+
+void TestKld() {
+  KldAccumulator metrics;
+  std::array<float, 4> logits{3, 1, 0, 0};
+  AccumulateKld(logits, logits, 2, metrics);
+  auto s = metrics.Summary();
+  Require(s.num_positions == 2 && s.top1_matches == 2 && s.mean_kl == 0 && s.p95_kl == 0 &&
+              s.max_kl == 0 && s.max_abs_logit_diff == 0,
+          "identical KLD");
+
+  // Uniform reference, candidate probabilities proportional to [1, e^2].
+  std::array<float, 2> ref{5000, 5000}, cand{-3000, -2998};
+  AccumulateKld(ref, cand, 2, metrics);
+  s = metrics.Summary();
+  double expected = std::log(std::cosh(1.0));
+  Require(std::abs(s.mean_kl - expected / 3) < 1e-12 && std::abs(s.p95_kl - expected) < 1e-12 &&
+              s.p95_kl == s.max_kl && s.top1_matches == 2 && s.max_abs_logit_diff == 8000,
+          "shifted asymmetric KLD");
+
+  float extreme = std::numeric_limits<float>::max();
+  ref = {extreme, -extreme};
+  cand = {-extreme, extreme};
+  AccumulateKld(ref, cand, 2, metrics);
+  Require(metrics.Summary().max_kl == 2.0 * extreme, "extreme finite KLD");
+}
 
 void TestStateError() {
   PostState ref{2, {0x3f80}, {}};
@@ -149,6 +187,28 @@ void TestDecodeGolden(Fixture& f, Object q, int first_token) {
           "decode top64 golden");
 }
 
+void TestKldRpc(const char* host, const char* forward, const char* model) {
+  Fixture f;
+  f.Launch(host, forward, model);
+  Array cases{Object{{"name", "tail"}, {"token_ids", Array{1, 2, 3, 4, 5}}, {"eval_start", 1}},
+              Object{{"name", "prompt"}, {"token_ids", Array{42, 43}}, {"eval_start", 0}}};
+  auto reply = f.Call({{"command", "kld"},
+                       {"so_ref", forward},
+                       {"so_cand", forward},
+                       {"chunk_size", 2},
+                       {"cases", std::move(cases)}});
+  const auto& rows = reply.at("cases").as<Array>();
+  Require(rows.size() == 2 && rows[0].at("num_positions").number<int>() == 4 &&
+              rows[1].at("num_positions").number<int>() == 2,
+          "KLD chunk boundaries");
+  Require(reply.at("num_positions").number<int>() == 6 &&
+              reply.at("top1_match_rate").number<double>() == 1,
+          "KLD position agreement");
+  for (auto key : {"mean_kl", "p95_kl", "max_kl", "max_abs_logit_diff", "unload_loss_bytes"})
+    Require(reply.at(key).number<double>() == 0, key);
+  Require(fs::is_empty(f.root / "loaded"), "leftover KLD DSO");
+  f.Shutdown();
+}
 void Test(const char* host, const char* forward) {
   Fixture f;
   f.Launch(host, forward);
@@ -229,16 +289,17 @@ void Test(const char* host, const char* forward) {
   Require(std::any_of(kv.begin(), kv.end(), [](auto v) { return v != std::byte{}; }),
           "empty decode state");
   Require(fs::is_empty(f.root / "loaded"), "leftover DSO");
-  f.Call({{"command", "shutdown"}});
-  int code;
-  Require(waitpid(f.pid, &code, 0) == f.pid, "waitpid");
-  f.pid = -1;
-  Require(WIFEXITED(code) && !WEXITSTATUS(code) && !fs::exists(f.socket), "clean shutdown");
+  f.Shutdown();
 }
 }  // namespace
 int main(int argc, char** argv) {
   try {
+    if (argc == 4) {
+      TestKldRpc(argv[1], argv[2], argv[3]);
+      return 0;
+    }
     Require(argc == 3, "expected host and forward paths");
+    TestKld();
     TestStateError();
     Test(argv[1], argv[2]);
     return 0;

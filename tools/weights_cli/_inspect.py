@@ -60,21 +60,26 @@ def add(bucket, nbytes):
     bucket["bytes"] += nbytes
 
 
+def read_header(stream, size, file):
+    prefix = stream.read(8)
+    if len(prefix) != 8:
+        raise ValueError(f"{file}: truncated safetensors length")
+    length = struct.unpack("<Q", prefix)[0]
+    if not 0 < length <= min(size - 8, 100_000_000):
+        raise ValueError(f"{file}: invalid safetensors header length {length}")
+    try:
+        header = json.loads(stream.read(length))
+    except ValueError as exc:
+        raise ValueError(f"{file}: invalid safetensors JSON header") from exc
+    if not isinstance(header, dict):
+        raise ValueError(f"{file}: expected safetensors header object")
+    return header, length
+
+
 def read_safetensors(path, file):
     size = path.stat().st_size
     with path.open("rb") as stream:
-        prefix = stream.read(8)
-        if len(prefix) != 8:
-            raise ValueError(f"{file}: truncated safetensors length")
-        length = struct.unpack("<Q", prefix)[0]
-        if not 0 < length <= min(size - 8, 100_000_000):
-            raise ValueError(f"{file}: invalid safetensors header length {length}")
-        try:
-            header = json.loads(stream.read(length))
-        except ValueError as exc:
-            raise ValueError(f"{file}: invalid safetensors JSON header") from exc
-    if not isinstance(header, dict):
-        raise ValueError(f"{file}: expected safetensors header object")
+        header, length = read_header(stream, size, file)
     metadata = header.pop("__metadata__", {})
     if not isinstance(metadata, dict) or not all(isinstance(v, str) for v in metadata.values()):
         raise ValueError(f"{file}: invalid __metadata__")

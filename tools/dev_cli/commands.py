@@ -322,7 +322,13 @@ def _gpu_check_commands(model_dir, golden_dir):
             golden("-f", golden_dir / "mtp_golden.safetensors"),
             shlex.join(["engine/build/mtp_tests", str(model_dir), str(golden_dir)]),
         ],
-        "forge-host": [build("-x", "engine/build/forge-host"), "engine/build/forge-host --smoke"],
+        "forge-host": [
+            build("-x", "engine/build/forge-host"),
+            "engine/build/forge-host --smoke || exit 1",
+            shlex.join(
+                ["engine/build/forge_tests", "engine/build/forge-host", forward, str(model_dir)]
+            ),
+        ],
         "server": [
             "set -e",
             'server="server/target/${CARGO_BUILD_TARGET:+$CARGO_BUILD_TARGET/}release/server"',

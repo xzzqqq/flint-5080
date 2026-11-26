@@ -15,6 +15,19 @@ namespace flint {
 inline constexpr double kRtx5080PeakBandwidthGbs = 960.0;
 inline constexpr double kRtx5080SolDivisor = kRtx5080PeakBandwidthGbs / 100.0;
 
+struct KldSummary {
+  size_t num_positions, top1_matches;
+  double mean_kl, p95_kl, max_kl, max_abs_logit_diff;
+};
+struct KldAccumulator {
+  std::vector<double> position_kl;
+  size_t top1_matches{};
+  double max_abs_logit_diff{};
+  [[nodiscard]] KldSummary Summary() const;
+};
+void AccumulateKld(std::span<const float> ref_logits, std::span<const float> cand_logits,
+                   size_t vocab, KldAccumulator& accumulator);
+
 struct StateSlice {
   size_t offset;
   KvSliceKind kind;

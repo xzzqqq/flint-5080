@@ -20,6 +20,8 @@ namespace flint {
 namespace fs = std::filesystem;
 namespace {
 
+constexpr unsigned kLogitRows = 8;
+
 size_t FreeBytes() {
   size_t free, total;
   CheckCuda(cudaMemGetInfo(&free, &total));
@@ -71,13 +73,13 @@ Replay::Replay(DaemonConfig cfg) : config_(std::move(cfg)) {
   size_t elements = size_t(capacity_) * width_;
   auto hidden_bytes = elements * sizeof(uint16_t);
   io_.emplace(ScratchArena::Allocate((2 + model::kCarryPlanes + (draft ? 4 : 0)) * hidden_bytes +
-                                     vocab_ * sizeof(float) +
-                                     (capacity_ + (draft ? 8 : 1)) * sizeof(int)));
+                                     kLogitRows * vocab_ * sizeof(float) +
+                                     (capacity_ + kLogitRows) * sizeof(int)));
   hidden_ = static_cast<uint16_t*>(io_->view().device_ptr);
   out_ = hidden_ + elements;
   carry_ = out_ + elements;
   logits_ = reinterpret_cast<float*>(carry_ + model::kCarryPlanes * elements);
-  taps_ = reinterpret_cast<uint16_t*>(logits_ + vocab_);
+  taps_ = reinterpret_cast<uint16_t*>(logits_ + kLogitRows * vocab_);
   ids_ = reinterpret_cast<int*>(taps_ + (draft ? 4 * elements : 0));
   next_ = ids_ + capacity_;
   for (auto dir : {"candidates", "loaded"}) fs::create_directories(config_.state_dir / dir);
@@ -219,18 +221,19 @@ void Replay::Restore(const Recording& r) {
 Object Replay::Request(const Json& q) {
   const auto cmd = q.at("command").as<std::string>();
   if (cmd == "status") return Status();
-  if (cmd != "run" && cmd != "profile" && cmd != "dump" && cmd != "ab")
+  if (cmd != "run" && cmd != "profile" && cmd != "dump" && cmd != "ab" && cmd != "kld")
     throw std::runtime_error("unknown command");
   const auto before = FreeBytes();
   Object reply;
   try {
-    reply = Measure(q, cmd);
+    reply = cmd == "kld" ? Kld(q) : Measure(q, cmd);
   } catch (const std::exception& e) {
     reply["error"] = e.what();
   }
   CheckCuda(cudaDeviceSynchronize());
   const auto after = FreeBytes();
   const size_t loss = before > after ? before - after : 0;
+  if (cmd == "kld") reply["unload_loss_bytes"] = loss;
   reply["vram_loss_bytes"] = loss;
   reply["vram_leak_warn"] = loss > (4u << 20);
   if (loss > (4u << 20)) {
@@ -238,6 +241,92 @@ Object Replay::Request(const Json& q) {
     std::cerr << warning << '\n';
     reply["warning"] = warning;
   }
+  return reply;
+}
+Object Replay::Kld(const Json& q) {
+  using Clock = std::chrono::steady_clock;
+  const auto start = Clock::now();
+  if (!weights_) throw std::runtime_error("KLD requires a loaded model");
+  const unsigned limit = std::min(capacity_, kLogitRows);
+  const auto chunk = Count(q, "chunk_size", limit, 1, limit);
+  ForwardOptions options{.use_cuda_graph = q.get("use_cuda_graph", false), .return_logits = 1};
+  struct Case {
+    std::string name;
+    std::vector<int> ids;
+    unsigned eval_start;
+    std::vector<float> reference;
+    KldAccumulator metrics;
+  };
+  std::vector<Case> cases;
+  for (const auto& item : q.at("cases").as<Array>()) {
+    Case c{item.at("name").as<std::string>(), {}, item.at("eval_start").number<unsigned>(), {}, {}};
+    for (const auto& id : item.at("token_ids").as<Array>()) {
+      int token = id.number<int>();
+      if (token < 0 || unsigned(token) >= model_config_.vocab_size)
+        throw std::invalid_argument("invalid KLD token id");
+      c.ids.push_back(token);
+    }
+    if (c.ids.size() > config_.kv_seq_len || c.eval_start >= c.ids.size())
+      throw std::invalid_argument("invalid KLD sequence length or eval_start");
+    cases.push_back(std::move(c));
+  }
+  if (cases.empty()) throw std::invalid_argument("KLD requires cases");
+  auto ref = q.at("so_ref").as<std::string>(), cand = q.at("so_cand").as<std::string>();
+  // Load each DSO once. Only evaluated reference rows survive the module switch.
+  for (bool reference : {true, false}) {
+    auto module = Load(reference ? ref : cand);
+    for (auto& c : cases) {
+      if (reference) c.reference.resize((c.ids.size() - c.eval_start) * vocab_);
+      kv_->Reset(stream_);
+      for (unsigned pos = 0; pos < c.ids.size();) {
+        unsigned rows = std::min<size_t>(chunk, c.ids.size() - pos);
+        CheckCuda(cudaMemcpyAsync(ids_, c.ids.data() + pos, rows * sizeof(int),
+                                  cudaMemcpyHostToDevice, stream_));
+        auto spec = Spec(0, model::kNumLogicalVisits, rows, pos, true, true);
+        spec.all_token_logits = 1;
+        module->Run(spec, options);
+        unsigned first = std::max(pos, c.eval_start);
+        if (first < pos + rows) {
+          auto values = std::span(c.reference)
+                            .subspan(size_t(first - c.eval_start) * vocab_,
+                                     size_t(pos + rows - first) * vocab_);
+          const float* src = logits_ + size_t(first - pos) * vocab_;
+          if (reference)
+            CheckCuda(cudaMemcpy(values.data(), src, values.size_bytes(), cudaMemcpyDeviceToHost));
+          else
+            AccumulateKld(values, Read(src, values.size()), vocab_, c.metrics);
+        }
+        pos += rows;
+      }
+      if (!reference) std::vector<float>().swap(c.reference);
+    }
+  }
+  auto report = [](const KldSummary& s) -> Object {
+    return {{"num_positions", s.num_positions},
+            {"mean_kl", s.mean_kl},
+            {"p95_kl", s.p95_kl},
+            {"max_kl", s.max_kl},
+            {"top1_match_rate", double(s.top1_matches) / s.num_positions},
+            {"max_abs_logit_diff", s.max_abs_logit_diff}};
+  };
+  Array per_case;
+  KldAccumulator total;
+  for (const auto& c : cases) {
+    auto row = report(c.metrics.Summary());
+    row["name"] = c.name;
+    row["eval_start"] = c.eval_start;
+    per_case.emplace_back(std::move(row));
+    total.position_kl.insert(total.position_kl.end(), c.metrics.position_kl.begin(),
+                             c.metrics.position_kl.end());
+    total.top1_matches += c.metrics.top1_matches;
+    total.max_abs_logit_diff = std::max(total.max_abs_logit_diff, c.metrics.max_abs_logit_diff);
+  }
+  auto reply = report(total.Summary());
+  reply["ref"] = ref;
+  reply["cand"] = cand;
+  reply["chunk_size"] = chunk;
+  reply["cases"] = std::move(per_case);
+  reply["elapsed_ms"] = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
   return reply;
 }
 Replay::Measurement Replay::ParseMeasurement(const Json& q, const std::string& cmd) const {

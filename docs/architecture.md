@@ -199,7 +199,9 @@ char* engine_stats_json(EngineHandle* h); // 返回 JSON 快照供 /ready 与 P1
 | **`dev`** | 纯 stdlib | 工程骨架与服务运维：`status`（5080 占用/温度/显存/同步状态）、`build`（`--engine`/`--server`/`--all`）、`serve`（`start`/`stop`/`status`/`logs`，执行机通过 `/ready` 确认启动并在 `.serve/` 维护进程状态和日志）、`check`（`--local` 本地检查；`--gpu` 持锁运行 CTest、真实权重的算子和端到端 golden 检查，以及 forge-host 和 server 的 smoke 检查）、`ssh`（逃生舱）。 |
 | **`forge`** | 纯 stdlib | 驱动远端/本机 `forge-host` 的全部调优原语（`start/stop/status/run/ab/profile/dump/ls/rm`）。 |
 | **`bench`** | 轻量异步 HTTP & 统计 | 纯黑盒 HTTP 压测器（支持 `--url` 测自研或任意 OpenAI 兼容竞品）：固定 coding-agent trace、TTFT、Canary 回归、paired geometric mean + bootstrap CI 报表。以服务端计时为主、客户端校准为辅。 |
-| **`weights`** | 纯 stdlib 前端；离线生成子进程通过 `weights.python` 指向独立 PyTorch 环境 | 低频离线权重与参考对齐：`inspect`、`repack`（输出 `safetensors`）、`golden`（持单卡 lease 生成算子与 48 逻辑步 prefill/decode 黄金夹具，详见 [model.md](model.md)）、`kld`（调用常驻引擎做 teacher-forcing KLD 评测）。 |
+| **`weights`** | 纯 stdlib 前端；离线生成子进程通过 `weights.python` 指向独立 PyTorch 环境 | 低频离线权重与参考对齐：`inspect`、`repack`（输出 `safetensors`）、`golden`（持单卡 lease 生成算子与 48 逻辑步 prefill/decode 黄金夹具，详见 [model.md](model.md)）、`kld`（复用已加载模型的 forge-host；空闲时按需启动并在评测后释放 lease）。 |
+
+`weights kld` 在执行机读取 golden 的 prompt 和生成序列，从最后一个 prompt token 开始比较下一 token 的完整分布。缺少对应 fixture 时评测全部 prompt 位置。forge-host 为每个模块和用例重置 KV，每批最多 8 行；只在主机保留所选位置的 FP32 参考 logits。每个模块加载一次，按位置以 FP64 计算 KL(ref ‖ cand)，汇总均值、最近秩 p95、最大值、top-1 一致率和最大 logit 绝对差。`baseline` 是 forge 启动时的 forward 快照；跨会话对比使用已保存的候选名称。
 
 ---
 

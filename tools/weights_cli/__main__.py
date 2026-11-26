@@ -6,6 +6,7 @@ from pathlib import Path
 
 from tools.common.config import find_repo_root, load_config
 from tools.common.output import RunResult, emit_result
+from tools.forge_cli.__main__ import candidate, positive
 
 from . import commands
 
@@ -36,6 +37,16 @@ def build_parser():
     golden.add_argument("--skip-ops", action="store_true")
     golden.add_argument("--skip-e2e", action="store_true")
     golden.add_argument("--skip-mtp", action="store_true")
+    kld = subs.add_parser("kld", help="Compare teacher-forced logits through forge-host.")
+    kld.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help=json_help)
+    kld.add_argument("--ref", type=candidate, default="baseline")
+    kld.add_argument("--cand", type=candidate, default="current")
+    kld.add_argument("--case", action="append", default=[], help="Select a named golden case.")
+    kld.add_argument("--all-positions", action="store_true", help="Include prompt positions.")
+    kld.add_argument("--chunk-size", type=positive, help="Teacher-forcing rows per forward (1–8).")
+    kld.add_argument("--no-build", action="store_true")
+    kld.add_argument("--local", action="store_true", help="Run on this host.")
+    kld.add_argument("--path", help="Checkpoint directory on the execution host.")
     chat = subs.add_parser("chat-golden", help="Generate offline HF chat and tokenizer references.")
     chat.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help=json_help)
     chat.add_argument("--local", action="store_true", help="Run on this host.")

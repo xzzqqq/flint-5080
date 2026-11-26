@@ -54,6 +54,7 @@ class Replay {
   SpecRound RunSpecRound(ForwardModule&, int anchor, const uint16_t* last, unsigned position,
                          bool profile);
   Object MeasureSpeculative(const Json&, const std::string&, const Measurement&);
+  Object Kld(const Json& request);
   Object Measure(const Json& request, const std::string& command);
   [[nodiscard]] std::optional<ForwardModule> Load(const std::filesystem::path& path);
   Recording Record(const std::vector<int>& ids, unsigned begin, unsigned end, unsigned step);

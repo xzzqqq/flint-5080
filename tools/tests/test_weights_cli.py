@@ -300,3 +300,150 @@ def test_module_quantization_metadata():
     assert data["bpw"] == [6.02] and data["group_sizes"] == [32]
     assert data["bits"] == [6] and data["counts_by_codebook"] == {"mul1": 1}
     assert data["raw_examples"]["modules"]["0.self_attn.k_proj.linear"]["bits"] == 6
+
+
+def test_kld_parser():
+    parse = cli.build_parser().parse_args
+    args = parse(["kld"])
+    assert (args.ref, args.cand, args.case, args.chunk_size) == ("baseline", "current", [], None)
+    assert not any((args.local, args.json, args.all_positions, args.no_build))
+    args = parse(
+        [
+            "--json",
+            "kld",
+            "--ref",
+            "v1",
+            "--cand",
+            "v2",
+            "--path",
+            "model",
+            "--case",
+            "math",
+            "--case",
+            "code",
+            "--chunk-size",
+            "3",
+            "--all-positions",
+            "--no-build",
+            "--local",
+        ]
+    )
+    assert args.json and args.all_positions and args.no_build and args.local
+    assert (args.ref, args.cand, args.path, args.chunk_size, args.case) == (
+        "v1",
+        "v2",
+        "model",
+        3,
+        ["math", "code"],
+    )
+    with pytest.raises(SystemExit):
+        parse(["kld", "--ref", "../candidate"])
+
+
+def test_kld_sequences(tmp_path):
+    from tools.weights_cli._kld import sequences
+
+    cases = [dict(name="a", input_ids=[20]), dict(name="b", input_ids=[30, 40])]
+    path = tmp_path / "e2e_a.safetensors"
+    write_weights(
+        path, [("generated_ids", "I32", [3]), ("unused", "F16", [2]), ("input_ids", "I32", [2])]
+    )
+    with path.open("r+b") as stream:
+        stream.seek(-24, 2)
+        stream.write(struct.pack("<6i", 3, 4, 5, 999, 1, 2))
+    assert sequences(tmp_path, cases, [], False) == [
+        dict(name="a", token_ids=[1, 2, 3, 4], eval_start=1),
+        dict(name="b", token_ids=[30, 40], eval_start=0),
+    ]
+    assert sequences(tmp_path, cases, ["a"], True) == [
+        dict(name="a", token_ids=[1, 2, 3, 4], eval_start=0)
+    ]
+    with pytest.raises(ValueError, match="Unknown workload"):
+        sequences(tmp_path, cases, ["absent"], False)
+    path.write_bytes(path.read_bytes()[:-1])
+    with pytest.raises(ValueError, match="invalid input_ids"):
+        sequences(tmp_path, cases, [], False)
+
+
+@pytest.mark.parametrize(
+    ("resident", "flags", "build", "failure"),
+    [
+        (True, [], True, False),
+        (True, ["--no-build"], False, False),
+        (True, ["--cand", "saved"], False, False),
+        (False, [], False, False),
+        (False, ["--no-build"], False, True),
+        (True, [], True, True),
+    ],
+)
+def test_kld_lifecycle(cfg, resident, flags, build, failure):
+    args = cli.build_parser().parse_args(["kld", "--local", "--path", "model", *flags])
+    cases = [dict(name="a", token_ids=[1, 2, 3], eval_start=1)]
+    result = RunResult("weights kld", True, {})
+    calls = []
+
+    def host_call(ex, op, payload):
+        calls.append(op)
+        if op == "status":
+            return dict(running=resident, weights_bytes=12, model_dir="model")
+        if op == "kld":
+            assert payload["cases"] == cases
+            assert payload["so_ref"] == ".forge/candidates/baseline.so"
+            if failure:
+                raise RuntimeError("bad candidate")
+            return {"num_positions": 2}
+        assert op == "stop"
+
+    with (
+        patch.object(commands.forge, "host_call", side_effect=host_call),
+        patch.object(commands, "Executor") as executor,
+        patch.object(commands.forge, "start") as start,
+        patch.object(commands.forge, "build") as rebuild,
+    ):
+        executor.return_value.run.return_value.stdout = json.dumps(cases)
+        if failure:
+            with pytest.raises(RuntimeError, match="bad candidate"):
+                commands.kld(cfg, args, result)
+        else:
+            commands.kld(cfg, args, result)
+            assert result.data == {"num_positions": 2, "resident": resident}
+        assert calls == (["status", "kld"] if resident else ["status", "kld", "stop"])
+        assert rebuild.called is build
+        if build:
+            assert rebuild.call_args.args[-1] == ["forward"]
+        assert start.called is not resident
+        if not resident:
+            options = start.call_args.args[1]
+            assert options.kv_seq_len == 3 and options.no_build == args.no_build
+
+
+def test_kld_rejects_no_model(cfg):
+    args = cli.build_parser().parse_args(["kld", "--local"])
+    with patch.object(
+        commands.forge, "host_call", return_value=dict(running=True, weights_bytes=0)
+    ):
+        with pytest.raises(ValueError, match="--no-model"):
+            commands.kld(cfg, args, RunResult("weights kld", True, {}))
+
+
+def test_kld_human_format():
+    metrics = dict(
+        num_positions=3, mean_kl=0, p95_kl=0, max_kl=0, top1_match_rate=1, max_abs_logit_diff=0
+    )
+    data = dict(
+        metrics,
+        ref="baseline",
+        cand="current",
+        elapsed_ms=42,
+        unload_loss_bytes=0,
+        cases=[dict(metrics, name="math")],
+    )
+    out = commands.human_format(RunResult("weights kld", True, data))
+    for field in (
+        "baseline → current",
+        "math: 3 positions",
+        "total: 3 positions",
+        "top-1 100.00%",
+        "unload loss 0 B",
+    ):
+        assert field in out

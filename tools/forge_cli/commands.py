@@ -37,7 +37,7 @@ def build(cfg, executor, data, targets):
     data["build_ms"] = out.duration_ms
 
 
-def start(cfg, args, ex, lease, data):
+def start(cfg, args, ex, lease, data, *, transient=False):
     if not args.no_build:
         build(cfg, ex, data, ["forge-host", "stub_forward" if args.no_model else "forward"])
     else:
@@ -81,7 +81,7 @@ def start(cfg, args, ex, lease, data):
     except BaseException:
         lease.release_unbound(record.token)
         raise
-    if cfg.is_remote:
+    if cfg.is_remote and not transient:
         atomic_json(
             cfg.repo_root / ".forge/daemon.json",
             {

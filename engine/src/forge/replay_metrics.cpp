@@ -5,6 +5,7 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <numeric>
 
 #include "loader/safetensors.h"
 
@@ -68,6 +69,47 @@ Object TopLogits(const SafetensorsFile& file, const std::string& phase,
   return diff;
 }
 }  // namespace
+
+KldSummary KldAccumulator::Summary() const {
+  auto sorted = position_kl;
+  if (sorted.empty()) throw std::invalid_argument("no KLD positions");
+  std::ranges::sort(sorted);
+  auto n = sorted.size();
+  return {n,
+          top1_matches,
+          std::accumulate(sorted.begin(), sorted.end(), 0.0) / n,
+          sorted[n - 1 - n / 20],
+          sorted.back(),
+          max_abs_logit_diff};
+}
+
+void AccumulateKld(std::span<const float> ref_logits, std::span<const float> cand_logits,
+                   size_t vocab, KldAccumulator& accumulator) {
+  if (!vocab || ref_logits.size() != cand_logits.size() || ref_logits.size() % vocab)
+    throw std::invalid_argument("incompatible KLD logits shapes");
+  for (size_t pos = 0; pos < ref_logits.size(); pos += vocab) {
+    auto ref = ref_logits.subspan(pos, vocab), cand = cand_logits.subspan(pos, vocab);
+    auto r = std::ranges::max_element(ref), c = std::ranges::max_element(cand);
+    const double rmax = *r, cmax = *c;
+    double rsum = 0, csum = 0;
+    for (size_t i = 0; i < vocab; ++i) {
+      if (!std::isfinite(ref[i]) || !std::isfinite(cand[i]))
+        throw std::invalid_argument("nonfinite KLD logit");
+      accumulator.max_abs_logit_diff =
+          std::max(accumulator.max_abs_logit_diff, std::abs(double(ref[i]) - cand[i]));
+      rsum += std::exp(ref[i] - rmax);
+      csum += std::exp(cand[i] - cmax);
+    }
+    const double rnorm = std::log(rsum), cnorm = std::log(csum);
+    double kl = 0;
+    for (size_t i = 0; i < vocab; ++i) {
+      double log_p = (ref[i] - rmax) - rnorm, log_q = (cand[i] - cmax) - cnorm;
+      kl += std::exp(log_p) * (log_p - log_q);
+    }
+    accumulator.position_kl.push_back(std::max(0.0, kl));
+    accumulator.top1_matches += (r - ref.begin() == c - cand.begin());
+  }
+}
 
 Object ComputeDiff(std::span<const float> a, std::span<const float> b) {
   if (a.empty() || a.size() != b.size()) throw std::runtime_error("incompatible comparison shapes");
