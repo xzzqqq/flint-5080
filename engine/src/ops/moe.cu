@@ -36,6 +36,38 @@ __global__ void Route(RouterParams p) {
     p.weights[t * 8 + i] = sigmoid[ids[i]] / (total + 1e-20f) * 8.f;
   }
 }
+__global__ void GroupTokens(MoeGroupParams p) {
+  __shared__ int counts[128], cursor[128], first_tile[128];
+  int e = threadIdx.x, slots = p.tokens * 8;
+  counts[e] = 0;
+  __syncthreads();
+  for (int s = e; s < slots; s += 128) atomicAdd(&counts[p.ids[s]], 1);
+  __syncthreads();
+  if (e == 0) {
+    int row = 0, tile = 0;
+    for (int i = 0; i < 128; ++i) {
+      cursor[i] = row;
+      first_tile[i] = tile;
+      row += counts[i];
+      tile += (counts[i] + p.tile_rows - 1) / p.tile_rows;
+    }
+    *p.num_tiles = tile;
+  }
+  __syncthreads();
+  int begin = cursor[e], end = begin + counts[e], tile = first_tile[e];
+  for (int row = begin; row < end; row += p.tile_rows, ++tile) {
+    p.tile_expert[tile] = e;
+    p.tile_begin[tile] = row;
+    p.tile_end[tile] = min(row + p.tile_rows, end);
+  }
+  __syncthreads();
+  for (int s = e; s < slots; s += 128) {
+    int expert = p.ids[s], row = atomicAdd(&cursor[expert], 1);
+    p.grouped_expert[row] = expert;
+    p.grouped_token[row] = s / 8;
+    p.slot_to_grouped[s] = row;
+  }
+}
 __global__ void Swiglu(SwigluParams p) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= p.rows * p.width) return;
@@ -62,14 +94,20 @@ __global__ void Accum(AccumParams p) {
     float sum = 0;
     for (int order = 0; order < 8; ++order) {
       int slot = t * 8 + slots[order];
+      int row = p.row_map ? p.row_map[slot] : slot;
       float x =
-          __bfloat162float(static_cast<const B*>(p.expert_outputs)[size_t(slot) * p.width + c]);
+          __bfloat162float(static_cast<const B*>(p.expert_outputs)[size_t(row) * p.width + c]);
       sum = __fadd_rn(sum, __fmul_rn(x, p.weights[slot]));
     }
     static_cast<B*>(p.y)[size_t(t) * p.width + c] = __float2bfloat16_rn(sum);
   }
 }
 }  // namespace
+int flint_moe_group_tokens(MoeGroupParams p, void* s) {
+  if (p.tokens <= 0 || p.tile_rows <= 0) return cudaErrorInvalidValue;
+  GroupTokens<<<1, 128, 0, static_cast<cudaStream_t>(s)>>>(p);
+  return cudaGetLastError();
+}
 int flint_moe_router_top8(RouterParams p, void* s) {
   Route<<<p.tokens, 128, 0, static_cast<cudaStream_t>(s)>>>(p);
   return cudaGetLastError();

@@ -6,12 +6,12 @@
 namespace {
 // Phase 1 reference parity: preserve the 12-way split-K and 4x32 WHT reduction order.
 constexpr int kExpertKSplits = 12;
-__device__ float Read(const void* x, int i, FlintType type) {
+__device__ float Read(const void* x, size_t i, FlintType type) {
   if (type == FLINT_F32) return static_cast<const float*>(x)[i];
   if (type == FLINT_F16) return __half2float(static_cast<const __half*>(x)[i]);
   return __bfloat162float(static_cast<const __nv_bfloat16*>(x)[i]);
 }
-__device__ void Write(void* y, int i, float v, FlintType type) {
+__device__ void Write(void* y, size_t i, float v, FlintType type) {
   if (type == FLINT_F32)
     static_cast<float*>(y)[i] = v;
   else if (type == FLINT_F16)
@@ -40,6 +40,20 @@ __global__ void Decode(DecodeParams p) {
   static_cast<__half*>(p.inner)[r * n + c] = DecodeValue<K2>(words, step);
 }
 
+template <int K2>
+__device__ void LoadTrellisTile(const short* trellis, unsigned* tile, int index, int lane) {
+  constexpr int words = 4 * K2;
+  auto src = reinterpret_cast<const unsigned*>(trellis) + index * words;
+  tile[lane] = src[lane];
+  if (lane + 16 < words) tile[lane + 16] = src[lane + 16];
+}
+
+template <int K2>
+__device__ float TileWeight(const unsigned* tile, int row, int lane) {
+  int step = ((lane % 8) * 4 + (row % 8) / 2) * 8 + (lane / 8) * 4 + (row / 8) * 2 + row % 2;
+  return __half2float(DecodeValue<K2>(tile, step));
+}
+
 // Each half warp expands a 16-column trellis tile. Keep the reference
 // cuBLAS split-K layout: 12 contiguous partial sums of 96 or 192 inputs.
 template <int K2>
@@ -52,14 +66,11 @@ __device__ void ExpertDot(const short* trellis, const float* x, float* partial, 
   float sum = 0;
   for (int base = start; base < start + chunk; base += 16) {
     int index = (base / 16) * (n / 16) + column / 16;
-    auto src = reinterpret_cast<const unsigned*>(trellis) + index * words_per_tile;
-    tiles[tile][lane] = src[lane];
-    if (lane + 16 < words_per_tile) tiles[tile][lane + 16] = src[lane + 16];
+    LoadTrellisTile<K2>(trellis, tiles[tile], index, lane);
     __syncwarp();
 #pragma unroll
     for (int row = 0; row < 16; ++row) {
-      int step = ((lane % 8) * 4 + (row % 8) / 2) * 8 + (lane / 8) * 4 + (row / 8) * 2 + row % 2;
-      sum = fmaf(x[base + row], __half2float(DecodeValue<K2>(tiles[tile], step)), sum);
+      sum = fmaf(x[base + row], TileWeight<K2>(tiles[tile], row, lane), sum);
     }
     __syncwarp();
   }
@@ -77,23 +88,72 @@ __global__ void IndexedGemv(ExpertSelection selection, const float* x, float* pa
     ExpertDot<7>(expert.trellis, x, partial, k, n);
 }
 
-__global__ void Wht(WhtParams p, bool scale_in, ExpertSelection experts, bool broadcast) {
+constexpr int kTileRows = 16;
+
+template <int K2>
+__device__ void GroupedDot(GroupedExl3GemmParams p, const short* trellis, int begin, int end) {
+  __shared__ unsigned tiles[8][4 * K2];
+  __shared__ float x_smem[kTileRows][16];
+  int lane = threadIdx.x % 16, tile = threadIdx.x / 16;
+  int col = blockIdx.x * 128 + threadIdx.x;
+  int chunk = p.k / kExpertKSplits;
+  float total[kTileRows] = {};
+  for (int split = 0; split < kExpertKSplits; ++split) {
+    float part[kTileRows] = {};
+    for (int base = split * chunk; base < (split + 1) * chunk; base += 16) {
+      LoadTrellisTile<K2>(trellis, tiles[tile], (base / 16) * (p.n / 16) + col / 16, lane);
+#pragma unroll
+      for (int r = tile; r < kTileRows; r += 8)
+        x_smem[r][lane] = begin + r < end ? p.rotated[size_t(begin + r) * p.k + base + lane] : 0.f;
+      __syncthreads();
+#pragma unroll
+      for (int j = 0; j < 16; ++j) {
+        float weight = TileWeight<K2>(tiles[tile], j, lane);
+#pragma unroll
+        for (int r = 0; r < kTileRows; ++r) part[r] = fmaf(x_smem[r][j], weight, part[r]);
+      }
+      __syncthreads();
+    }
+#pragma unroll
+    for (int r = 0; r < kTileRows; ++r) total[r] = __fadd_rn(total[r], part[r]);
+  }
+#pragma unroll
+  for (int r = 0; r < kTileRows; ++r)
+    if (begin + r < end) p.projected[size_t(begin + r) * p.n + col] = total[r];
+}
+
+__global__ void GroupedGemm(GroupedExl3GemmParams p) {
+  int tile = blockIdx.y;
+  if (tile >= *p.num_tiles) return;
+  const auto& expert = p.table[p.tile_expert[tile]];
+  int begin = p.tile_begin[tile], end = p.tile_end[tile];
+  if (expert.k2 == 6)
+    GroupedDot<6>(p, expert.trellis, begin, end);
+  else
+    GroupedDot<7>(p, expert.trellis, begin, end);
+}
+
+__global__ void Wht(WhtParams p, bool scale_in, ExpertSelection experts, bool broadcast,
+                    bool split_input, const int* row_map) {
   int slot = blockIdx.x / (p.width / 128);
   if (experts.table) {
     const auto& m = experts.table[experts.ids[slot]];
     p.scale = scale_in ? m.suh : m.svh;
   }
   __shared__ float values[128];
-  int i = blockIdx.x * 128 + threadIdx.x;
-  float scale = Read(p.scale, i % p.width, FLINT_F16);
+  size_t i = size_t(blockIdx.x) * 128 + threadIdx.x;
+  int column = (blockIdx.x % (p.width / 128)) * 128 + threadIdx.x;
+  float scale = Read(p.scale, column, FLINT_F16);
   float value;
-  if (experts.table && !scale_in) {
+  if (split_input) {
     const float* splits =
-        static_cast<const float*>(p.x) + slot * kExpertKSplits * p.width + i % p.width;
+        static_cast<const float*>(p.x) + size_t(slot) * kExpertKSplits * p.width + column;
     value = 0;
     for (int j = 0; j < kExpertKSplits; ++j) value += splits[j * p.width];
   } else {
-    value = Read(p.x, broadcast ? i % p.width : i, p.input);
+    size_t source = broadcast ? column : i;
+    if (scale_in && row_map) source = size_t(row_map[slot]) * p.width + column;
+    value = Read(p.x, source, p.input);
   }
   values[threadIdx.x] = value * (scale_in ? scale : 1.f);
   __syncthreads();
@@ -109,9 +169,11 @@ __global__ void Wht(WhtParams p, bool scale_in, ExpertSelection experts, bool br
   }
   Write(p.y, i, scale_in ? sum : sum * scale, p.output);
 }
-int Rotate(WhtParams p, void* s, bool in, ExpertSelection expert = {}, bool broadcast = false) {
+int Rotate(WhtParams p, void* s, bool in, ExpertSelection expert = {}, bool broadcast = false,
+           bool split_input = false, const int* row_map = nullptr) {
   if (p.rows <= 0 || p.width <= 0 || p.width % 128) return cudaErrorInvalidValue;
-  Wht<<<p.rows*(p.width / 128), 128, 0, static_cast<cudaStream_t>(s)>>>(p, in, expert, broadcast);
+  Wht<<<p.rows*(p.width / 128), 128, 0, static_cast<cudaStream_t>(s)>>>(p, in, expert, broadcast,
+                                                                        split_input, row_map);
   return cudaGetLastError();
 }
 __global__ void Cast(CastParams p) {
@@ -127,7 +189,18 @@ int flint_exl3_indexed_gemv(ExpertSelection experts, const float* rotated, float
 }
 int flint_exl3_indexed_rotate(ExpertSelection experts, WhtParams p, int input, int broadcast,
                               void* s) {
-  return Rotate(p, s, input, experts, broadcast);
+  return Rotate(p, s, input, experts, broadcast, !input);
+}
+int flint_exl3_grouped_rotate(ExpertSelection experts, WhtParams p, int input, const int* row_map,
+                              void* s) {
+  return Rotate(p, s, input, experts, false, false, row_map);
+}
+int flint_exl3_grouped_gemm_tile_rows(void) { return kTileRows; }
+int flint_exl3_grouped_gemm(GroupedExl3GemmParams p, void* s) {
+  if (p.max_tiles <= 0 || p.n <= 0 || p.n % 128 || p.k <= 0 || p.k % (16 * kExpertKSplits))
+    return cudaErrorInvalidValue;
+  GroupedGemm<<<dim3(p.n / 128, p.max_tiles), 128, 0, static_cast<cudaStream_t>(s)>>>(p);
+  return cudaGetLastError();
 }
 int flint_cast(CastParams p, void* s) {
   Cast<<<(p.count + 255) / 256, 256, 0, static_cast<cudaStream_t>(s)>>>(p);

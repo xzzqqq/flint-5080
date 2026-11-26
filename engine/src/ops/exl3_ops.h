@@ -32,6 +32,19 @@ typedef struct {
   const ExpertProjection* table;
   const int* ids;
 } ExpertSelection;
+typedef struct {
+  const ExpertProjection* table;
+  const int *tile_expert, *tile_begin, *tile_end, *num_tiles;
+  const float* rotated;
+  float* projected;
+  int max_tiles;
+  int k, n;
+} GroupedExl3GemmParams;
+
+int flint_exl3_grouped_gemm(GroupedExl3GemmParams p, void* stream);
+int flint_exl3_grouped_gemm_tile_rows(void);
+int flint_exl3_grouped_rotate(ExpertSelection experts, WhtParams p, int input, const int* row_map,
+                              void* stream);
 int flint_exl3_indexed_gemv(ExpertSelection experts, const float* rotated, float* partial, int k,
                             int n, void* stream);
 int flint_exl3_indexed_rotate(ExpertSelection expert, WhtParams p, int input, int broadcast,

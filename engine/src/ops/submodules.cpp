@@ -1,9 +1,9 @@
 #include "ops/submodules.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <stdexcept>
-#include <vector>
 
 #include "common/cuda_check.h"
 #include "loader/kv_layout.h"
@@ -117,6 +117,48 @@ void Attention(const Gemm& g, ScratchArenaView scratch, const LayerWeightsView& 
     row += count;
   }
 }
+void GroupedMoe(cudaStream_t stream, ScratchWorkspace ws, const ExpertProjection* experts,
+                const void* x, void* y, const int* ids, const float* weights, int t) {
+  using namespace model;
+  int rows = t * kTopKExperts, tile_rows = flint_exl3_grouped_gemm_tile_rows();
+  int max_tiles = std::min(rows, rows / tile_rows + kNumExperts);
+  MoeGroupParams group{ids,
+                       ws.Take<int>(rows),
+                       ws.Take<int>(rows),
+                       ws.Take<int>(rows),
+                       ws.Take<int>(max_tiles),
+                       ws.Take<int>(max_tiles),
+                       ws.Take<int>(max_tiles),
+                       ws.Take<int>(1),
+                       t,
+                       tile_rows};
+  CheckCuda(flint_moe_group_tokens(group, stream));
+  static_assert(kGateUpSize == kHiddenSize && kIntermediateSize <= kHiddenSize);
+  size_t elements = size_t(rows) * kHiddenSize;
+  auto gate_up = ws.Take<uint16_t>(elements);
+  auto act = ws.Take<uint16_t>(size_t(rows) * kIntermediateSize);
+  auto rotated = ws.Take<float>(elements);
+  auto projected = ws.Take<float>(elements);
+  auto linear = [&](const ExpertProjection* table, const void* input, uint16_t* output, int k,
+                    const int* source_rows) {
+    ExpertSelection selection{table, group.grouped_expert};
+    CheckCuda(flint_exl3_grouped_rotate(selection,
+                                        {input, nullptr, rotated, rows, k, FLINT_BF16, FLINT_F32},
+                                        1, source_rows, stream));
+    CheckCuda(
+        flint_exl3_grouped_gemm({table, group.tile_expert, group.tile_begin, group.tile_end,
+                                 group.num_tiles, rotated, projected, max_tiles, k, kHiddenSize},
+                                stream));
+    CheckCuda(flint_exl3_grouped_rotate(
+        selection, {projected, nullptr, output, rows, kHiddenSize, FLINT_F32, FLINT_BF16}, 0,
+        nullptr, stream));
+  };
+  linear(experts, x, gate_up, kHiddenSize, group.grouped_token);
+  CheckCuda(flint_softcapped_swiglu({gate_up, act, rows, kIntermediateSize}, stream));
+  linear(experts + kNumExperts, act, gate_up, kIntermediateSize, nullptr);
+  CheckCuda(flint_moe_weighted_accum(
+      {gate_up, weights, y, t, kHiddenSize, ids, group.slot_to_grouped}, stream));
+}
 }  // namespace
 void RunSlidingAttention(const Gemm& g, ScratchArenaView w, const LayerWeightsView& l,
                          const KvStateArenaView& c, AttentionBatch b) {
@@ -166,11 +208,27 @@ void RunSparseMoeBlock(const Gemm& g, ScratchArenaView w, const LayerWeightsView
   if (!logits) logits = ws.Take<float>(t * model::kNumExperts);
   if (!ids) ids = ws.Take<int>(t * model::kTopKExperts);
   if (!weights) weights = ws.Take<float>(t * model::kTopKExperts);
-  auto outputs = ws.Take<uint16_t>(size_t(t) * model::kTopKExperts * model::kHiddenSize);
+  if (!experts) {
+    std::array<ExpertProjection, 2 * model::kNumExperts> descriptors;
+    size_t i = 0;
+    for (const auto* projection : {l.gate_up_proj, l.down_proj})
+      for (int e = 0; e < model::kNumExperts; ++e) {
+        const auto& m = projection[e];
+        if (m.k2 != 6 && m.k2 != 7) throw std::invalid_argument("unsupported expert bitrate");
+        descriptors[i++] = {m.trellis, m.suh, m.svh, m.k2};
+      }
+    auto table = ws.Take<ExpertProjection>(descriptors.size());
+    CheckCuda(cudaMemcpyAsync(table, descriptors.data(), sizeof(descriptors),
+                              cudaMemcpyHostToDevice, g.stream()));
+    CheckCuda(
+        cudaStreamSynchronize(g.stream()));  // Host descriptors belong to this diagnostic call.
+    experts = table;
+  }
   RunFp32Linear(g, ws.rest, x, FLINT_BF16, l.router_weight, FLINT_BF16, logits, t,
                 model::kNumExperts, model::kHiddenSize);
   CheckCuda(flint_moe_router_top8({logits, l.router_bias, ids, weights, t}, g.stream()));
-  if (t == 1 && experts) {
+  if (t == 1) {
+    auto outputs = ws.Take<uint16_t>(model::kTopKExperts * model::kHiddenSize);
     auto gate_up = ws.Take<uint16_t>(model::kTopKExperts * model::kGateUpSize),
          act = ws.Take<uint16_t>(model::kTopKExperts * model::kIntermediateSize);
     auto rotated = ws.Take<float>(model::kTopKExperts * model::kHiddenSize),
@@ -191,24 +249,25 @@ void RunSparseMoeBlock(const Gemm& g, ScratchArenaView w, const LayerWeightsView
     CheckCuda(flint_softcapped_swiglu({gate_up, act, model::kTopKExperts, model::kIntermediateSize},
                                       g.stream()));
     linear({experts + model::kNumExperts, ids}, act, outputs, model::kIntermediateSize, false);
-  } else {
-    auto gate_up = ws.Take<uint16_t>(model::kGateUpSize),
-         act = ws.Take<uint16_t>(model::kIntermediateSize);
-    std::vector<int> selected(size_t(t) * model::kTopKExperts);
-    CheckCuda(cudaMemcpyAsync(selected.data(), ids, selected.size() * sizeof(int),
-                              cudaMemcpyDeviceToHost, g.stream()));
-    CheckCuda(cudaStreamSynchronize(g.stream()));
-    for (int i = 0; i < t * model::kTopKExperts; ++i) {
-      int e = selected[i];
-      RunExl3Linear(
-          g, ws.rest, l.gate_up_proj[e],
-          static_cast<const uint16_t*>(x) + (i / model::kTopKExperts) * model::kHiddenSize, gate_up,
-          1);
-      CheckCuda(flint_softcapped_swiglu({gate_up, act, 1, model::kIntermediateSize}, g.stream()));
-      RunExl3Linear(g, ws.rest, l.down_proj[e], act, outputs + i * model::kHiddenSize, 1);
-    }
+    CheckCuda(flint_moe_weighted_accum({outputs, weights, y, t, model::kHiddenSize, ids, nullptr},
+                                       g.stream()));
+    return;
   }
-  CheckCuda(
-      flint_moe_weighted_accum({outputs, weights, y, t, model::kHiddenSize, ids}, g.stream()));
+  // Large configured chunks or smaller scratch arenas may need multiple groups.
+  // Budget at most one tile per slot and one alignment gap per scratch allocation.
+  constexpr size_t bytes_per_token =
+      model::kTopKExperts * (model::kHiddenSize * (2 * sizeof(float) + sizeof(uint16_t)) +
+                             model::kIntermediateSize * sizeof(uint16_t) + 6 * sizeof(int));
+  constexpr size_t overhead = 11 * 256;
+  size_t capacity = ws.rest.bytes > overhead ? (ws.rest.bytes - overhead) / bytes_per_token : 0;
+  if (!capacity) throw std::length_error("insufficient grouped MoE scratch");
+  for (int row = 0; row < t;) {
+    int count = std::min<size_t>(t - row, capacity);
+    size_t offset = size_t(row) * model::kHiddenSize;
+    GroupedMoe(g.stream(), ws, experts, static_cast<const uint16_t*>(x) + offset,
+               static_cast<uint16_t*>(y) + offset, ids + row * model::kTopKExperts,
+               weights + row * model::kTopKExperts, count);
+    row += count;
+  }
 }
 }  // namespace flint

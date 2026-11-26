@@ -509,6 +509,45 @@ void SyntheticAttention() {
   Require(out.read() == std::vector<uint16_t>{B(2 / (1 + expf(1))), B(3 / (1 + expf(-2)))},
           "attention gate");
 }
+void SyntheticGrouping() {
+  constexpr int tokens = 35, rows = tokens * 8;
+  int tile_rows = flint_exl3_grouped_gemm_tile_rows();
+  std::vector<int> ids(rows), counts(128);
+  for (int s = 0; s < rows; ++s) {
+    ids[s] = (17 * (s % 8) + (s / 8 < tile_rows ? 0 : 1)) % 128;
+    ++counts[ids[s]];
+  }
+  int max_tiles = std::min(rows, rows / tile_rows + 128);
+  Buffer<int> input(ids), experts(rows), token(rows), inverse(rows), tile(max_tiles),
+      begin(max_tiles), end(max_tiles), num(1);
+  Check(flint_moe_group_tokens({input.get(), experts.get(), token.get(), inverse.get(), tile.get(),
+                                begin.get(), end.get(), num.get(), tokens, tile_rows},
+                               nullptr));
+  auto group = experts.read(), source = token.read(), map = inverse.read();
+  std::vector<bool> seen(rows);
+  for (int s = 0; s < rows; ++s) {
+    int r = map[s];
+    Require(r >= 0 && r < rows && !seen[r], "group permutation");
+    seen[r] = true;
+    Require(group[r] == ids[s] && source[r] == s / 8, "group slot mapping");
+  }
+  auto e = tile.read(), b = begin.read(), z = end.read();
+  int row = 0, i = 0, active = num.read()[0];
+  Require(active >= 0 && active <= max_tiles, "active tile count");
+  for (int id = 0; id < 128; ++id) {
+    int limit = row + counts[id];
+    while (row < limit) {
+      int next = std::min(row + tile_rows, limit);
+      Require(i < active && e[i] == id && b[i] == row && z[i] == next, "expert tile range");
+      Require(std::all_of(group.begin() + row, group.begin() + next,
+                          [id](int expert) { return expert == id; }),
+              "expert tile contents");
+      row = next;
+      ++i;
+    }
+  }
+  Require(row == rows && i == active, "tile coverage");
+}
 void SyntheticMoe() {
   std::vector<float> logits(128, -1), bias(128, 0);
   bias[120] = 1;
@@ -536,7 +575,8 @@ void SyntheticMoe() {
   std::vector<uint16_t> ys(16);
   for (int i = 0; i < 16; ++i) ys[i] = B(float(i - 7));
   Buffer<uint16_t> experts(ys);
-  Check(flint_moe_weighted_accum({experts.get(), w.get(), act.get(), 1, 2, ids.get()}, nullptr));
+  Check(flint_moe_weighted_accum({experts.get(), w.get(), act.get(), 1, 2, ids.get(), nullptr},
+                                 nullptr));
   result = act.read();
   for (int c = 0; c < 2; ++c) {
     float sum = 0;
@@ -627,6 +667,47 @@ void SyntheticComposition(const Gemm& g) {
     Require(fabsf(BFloat(result[i]) - (i % 128 == 0 ? expected : 0.f)) < 1e-5f,
             "synthetic MoE projection");
 
+  // Compare the grouped path with the original one-row cuBLAS projections.
+  // Every selected expert sees every token, with distinct weights and both bitrates.
+  std::vector<int16_t> codes(144 * 144 * 56 + 128 * 2);
+  unsigned state = 5080;
+  for (auto& word : codes) {
+    state = state * 1664525u + 1013904223u;
+    word = static_cast<int16_t>(state >> 16);
+  }
+  Buffer<int16_t> packed(codes);
+  for (int e = 0; e < 128; ++e) {
+    for (auto* projection : {layer.gate_up_proj, layer.down_proj}) {
+      projection[e].trellis = packed.get() + 2 * e;
+      projection[e].k2 = 6 + e % 2;
+    }
+  }
+  for (int t : {5, 35}) {
+    int rows = t * 8;
+    std::vector<uint16_t> values(t * 2304);
+    for (auto& v : values) {
+      state = state * 1664525u + 1013904223u;
+      v = B(float(int(state >> 24) - 128) / 128);
+    }
+    Buffer<uint16_t> src(values), grouped(t * 2304), ref(t * 2304), outputs(rows * 2304), gu(2304),
+        activated(1152);
+    Buffer<int> ids(rows);
+    Buffer<float> weights(rows);
+    RunSparseMoeBlock(g, scratch.view(), layer, src.get(), grouped.get(), t, nullptr, ids.get(),
+                      weights.get());
+    auto selected = ids.read();
+    for (int s = 0; s < rows; ++s) {
+      RunExl3Linear(g, scratch.view(), layer.gate_up_proj[selected[s]], src.get() + (s / 8) * 2304,
+                    gu.get(), 1);
+      Check(flint_softcapped_swiglu({gu.get(), activated.get(), 1, 1152}, g.stream()));
+      RunExl3Linear(g, scratch.view(), layer.down_proj[selected[s]], activated.get(),
+                    outputs.get() + s * 2304, 1);
+    }
+    Check(flint_moe_weighted_accum(
+        {outputs.get(), weights.get(), ref.get(), t, 2304, ids.get(), nullptr}, g.stream()));
+    Require(grouped.read() == ref.read(), "grouped MoE vs scalar t=" + std::to_string(t));
+  }
+
   // The sole active rank reads the first feature of each normalized input.
   std::vector<uint16_t> d(64 * 4608), f(2304 * 64), a(2304 * 64);
   d[0] = B(2);
@@ -652,6 +733,7 @@ void Synthetic(const Gemm& g) {
   SyntheticNorm();
   SyntheticConv();
   SyntheticAttention();
+  SyntheticGrouping();
   SyntheticMoe();
   SyntheticLoop(g);
   Buffer<float> x(std::vector<float>{1, 2, 3, 3, 100}), logits(4);
