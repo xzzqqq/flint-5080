@@ -86,18 +86,25 @@ unmatched conditions is diagnostic.
 
 - Require every canary to pass. A failed assertion or request yields a nonzero
   run exit code and a case-level diagnostic.
-- M2.6 freezes Phase 2 AR with all suites on the RTX 5080. Record C1 decode
-  SOL as `100 × model AR floor_ms / server_tpot_ms` at matched context length
-  (short-context floor 3.550 ms at 960 GB/s, see `docs/model.md`). Compare
-  Phase 3 speculative output in tokens/s as well as ms/round. Its output rate
-  relative to the AR ceiling is an AR-equivalent rate, not measured bandwidth.
-- Proposed Phase 3 review thresholds, pending M2.6 repeatability measurements:
-  target at least 75% of the context-matched logical bandwidth SOL for optimized
-  AR C1 decode. For regression review use 5% on `short` and `agent` decode
-  latency against frozen Phase 2. Inspect individual cases. Repeat a matched run when a regression crosses the threshold and the
-  interval overlaps it. Confirm sustained changes before promotion. Verify
-  numerical accuracy and model quality separately for precision or algorithm changes.
-- Keep raw run records under `.runs/`. Add `--archive` to save a comparison as well.
-  Publish the frozen baseline and accepted or rejected experiments as dated
+- Record AR C1 decode SOL as `100 × model AR floor_ms / server_tpot_ms` at
+  matched context length (short-context floor 3.550 ms at 960 GB/s; see
+  `docs/model.md`). Report speculative decoding in `server_decode_tok_s` as
+  well as `ms/round`, `tokens/round`, and `spec_accepted`. Speculative
+  throughput relative to the AR ceiling is an AR-equivalent rate, not raw
+  measured bandwidth.
+- Optimization and regression thresholds: target at least 75% of
+  context-matched logical bandwidth SOL for AR C1 decode while improving net
+  speculative `server_decode_tok_s`. Use a 5% regression review threshold on
+  `short` and `agent` decode latency/throughput against the active frozen
+  baseline (clean-restart repeatability over `remote_loopback` is verified
+  below 0.1%). Inspect individual cases and repeat matched runs when a
+  regression crosses the threshold and the interval overlaps it. Confirm
+  sustained changes before promotion.
+- Whenever an optimization alters arithmetic order, precision (such as KV
+  compression), or algorithms, verify numerical accuracy via `./bin/weights kld`
+  (teacher-forced KLD and top-1 agreement) alongside `canary` and
+  `dev check --gpu`, and evaluate model quality where precision is traded.
+- Keep raw run records under `.runs/`. Add `--archive` to save a comparison as
+  well. Publish frozen baselines and accepted or rejected experiments as dated
   reports in `docs/findings/`, citing run IDs, source revisions, hardware,
-  configuration, workload hashes, medians, intervals, SOL and correctness.
+  configuration, workload hashes, medians, intervals, SOL, and numerical checks.

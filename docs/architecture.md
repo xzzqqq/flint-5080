@@ -1,267 +1,102 @@
-# Flint-5080 总体架构设计
+# Flint-5080 系统架构
 
-> **状态**：架构基线（Model-Agnostic Blueprint）  
-> **目标硬件**：单卡 Linux RTX 5080 16 GB（Blackwell `sm_120a`），配合 Mac Laptop 远程开发  
-> **目标模型与场景**：面向 **Inkling 2 mini**（含 `dspark` 投机解码）的个人本地 chat 与 coding-agent 推理服务，追求 **C1 极致低延迟（decode 逼近 SOL）**，兼顾 C2，并发不设硬上限。  
-> **范围说明**：本文档沉淀与具体模型细节解耦的总体架构、模块边界、热重载调优台、工具链与工程规范；模型结构、算子排布与 `dspark` 算法细节将在后续文档中补充。
+> **目标硬件**：单卡 Linux RTX 5080 16 GiB（Blackwell `sm_120a`），配合 Mac Laptop 远程开发  
+> **目标场景**：面向 **Inkling 2 mini**（含 `dspark` 投机解码）的个人本地 chat 与 coding-agent 推理服务，C1 极致低延迟优先、兼顾 C2，并发不设硬上限。  
+> **延伸文档**：模型拓扑、算子语义与显存/Roofline 账本见 [model.md](model.md)，压测协议与门禁见 [benchmark.md](benchmark.md)，优化追踪与实测证据见 [findings/](findings/README.md)，工程红线见 [AGENTS.md](../AGENTS.md)。
 
 ---
 
-## 1. 设计原则与核心取舍
+## 1. 设计原则与系统能力
+
+### 1.1 核心原则
 
 1. **单卡极致精简，拒绝重型抽象**  
-   彻底放弃多卡、多硬件档位、多模型热切、发行版级运维设施以及跨语言重型状态机。以最少的代码量换取最低的认知负担、最快的编译速度和最直接的硬件掌控力（面向 Agent-Native 高频迭代）。
-2. **单一真相源，边界画在 Request 级**  
-   推理引擎的一切运行时状态（权重、显存池、KV/Prefix Cache、调度循环、CUDA Graph、`dspark`）全部收归 C++/CUDA 引擎内部闭环；Rust 服务壳只做协议与文本前/后处理，通过极窄的 Request 级 C ABI 交互，消除跨语言状态同步债。
-3. **调优工作台（`forge`）作为一等公民**  
-   将“常驻权重 + 整图 `forward.so` 秒级热重载 + 自动懒录制 + 交错 A/B + Roofline 剖析”内建为引擎原生运行形态，而非生产服务的后期补丁。
-4. **严格隔离生产路径与外围脚本**  
-   生产服务是干净的单二进制（零 Python 依赖）；Python 严格限定在开发、远程编排、黑盒压测与离线权重/参考对齐工具链中，永不侵入在线热路径。
+   彻底放弃多卡、多硬件档位、多模型热切与重型跨语言状态机，以最少代码量换取低认知负担、快编译与直接硬件掌控。
+2. **面向极限调优的算子自由与闭环验证**  
+   引擎内部不引入锁死算子演进的抽象——以标准 `safetensors`（支持 `layout_tag` 离线重排）、静态 Arena 与整图 `forward.so` 秒级热重载消除重构阻力，并用 `forge`、`weights kld` 与 `bench` 做延迟/SOL 与数值精度闭环验证。
+
+### 1.2 系统能力与扩展预留
+
+**现有能力**
+- **推理引擎与显存管理**：以标准 `safetensors` 只读 `mmap` 一次载入并静态划分显存 Arena，支持 chunked prefill、请求取消与静态 CUDA Graph。
+- **DSpark 投机解码**：默认加载 MTP 权重执行多 token 草拟与批验证，支持精确状态回滚与贪心/无偏随机拒绝采样，`--no-spec` 可切换回 AR。
+- **VRAM Prefix Cache**：在显存内复用多轮对话前缀（含滑窗 KV、卷积状态、末位 logits 与 tap），精确命中可零 prefill 直接进入解码。
+- **OpenAI 兼容服务壳**：提供 Chat Completions（SSE / 非流式 / stop 字符串 / 超时取消）、离线 HF 黄金对齐的 Tokenizer 与 Jinja 模板、独立 Reasoning/Tool-Call 流式解析器及免鉴权 `/health`、`/ready`、`/metrics`（Prometheus）。
+- **调优工作台与精度守门**：通过 `forge` 实现常驻权重 + 整图 `forward.so` 热重载、A/B 交错与分阶段剖析，配合 `weights golden`/`kld` 和 `bench` 完成数值与性能闭环验收。
+
+**预留扩展**
+- **OpenAI Responses API**：`server/` 生成与流式解析层协议无关，可平滑挂载新协议路由。
+- **Host KV-RAM 缓存**：纯 `engine/` 内部状态快照扩展，不触碰跨语言 C ABI。
+- **Vision 多模态**：`engine_api.h` 已预留 `MediaSlice` 参数位，当前跳过载入视觉权重。
+- **`web/` 前端 UI**：`server/` 可按需挂载静态 `/ui/` 页面。
 
 ---
 
-## 2. 技术栈与三层职责划分
+## 2. 分层架构与边界
 
 ```text
-┌──────────────────────────────────────────────────────────────────────┐
-│  工具链与评测层（tools/ — 轻量 Python，仅开发/实验/离线使用）            │
-│  4 个顶层命令共享纯 stdlib 底座（配置 / 远程同步 / 单卡 lease 锁 / JSON） │
-│  • dev (status/build/serve/check)   • forge (常驻热重载调优工作台)     │
-│  • bench (黑盒 HTTP 压测 & canary)  • weights (safetensors/golden/kld) │
-└──────────────────────────────────────────────────────────────────────┘
-                                 │ HTTP (OpenAI API)
-                                 ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│  极薄服务壳（server/ — 单 Crate Rust，零调度/KV/CUDA 逻辑）             │
-│  • OpenAI Chat Completions (SSE / 非流式 / 取消 / 超时) + P1 Responses │
-│  • Tokenizer & Jinja Chat Template（离线 HF golden fixture 锁死对齐）  │
-│  • 独立可插拔 Reasoning / Tool-Call 流式解析器                         │
-│  • CLI/TOML、/health、/ready、/metrics、/v1/models、可选 API Key      │
-└──────────────────────────────────────────────────────────────────────┘
-                     │ 唯一跨语言边界：engine_api.h（Request 级 C ABI）
-                     ▼
-┌──────────────────────────────────────────────────────────────────────┐
-│  完整推理引擎（engine/ — 纯 C++/CUDA，sm_120a，不依赖 Rust 编译）       │
-│  • safetensors 只读 mmap loader + 静态显存分区（Arena）                │
-│  • VRAM Prefix Cache + 低并发调度（C1 极致、兼顾 C2、超额自然排队）      │
-│  • 模型前向（AR baseline + dspark 投机解码）+ CUDA Graph + sm_120a 算子│
-│  • 双运行形态：libengine（生产） / forge-host + forward.so（调优）      │
-└──────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────┐
+│  工具链与评测层（tools/ — 轻量 Python，严格隔离于生产路径之外）             │
+│  共享纯 stdlib 底座（.dev.toml / 远程同步 / 单卡 lease 锁 / JSON 归档）    │
+│  • dev (运维/构建/检查)  • forge (热重载调优)  • bench (压测)  • weights │
+└─────────────────────────────────────────────────────────────────────────┘
+                                  │ HTTP (OpenAI API)
+                                  ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  极薄服务壳（server/ — 单 Crate Rust，零调度/KV/CUDA/模型布局逻辑）        │
+│  HTTP 协议、HF 对齐分词/模板、独立流式解析、断连取消与 /metrics 导出       │
+└─────────────────────────────────────────────────────────────────────────┘
+                 │ 唯一跨语言边界：engine/include/engine_api.h（Request ABI）
+                 ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│  完整推理引擎（engine/ — 纯 C++/CUDA，sm_120a，不依赖 Rust 编译）          │
+│  静态显存分区、VRAM Prefix Cache、调度、AR/DSpark 前向与 sm_120a 算子     │
+│  双运行形态：libengine.a（生产） / forge-host + forward.so（调优）         │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
+
+- **跨语言契约（[engine_api.h](../engine/include/engine_api.h)）**：全部推理运行时状态收归 `engine/` 闭环；跨语言仅暴露 Request 级 C ABI，以 JSON 配置初始化、按轮批量异步回调 token 并回传终态遥测与停止原因。`server/` 编译为无 Python 依赖的单二进制，对模型、KV 与投机完全无知，文本对齐由 `weights chat-golden` 离线锁死，客户端断连或超时由流内 guard 立即触发 `engine_cancel` 释放单卡。
+- **双运行形态**：生产形态由 `server` 静态链接 `libengine.a`；调优形态由纯 C++ 常驻进程 `forge-host` 通过 `dlopen` 热加载 `forward.so`。两者共用同一份 Release（`-O3`、`sm_120a`）引擎核心，通过单卡 lease 锁互斥占用 5080。
 
 ---
 
-## 3. 功能范围与边界（P0 / P1 / Non-goals）
+## 3. 引擎架构不变量
 
-### 3.1 P0（首期必须实现）
+引擎内部不固化特定算子边界或调度实现，具体数据流见 `engine/src/`、显存账本见 [model.md](model.md)；任何演进只须守住三条结构不变量：
 
-| 能力 | 归属层 | 设计要点 |
-|---|---|---|
-| **OpenAI Chat Completions** | `server/` | `http.rs` 封装 JSON/SSE；`generation.rs` 共用模板、增量解码、stop 字符串过滤与终止遥测。断连或超时由流内 guard 取消引擎请求。 |
-| **Reasoning & Tool-Call 解析** | `server/` | 独立、可插拔的流式状态机模块，不与 HTTP handler 耦合。 |
-| **Tokenizer & Chat Template** | `server/` | `tokenizers` + `minijinja`，由离线 Python 脚本生成的 HF golden fixtures 在 `dev check --local` 中强制锁死 100% 一致。 |
-| **极简服务基础** | `server/` | `/health`、`/ready`、`/metrics`（无需认证，导出引擎统计与按端点、状态类别汇总的 HTTP 计数）、`/v1/models`、可选 `--api-key`、结构化 `tracing` 日志、`clap` + 单配置文件。 |
-| **单卡低并发推理引擎** | `engine/` | 优化 C1 延迟、有余力优化 C2，不写死并发上限（超额自然排队）；支持 chunked prefill、请求取消与 CUDA Graph。 |
-| **VRAM Prefix Cache** | `engine/` | 针对 coding-agent 高前缀复用率场景内置显存级前缀共享。 |
-| **投机解码（`dspark`）** | `engine/` | 属于 P0 目标能力；Bootstrap 阶段先跑通 AR baseline，引擎步进结构原生兼容多 token verify，随后接入 `dspark`。 |
-| **一等公民 `forge` 工作台** | `engine/` + `tools/` | 独立常驻宿主 + `forward.so` 热重载 + 5 组正交原语（详见第 6 节）。 |
-| **4 入口统一底座 CLI 与评测** | `tools/` | `dev` / `forge` / `bench` / `weights`，含固定 coding-agent trace 压测与 canary 回归。 |
+1. **全静态显存分区**：权重、KV/卷积状态、前缀快照与运行时工作区在启动时按静态 Arena 预分配，推理热路径严禁动态 `cudaMalloc` / `cudaFree`。
+2. **标准 `safetensors` 一体化**：只认标准 `safetensors` 目录，优化期通过带 `layout_tag` 元数据的离线派生重排满足硬件布局需求，不造私有容器。
+3. **内部闭环与重构自由**：调度、前缀缓存、CUDA Graph、投机解码与拒绝回滚全部内聚在 `engine/` 内部；只要对外保持 Request ABI 语义不变，内部算子、层衔接与内存布局可随优化自由演进。
 
-### 3.2 P1（首期仅预留干净接口，按需补齐）
+---
 
-| 能力 | 预留方式 |
+## 4. 调优工作台与数值守门（`forge` + `weights`）
+
+- **整图 `forward.so` 秒级热重载**：放弃固定算子槽位插件 ABI，将完整前向编排、CUDA Graph、DSpark 与全部算子统一链接为单一 `forward.so`（Forge ABI 见 [forward_abi.h](../engine/src/forge/forward_abi.h)），使跨算子融合、跨层重排、KV 编码改动或双流重叠均可无条件热加载。借助单架构 `sm_120a`、关闭 `-rdc`、动态链接 CUDA 运行时与头文件隔离的 `ops/*.cu`，单算子改动可秒级增量重编并进程内热替换。
+- **区间懒录制与安全对照**：前向接受逻辑层区间 `(begin, end)`，首次局部回放时宿主自动用冻结的 `baseline.so` 截获真实上下文与状态快照并缓存，零注册宏；每次 `dlopen`/`dlclose` 前后比对显存防止泄漏；内置 `--no-graph`、`--no-spec` 与 `return_logits` 零开销对照开关。
+- **三层闭环验证**：
+  - `forge`（`start/stop/status`、`run`、`ab`、`profile`、`dump`、`ls/rm`）驱动高频延迟/SOL 与交错 A/B 迭代；
+  - `weights golden`（`ops`/`e2e`/`mtp`/`chat` 四级夹具）锁死语义对齐，`weights kld` 经由常驻 `forge-host`（空闲时自动持锁拉起并回收）以 FP64 计算 teacher-forced KLD，为非逐位优化与量化守门；
+  - `bench` 以黑盒 HTTP 压测与配对统计执行端到端验收。
+
+---
+
+## 5. 工具链与顶层目录
+
+开发/评测统一收归 `tools/`，共享零第三方依赖的 `tools/common/`（`.dev.toml` 单一配置、本地/远程工作区隔离同步、权重/`ccache` 全局共享、单卡 lease 进程监管与 `--json` / `.runs/` 归档），仅暴露 4 个顶层入口（参数以 `--help` 为准）：
+
+- **`dev`**（纯 stdlib）：远程状态查询、增量构建、生产服务生命周期与本地/GPU 分层验收。
+- **`forge`**（纯 stdlib）：驱动常驻 `forge-host` 的全部热重载调优原语。
+- **`bench`**（轻量异步 HTTP）：黑盒 OpenAI HTTP 压测、canary 回归与配对统计对比。
+- **`weights`**（纯 stdlib 前端，离线生成走独立 PyTorch 环境）：权重检视、四级黄金夹具、teacher-forced KLD 与离线布局重排。
+
+| 顶层目录 | 职责 |
 |---|---|
-| **OpenAI Responses API（HTTP + WebSocket）** | `server/` 路由与流式输出层保持协议无关抽象，后续平滑挂载。 |
-| **Host KV-RAM 缓存** | 纯 `engine/` 内部状态 `snapshot/restore` 扩展，**不暴露到 C ABI**。 |
-| **Vision 多模态** | `engine_api.h` 提交接口预留 `MediaSlice` 参数位（P0 传 `NULL, 0`）；`server/` 预留媒体解码位。 |
-| **`web/` UI** | `server/` 后续按需挂载静态 `/ui/`。 |
+| `bin/` | `dev`、`forge`、`bench`、`weights` 四个薄 CLI 入口包装 |
+| `engine/` | 纯 C++/CUDA `sm_120a` 推理引擎、独立 CMake/Ninja 构建与 C++ 测试 |
+| `server/` | 单 Crate Rust HTTP 服务壳与协议/文本对齐测试 |
+| `tools/` | 共享 stdlib 底座与 4 个 CLI 实现（严禁进入生产运行路径） |
+| `workloads/` | 固定压测、canary、chat 与模型黄金用例清单 |
+| `docs/` | 活文档（`architecture.md`、`model.md`、`benchmark.md`）与 `findings/` 实测档案库 |
 
-### 3.3 Non-goals（明确移除，绝不带入）
-
-- **Idle Unload**、在线模型切换、模型目录/下载/删除 HTTP API（单模型单卡，直接重启与外部下载）。
-- **KV-Disk**（SSD 落盘 / Direct I/O / CRC32）。
-- **在线配置热更**（`PATCH /v1/config`）、多卡/多硬件 profile 矩阵。
-- **Swagger / OpenAPI 自动代码生成**。
-- **数千行模型特化启发式补丁**（如重型 `loop_guard`；先依赖标准 `max_tokens` 与 stop token）。
-- **私有权重容器格式**（如 `.ninfer`）与独立 `Makefile` 体系。
-- **重型纯 CPU `MockCompute` 状态机测试**（Rust 侧仅需 ~50 行假回调 stub 即可完整覆盖所有 HTTP/SSE/取消/解析单测）。
-
----
-
-## 4. 权重格式与加载：`safetensors` 一体化
-
-- **唯一格式**：统一只认标准 `safetensors` 目录（`config.json` + `tokenizer.json` + `*.safetensors` + 可选 index）。
-- **极简加载器**：`engine/` 内置约 200–300 行只读 `safetensors` `mmap` loader，按规划直接拷贝/映射到 VRAM 或 pinned host memory。
-- **优化期重排（Layout Repack）不造新容器**：
-  - AR baseline 阶段直接加载原始/量化后的标准 `safetensors`，零转换成本；
-  - 后续面向 `sm_120a` 做融合权重、量化 scale 或 MMA 布局重排时，由 `weights repack` 离线输出**派生 `safetensors` 目录**，通过文件 metadata 标明 `layout_tag`（如 `sm120_v1`）。
-  - 永远只需维护一套 loader，且 Python 生态（`safetensors` / `torch`）可直接检查与修改任意权重文件。
-
----
-
-## 5. Rust ↔ C++ 边界：单头文件 Request 级 C ABI
-
-全仓库唯一的跨语言接口收敛至 `engine/include/engine_api.h`（~150 行 C99），参考业界现代引擎（vLLM V1 / SGLang / TensorRT-LLM Executor）的 Request / Token-Stream 边界：
-
-```c
-// 1. 生命周期（配置使用 JSON 字符串，字段演进不破 ABI）
-EngineHandle* engine_create(const char* config_json, char** err_out);
-void          engine_destroy(EngineHandle* h);
-
-// 2. 异步提交请求（引擎内部独立线程驱动调度、prefill、decode 与 dspark）
-//    media / n_media 为 P1 Vision 预留（P0 传 NULL, 0）
-//    stop_token_ids 下沉到引擎立即终止 decode；stop_strings 与 UTF-8/tool/reasoning 解析留 Rust
-uint64_t engine_submit(
-    EngineHandle* h,
-    const RequestParams* params,
-    const int32_t* token_ids, size_t n_tokens,
-    const MediaSlice* media, size_t n_media,
-    TokenCallback cb, void* user_data
-);
-
-// 3. 取消与可观测性
-void  engine_cancel(EngineHandle* h, uint64_t req_id);
-char* engine_stats_json(EngineHandle* h); // 返回 JSON 快照供 /ready 与 /metrics
-```
-
-**接口契约要点**：
-- **Rust 侧对底层完全无知**：不感知层数、KV 格式/页表、投机解码细节或 Host KV-RAM。
-- **回调事件**：Request ABI v2 的 `DONE` 携带最终遥测（`prefill_tokens`、`cached_prefix_tokens`、`decode_tokens`、`prefill_ms`、`decode_ms`、`decode_rounds`、`spec_accepted`）和 `EngineStopReason`。引擎区分模型 EOS、调用方停止 token、输出 token 上限和上下文上限，Rust 结合停止字符串与工具调用生成 HTTP `finish_reason`。`TOKENS` 和 `ERROR` 的 `stop_reason` 均为 `ENGINE_STOP_NONE`，错误码（`ContextOverflow` / `InvalidInput` / `Cancelled` / `Internal`）由 `ERROR.status` 返回。
-- 生产引擎默认在 checkpoint 含 MTP 权重时启用 DSpark。`dev serve start --no-spec` 切换至 AR。前缀快照包含目标与草拟器的滑窗 KV、目标卷积状态，以及完整提示末位的 logits 和 18 KiB BF16 tap。精确命中可直接开始草拟，部分命中只处理剩余提示。`/ready` 的引擎统计同时报告配置开关、实际启用状态与已结束请求的累计遥测。
-- **零热路径开销**：每轮 decode（10–20 ms）仅回调一次推送本轮产出的 1~K 个 token IDs，Rust 侧转发至 `tokio::sync::mpsc` 驱动 SSE。
-
----
-
-## 6. 一等公民调优工作台：`forge`
-
-### 6.1 两种互斥运行形态（共用同一份 Release 引擎核心）
-
-```text
-【生产形态】  server（Rust 薄壳 + 静态链接 libengine）
-             → 纯粹、稳定、零热重载与实验负担，面向日常使用
-
-【调优形态】  forge-host（纯 C++ 常驻守护进程，不依赖 Rust 编译）
-                └── dlopen ──▶ forward.so（完整前向编排 + CUDA Graph + dspark + 全部 sm_120a 算子）
-             → 宿主跨命令常驻 5080 显存（Weights Arena + KV/State Arena + Scratch Workspace Arena）
-             → 改计算代码仅增量编单文件并链接为新 forward.so，进程内 3–6 秒热替换生效
-```
-
-- **`forge-host` 与 `forward.so` 均为全速 Release（`-O3`、`sm_120a`、CUDA Graph 全开）构建**，绝非 Debug 构建。
-- `libengine.a` 与 `forward.so` 共用 `engine_model` 中的 `InklingRunner` 和 `DsparkRunner`。Forge ABI v5 与 runner 共用 `model/forward_types.h` 中的请求和结果类型，返回的 `num_block_out` 表示活跃残差块数。
-- 存在 MTP 权重时，forge 在同一权重 arena 载入草拟器，独立保留 1032 槽的局部 KV 和逐位置的全局 KV。`--e2e --step 1` 默认测量完整投机轮次，计时包含草拟、8 行验证、状态提交和已接受前缀的草拟 KV 更新。target 在验证前保存即将覆盖的 SWA 槽，并记录四个卷积的输入历史，按提交长度恢复。
-- `forge start --no-model` 和 `forge-host --smoke` 加载 `stub_forward.so`。回放使用相同的 BF16 隐状态、carry 和按 visit 定位的 KV/卷积快照。
-- 两种形态互斥使用 5080（由单卡 lease 锁强制防撞车）。
-
-### 6.2 整图 `forward.so` 热重载的关键机制
-
-- **为什么不采用“固定算子槽位 ABI”**：固定槽位在面对跨算子融合、跨层 PDL、双流重叠或 KV 编码变更时极易失效并堆积大量胶水。将完整计算执行体统一链接为单一 `forward.so` 后，**任何计算侧重构均可无条件热加载**。
-- **体积与编译速度保障**：
-  - 仅编译 `sm_120a` 单架构；CUDA 运行时/数学库动态链接在 `forge-host` 中（不静态编入 `forward.so`）；关闭跨文件设备链接（`-rdc=false`）。
-  - 单个 `forward.so` 体积控制在 **5–25 MB**；改单个算子 `.cu` 仅增量编译 1 个编译单元（2–5 s）+ 主机链接（<1 s）+ 热重载（<0.2 s），全流程 **3–6 秒**。
-- **无状态算子与零宏层区间执行（`run_layers(begin, end)`）**：
-  - 算子本身保持纯无状态函数（不感知层号）；外层前向循环接收 `(begin, end)` 起止参数——完整前向即 `run_layers(0, N)`，Fast Tier 局部回放即 `run_layers(k, m)`。
-  - **兼容跨层融合**：区间内部（如 `0..4` 内的相邻层衔接）允许任意跨层融合（fused residual+norm、跨层 PDL 等），仅在区间首尾对齐标准残差流。
-  - **自动懒录制**：首次对 `(case, layers)` 执行局部回放时，宿主自动用基准 `baseline.so` 跑一遍真实请求，在 `begin` 层入口自动截获真实 `hidden_state`、位置信息及该区间 KV/状态并缓存，同时存下 `end` 层参考输出；后续所有迭代直接命中缓存复用，**零注册宏、零手工前置**。
-- **显存安全与调试对照开关**：
-  - **静态 Arena + 热重载泄漏检查**：热路径严禁动态 `cudaMalloc`；A/B 模块在同一条流上轮流使用宿主的 Scratch Arena，调用间可覆盖其中的全部内容。专家描述符常驻 Weights Arena，Graph/stream/event 随各自的 `ForwardContext` 析构。宿主在 `dlopen` 前与 `dlclose` 后调用 `cudaMemGetInfo` 比对剩余显存，超阈值（如 >4 MB）直接打印 `WARN`。
-  - **内置零开销对照选项（`ForwardOptions`）**：支持 `use_cuda_graph`（`--no-graph` 退回 eager）、`use_speculative`（`--no-spec` 退回 AR-only）与 `return_logits`（供 teacher-forcing KLD 与 `dspark` 数学一致性验证）。
-
-### 6.3 `forge` 核心原语（5 组正交命令 + 候选管理）
-
-| 原语 | 职责 | 典型用法 |
-|---|---|---|
-| **`start` / `stop` / `status`** | 拉起/关闭/查询 `forge-host` 常驻宿主并占/释 5080 lease 锁（自动冻结 `baseline.so`，检测到 `nsys` 时预武装 profiler-API 采集） | `forge start` / `forge status` / `forge stop` |
-| **`run`** | 自动增量编并热加载 `forward.so`，输出耗时、5080 SOL 占比与数值误差（`--save <name>` 测量所选候选的快照，成功后保存同一份 `.so`） | `forge run --layers 0..4`<br>`forge run --e2e [--full] [--no-graph] [--no-spec]`<br>`forge run --e2e --save fast-v1` |
-| **`ab`** | 同常驻会话内交替加载两个候选 `.so` 做 A-B-A-B 交错测量，消除热机与频率漂移 | `forge ab baseline current --layers 0..4`<br>`forge ab fast-v1 fast-v2 --e2e --full` |
-| **`profile`** | 默认零重启开启轻量 CUDA Event 阶段标尺，输出分阶段耗时与 960 GB/s Roofline 占比；加 `--nsys` 采集 Nsight Systems timeline | `forge profile --layers 0..1`<br>`forge profile --e2e --nsys` |
-| **`dump`** | 指定输入请求（`--case` / `--prompt`）按需导出真实输入、参考/候选输出及可选状态为 `.safetensors`，供 Python 排错或独立 `ncu` 单算子微调 | `forge dump --case short_bug`<br>`forge dump --case long_64k --layers 17..18 --step 5 --with-state` |
-| **`ls` / `rm`** | 列出或清理保存在远程 `.forge/candidates/` 下的候选 `.so` | `forge ls` / `forge rm fast-v1` |
-
-`run` 和 `ab` 在计时结束后通过 `state_error` 报告活跃块数、carry、KV 和卷积状态的写回差异。`run` 与录制的基准比较，`ab` 比较两个候选。端到端回放优先对照完整 logits，缺少时按夹具保存的 top-64 ID 比较 logits，并独立核对下一 token。
-
----
-
-## 7. 工具链与 CLI 设计（共享底座 + 4 独立入口）
-
-彻底取消 `Makefile` 与散装脚本，底层只留标准 `engine/CMakeLists.txt`（Ninja）与 `server/Cargo.toml`。所有开发/评测能力收归 `tools/`，由**纯 Python stdlib 底座（`tools/common/`）+ 4 个职责清晰、依赖隔离的顶层命令**组成：
-
-### 7.1 共享底座（`tools/common/`，零第三方依赖）
-- **单一配置源**：本地 `.dev.toml`（不进 git，仓库提供 `.dev.toml.example`）管理远程 5080 SSH、工作目录、模型权重路径与默认 workload。各 CLI 通过 `DevConfig` 解析模型与 golden 目录，`dev` 和 `forge` 共用 `common/build.py` 生成引擎构建命令。
-- **本地/远程透明一体**：在 Laptop 执行需 GPU/CUDA 的命令时自动增量同步源码 → 校验单卡锁 → 远程执行 → 回传摘要；在 Linux 5080 本机执行完全相同的命令时自动走本机路径。
-- **工作区隔离 + 大资产共享**：远程源码与 `build/` 按本地 worktree/workspace 名隔离（支持多分支/多 Agent 并行编辑不互踩）；模型权重目录与 `ccache` 缓存全局共享。
-- **单卡 lease 与进程监管**：`dev serve` 和 `forge` 通过标准输入向执行机发送 JSON 请求。`common/daemon.py` 在 HTTP 或 Unix socket 就绪后将 lease 从监管进程移交给目标 PID，定期续租，并在退出时持生命周期锁按 token 清理状态文件。
-- **Agent 原生输出契约**：终端默认输出简洁摘要；加 `--json` 时 **`stdout` 仅输出稳定 Schema 的纯净 JSON**（编译与同步日志走 `stderr`），每次运行自动归档至 `.runs/<id>.json`。
-
-### 7.2 四个顶层入口（严格克制，禁止新增散装脚本）
-
-| 命令 | 依赖边界 | 职责 |
-|---|---|---|
-| **`dev`** | 纯 stdlib | 工程骨架与服务运维：`status`（5080 占用/温度/显存/同步状态）、`build`（`--engine`/`--server`/`--all`）、`serve`（`start`/`stop`/`status`/`logs`，执行机通过 `/ready` 确认启动并在 `.serve/` 维护进程状态和日志）、`check`（`--local` 本地检查；`--gpu` 持锁运行 CTest、真实权重的算子和端到端 golden 检查，以及 forge-host 和 server 的 smoke 检查）、`ssh`（逃生舱）。 |
-| **`forge`** | 纯 stdlib | 驱动远端/本机 `forge-host` 的全部调优原语（`start/stop/status/run/ab/profile/dump/ls/rm`）。 |
-| **`bench`** | 轻量异步 HTTP & 统计 | 纯黑盒 HTTP 压测器（支持 `--url` 测自研或任意 OpenAI 兼容竞品）：固定 coding-agent trace、TTFT、Canary 回归、paired geometric mean + bootstrap CI 报表。以服务端计时为主、客户端校准为辅。 |
-| **`weights`** | 纯 stdlib 前端；离线生成子进程通过 `weights.python` 指向独立 PyTorch 环境 | 低频离线权重与参考对齐：`inspect`、`repack`（输出 `safetensors`）、`golden`（持单卡 lease 生成算子与 48 逻辑步 prefill/decode 黄金夹具，详见 [model.md](model.md)）、`kld`（复用已加载模型的 forge-host；空闲时按需启动并在评测后释放 lease）。 |
-
-`weights kld` 在执行机读取 golden 的 prompt 和生成序列，从最后一个 prompt token 开始比较下一 token 的完整分布。缺少对应 fixture 时评测全部 prompt 位置。forge-host 为每个模块和用例重置 KV，每批最多 8 行；只在主机保留所选位置的 FP32 参考 logits。每个模块加载一次，按位置以 FP64 计算 KL(ref ‖ cand)，汇总均值、最近秩 p95、最大值、top-1 一致率和最大 logit 绝对差。`baseline` 是 forge 启动时的 forward 快照；跨会话对比使用已保存的候选名称。
-
----
-
-## 8. 仓库目录结构与编码/构建规范
-
-### 8.1 目录布局
-
-```text
-flint-5080/
-├── bin/                 # 4 个薄入口包装：dev, forge, bench, weights（可加入 PATH 或 ./bin/... 调用）
-├── .dev.toml.example    # 唯一环境配置模板
-├── AGENTS.md            # Agent-Native 行为宪法、架构边界红线、数值准则与文档地图
-├── engine/              # 纯 C++/CUDA 引擎（独立 CMake + Ninja，不依赖 Rust）
-│   ├── CMakeLists.txt
-│   ├── include/
-│   │   └── engine_api.h # 唯一对外 Request 级 C ABI
-│   ├── src/
-│   │   ├── common/      # JSON 解析、CUDA 错误与 profiler 接口
-│   │   ├── loader/      # safetensors 加载、Arena 分配与 KV 快照布局
-│   │   ├── runtime/     # Request ABI、EngineRuntime 请求队列、前缀缓存与 prefill/decode
-│   │   ├── model/       # InklingRunner 前向编排与 CUDA Graph、注意力和 MoE 子模块
-│   │   ├── ops/         # sm_120a 无状态 CUDA 算子（严格单文件头文件隔离）
-│   │   └── forge/       # ForwardModule 热重载 DSO，Replay 管理懒录制、测量与显存泄漏检测，replay_metrics 对比数值与 golden
-│   ├── third_party/     # 版本锁定的外部 CUDA 库（如 CUTLASS/CuTe 等）
-│   └── tests/           # 引擎与算子 C++ 测试
-├── server/              # 极薄单 Crate Rust HTTP 服务
-│   ├── Cargo.toml
-│   └── src/             # http、generation、tokenizer、template、parser、engine_ffi，checks.rs 运行 smoke 与 chat golden
-├── tools/               # Python CLI 包（严禁进入生产运行路径）
-│   ├── common/          # 纯 stdlib 底座（config, remote sync, gpu lease lock, json output）
-│   ├── dev_cli/         # dev 命令实现
-│   ├── forge_cli/       # forge 命令实现
-│   ├── bench_cli/       # bench run（httpx 异步 HTTP / canary）、compare（配对统计）
-│   ├── weights_cli/     # weights 命令实现
-│   └── tests/           # pytest 自测（纳入 dev check --local）
-├── workloads/           # 固定 coding-agent 压测 trace、canary 与 forge 标准用例
-├── web/                 # (P1) 可选前端 UI
-└── docs/
-    ├── architecture.md  # 活蓝图（边界/工具链变更时原地更新，无 ADR）
-    ├── model.md         # (后续) 活文档：模型结构、权重布局与 5080 SOL 账本
-    ├── benchmark.md     # 固定评测口径、workload 与验收门禁
-    └── findings/        # 按日期追加的 GPU 实测证据库（含正/负实验与死胡同记录）
-```
-
-### 8.2 编译速度与代码卫生红线（写入工程规范）
-
-1. **头文件物理隔离**：`engine/src/ops/*.cu` 仅依赖极薄的纯 C POD 参数头文件，禁止构造“万能 `common.cuh`”，保护改单算子 2–5 秒增量编译红利。
-2. **克制模板实例化**：严禁在单个 `.cu` 中展开无用的多架构/多形状笛卡尔积模板，只实例化 `sm_120a` 实际需要的配置。
-3. **默认快构工具链**：CMake + Ninja + `ccache` + 快速链接器（`lld`/`mold`），关闭 `-rdc`。
-4. **热路径零动态分配**：推理循环内禁止 `cudaMalloc`/`cudaFree`，所有临时缓冲来自预分配 `Scratch Workspace Arena`。
-5. **严守跨层边界**：`server/` 禁止引入调度/KV/张量布局逻辑；`tools/` 外禁止散落一次性脚本。
-
----
-
-## 9. Bootstrap 推进路线图
-
-| 阶段 | 核心目标 | 验收标志 |
-|---|---|---|
-| **Phase 0：工程骨架与工具底座** | 建好目录、空壳 CMake/Cargo、`tools/common/`（远程同步 + 单卡 lease 锁 + JSON 输出）与 `dev status / build / check --local` | Mac 一键同步并在 5080 增量编通空壳 `libengine` + `forge-host` + `server` |
-| **Phase 1：C++ AR Baseline + `forge` 闭环** | 实现 `safetensors` loader、AR 前向、`weights golden` 逐层对齐、`forge start/run/ab/profile/dump` 热重载闭环 | `forge run --e2e` 与 HF 参考 logits/输出对齐；改单算子 6 秒内热重载生效 |
-| **Phase 2：Rust 薄壳 + `bench` 端到端** | 打通 `engine_api.h`、Chat Completions (SSE + reasoning + tool calls)、HF tokenizer/template golden 单测、VRAM Prefix Cache 与 `bench` | 真实 coding agent 客户端可流畅对话与调用工具；`bench` 跑出首份冻结基线 |
-| **Phase 3：DSpark 投机解码与功能补齐** | 以 `mtp_golden.safetensors` 对齐 `dspark` 草拟、验证与回滚，接入 `weights kld` 与 Prometheus `/metrics` | 投机 greedy 序列与 AR 逐 token 一致，可采集 KLD 与服务指标 |
-| **Phase 4：5080 SOL 深度优化** | 用 `forge` 评测 FlashAttention/FlashDecoding、EXL3 `sm_120a` 融合、`weights repack`、FP8 KV 与 PDL，优化 C1 和 C2 | 按固定负载记录延迟、SOL、C2 吞吐及 canary / KLD 回归结果 |
+编译速度与跨层边界红线（`ops/*.cu` 头文件隔离、克制 `sm_120a` 模板实例化、热路径零动态分配、跨层隔离）由 [AGENTS.md](../AGENTS.md) 统一约束。
