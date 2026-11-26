@@ -5,6 +5,7 @@ use crate::{
         FinishReason, GenerationError, GenerationEvent, GenerationRequest, GenerationStream,
         before_deadline, collect_generation, start_generation,
     },
+    metrics::{self, HttpMetrics},
     parser::{ParseDelta, ParsedToolCall},
     template::ChatTemplate,
     tokenizer::Tokenizer,
@@ -31,6 +32,7 @@ use tokio::time::Instant;
 use tokio_stream::StreamExt;
 
 pub struct AppState {
+    pub metrics: HttpMetrics,
     pub config: Config,
     pub engine: Arc<Engine>,
     pub tokenizer: Arc<Tokenizer>,
@@ -46,6 +48,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .nest("/v1", v1)
         .route("/health", get(|| async { Json(json!({"status":"ok"})) }))
         .route("/ready", get(ready))
+        .route("/metrics", get(metrics::scrape))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            metrics::count,
+        ))
         .with_state(state)
 }
 

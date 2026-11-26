@@ -36,6 +36,7 @@ async fn serve(options: server::config::Options) -> Result<(), BoxError> {
     let tokenizer = Arc::new(Tokenizer::from_model_dir(&config.model_dir)?);
     let engine = Arc::new(Engine::new(&config.engine_json())?);
     let router = build_router(Arc::new(AppState {
+        metrics: Default::default(),
         config,
         template,
         tokenizer,

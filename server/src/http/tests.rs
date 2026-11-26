@@ -25,6 +25,7 @@ fn state(engine: Engine) -> AppState {
     .resolve(None)
     .unwrap();
     AppState {
+        metrics: Default::default(),
         engine: Arc::new(engine),
         config,
         tokenizer: Arc::new(byte_tokenizer()),
@@ -649,5 +650,48 @@ async fn context_window_finish_reason() {
         assert_eq!(body["usage"]["prompt_tokens"], 5);
         assert_eq!(body["usage"]["completion_tokens"], reply.len());
         assert_eq!(body["choices"][0]["finish_reason"], reason);
+    }
+}
+
+#[tokio::test]
+async fn public_metrics_count_completed_responses_by_route_and_status() {
+    let mut app = script("hello");
+    app.config.api_key = Some("test".into());
+    let router = build_router(Arc::new(app));
+    let get = |path| HttpRequest::get(path).body(Body::empty()).unwrap();
+    for path in ["/ready", "/health", "/health?probe=1", "/metrics"] {
+        assert_eq!(query(router.clone(), get(path)).await.0, 200);
+    }
+    assert_eq!(query(router.clone(), get("/v1/models")).await.0, 401);
+    let stream = || {
+        let mut request = chat_request(json!({"stream":true}), None);
+        request
+            .headers_mut()
+            .insert("authorization", "Bearer test".parse().unwrap());
+        request
+    };
+    drop(router.clone().oneshot(stream()).await.unwrap());
+    assert_eq!(query(router.clone(), stream()).await.0, 200);
+
+    let response = router.oneshot(get("/metrics")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["content-type"],
+        "text/plain; version=0.0.4; charset=utf-8"
+    );
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let text = std::str::from_utf8(&bytes).unwrap();
+    assert!(text.contains("# TYPE flint_http_requests_total counter\n"));
+    for (endpoint, status, count) in [
+        ("/v1/chat/completions", "2xx", 1),
+        ("/v1/models", "4xx", 1),
+        ("/ready", "2xx", 1),
+        ("/health", "2xx", 2),
+        ("/metrics", "2xx", 1),
+    ] {
+        let expected = format!(
+            "flint_http_requests_total{{endpoint=\"{endpoint}\",status=\"{status}\"}} {count}"
+        );
+        assert!(text.lines().any(|line| line == expected), "{expected}");
     }
 }

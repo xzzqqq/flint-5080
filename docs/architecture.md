@@ -36,7 +36,7 @@
 │  • OpenAI Chat Completions (SSE / 非流式 / 取消 / 超时) + P1 Responses │
 │  • Tokenizer & Jinja Chat Template（离线 HF golden fixture 锁死对齐）  │
 │  • 独立可插拔 Reasoning / Tool-Call 流式解析器                         │
-│  • 极简 CLI/TOML 配置、/health、/ready、/v1/models、可选 API Key       │
+│  • CLI/TOML、/health、/ready、/metrics、/v1/models、可选 API Key      │
 └──────────────────────────────────────────────────────────────────────┘
                      │ 唯一跨语言边界：engine_api.h（Request 级 C ABI）
                      ▼
@@ -60,7 +60,7 @@
 | **OpenAI Chat Completions** | `server/` | `http.rs` 封装 JSON/SSE；`generation.rs` 共用模板、增量解码、stop 字符串过滤与终止遥测。断连或超时由流内 guard 取消引擎请求。 |
 | **Reasoning & Tool-Call 解析** | `server/` | 独立、可插拔的流式状态机模块，不与 HTTP handler 耦合。 |
 | **Tokenizer & Chat Template** | `server/` | `tokenizers` + `minijinja`，由离线 Python 脚本生成的 HF golden fixtures 在 `dev check --local` 中强制锁死 100% 一致。 |
-| **极简服务基础** | `server/` | `/health`、`/ready`、`/v1/models`、可选 `--api-key`、结构化 `tracing` 日志、`clap` + 单配置文件。 |
+| **极简服务基础** | `server/` | `/health`、`/ready`、`/metrics`（无需认证，导出引擎统计与按端点、状态类别汇总的 HTTP 计数）、`/v1/models`、可选 `--api-key`、结构化 `tracing` 日志、`clap` + 单配置文件。 |
 | **单卡低并发推理引擎** | `engine/` | 优化 C1 延迟、有余力优化 C2，不写死并发上限（超额自然排队）；支持 chunked prefill、请求取消与 CUDA Graph。 |
 | **VRAM Prefix Cache** | `engine/` | 针对 coding-agent 高前缀复用率场景内置显存级前缀共享。 |
 | **投机解码（`dspark`）** | `engine/` | 属于 P0 目标能力；Bootstrap 阶段先跑通 AR baseline，引擎步进结构原生兼容多 token verify，随后接入 `dspark`。 |
@@ -74,7 +74,7 @@
 | **OpenAI Responses API（HTTP + WebSocket）** | `server/` 路由与流式输出层保持协议无关抽象，后续平滑挂载。 |
 | **Host KV-RAM 缓存** | 纯 `engine/` 内部状态 `snapshot/restore` 扩展，**不暴露到 C ABI**。 |
 | **Vision 多模态** | `engine_api.h` 提交接口预留 `MediaSlice` 参数位（P0 传 `NULL, 0`）；`server/` 预留媒体解码位。 |
-| **基础 Prometheus Metrics & `web/` UI** | 引擎通过 `engine_stats_json()` 暴露指标快照，`server/` 后续按需挂 `/metrics` 和静态 `/ui/`。 |
+| **`web/` UI** | `server/` 后续按需挂载静态 `/ui/`。 |
 
 ### 3.3 Non-goals（明确移除，绝不带入）
 
@@ -121,7 +121,7 @@ uint64_t engine_submit(
 
 // 3. 取消与可观测性
 void  engine_cancel(EngineHandle* h, uint64_t req_id);
-char* engine_stats_json(EngineHandle* h); // 返回 JSON 快照供 /ready 与 P1 /metrics
+char* engine_stats_json(EngineHandle* h); // 返回 JSON 快照供 /ready 与 /metrics
 ```
 
 **接口契约要点**：
