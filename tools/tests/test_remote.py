@@ -49,6 +49,24 @@ def test_local_run(cfg, capsys):
         ex.run("echo problem >&2; exit 3", check=True)
 
 
+def test_stream_with_input(cfg, capsys):
+    # Fill stdout before reading stdin so a synchronous write would deadlock.
+    payload = "你好" * 100_000
+    ex = Executor(cfg)
+    result = ex.run(
+        "dd if=/dev/zero bs=65536 count=8 2>/dev/null; echo progress >&2; cat",
+        input_text=payload,
+        stream_stderr=True,
+        echo_stdout=False,
+        timeout=5,
+        check=True,
+    )
+    assert result.stdout == "\0" * (65536 * 8) + payload
+    assert capsys.readouterr().err == result.stderr == "progress\n"
+    assert ex.run("exit 0", stream_stderr=True, input_text=payload, check=True).stdout == ""
+    assert ex.run("cat", stream_stderr=True, input_text="", timeout=5, check=True).stdout == ""
+
+
 @pytest.mark.parametrize("stream", [False, True])
 def test_timeout(cfg, stream):
     with pytest.raises(subprocess.TimeoutExpired):

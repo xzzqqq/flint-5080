@@ -20,9 +20,9 @@ This report freezes the **Phase 2 AR HTTP serving baseline** on the RTX 5080 for
 - **Full Phase 2 acceptance green**: `dev check --local` (136 pytest, 22 cargo tests, format/lint/hygiene) and `dev check --gpu` (8/8 CTest, `ops-golden`, `e2e-golden`, `runtime-golden`, `forge-host`, `server` smoke & chat golden) all passed.
 - **Canary 6/6 passed (`61.8 s`)**: arithmetic reasoning, Python bugfix, single & multi-tool calls (`tool_call_multi` emitted 2 valid calls), stop-sequence truncation, and exact streaming vs. non-streaming UTF-8 parity (`utf8_stream_parity` hit 100% VRAM Prefix Cache on the second request, cutting prefill from `3,033.4 ms` to `1.08 ms`).
 - **Frozen `short` baseline (`535.0 s`, empty cache, 1 warmup + 3 rounds)**:
-  - `short_chat` (59 prompt tok): **`42.06 ms/round`** (`24.15 tok/s`, **8.44%** of 3.550 ms AR floor / **8.48%** context-matched SOL).
-  - `short_debug` (269 prompt tok): **`45.87 ms/round`** (`22.15 tok/s`, **7.74%** of 3.550 ms floor / **7.87%** context-matched SOL).
-  - `short_review` (1,087 prompt tok): **`58.98 ms/round`** (`17.22 tok/s`, **6.02%** of 3.550 ms floor / **6.38%** context-matched SOL).
+  - `short_chat` (59 prompt tok): **`42.06 ms/round`** (`23.78 tok/s`, **8.44%** of 3.550 ms AR floor / **8.48%** context-matched SOL).
+  - `short_debug` (269 prompt tok): **`45.87 ms/round`** (`21.80 tok/s`, **7.74%** of 3.550 ms floor / **7.87%** context-matched SOL).
+  - `short_review` (1,087 prompt tok): **`58.98 ms/round`** (`16.95 tok/s`, **6.02%** of 3.550 ms floor / **6.38%** context-matched SOL).
 - **Zero recapture & tight within-run stability**: Across all 12 `short` requests (warmup + 3 rounds × 3 cases), the engine executed **1 static CUDA Graph capture** and **756 graph launches** (`12 × 63`), `0` prefix cache hits / `12` misses (confirming cold nonce isolation), and `<0.3%` round-to-round `server_tpot_ms` spread.
 
 ## Measurements
@@ -33,26 +33,26 @@ All three cases emit `64` completion tokens (`63` decode rounds; first token emi
 
 | Case | Prompt / Output (tok) | Prefill Median (ms) | Prefill Rate (tok/s) | TTFT Median (ms) | TPOT Median (ms/round) | TPOT Rounds (ms) | Decode Rate (tok/s) | Context-Matched Floor (ms) | SOL % (3.550 ms / Matched) | Client ITL p50 / p95 (ms) | E2E Median (ms) | HTTP Overhead (ms) |
 |---|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|
-| `short_chat` | 59 / 64 | 4,921.07 | 11.99 | 5,131.30 | **42.059** | 41.952, 42.059, 42.063 | 24.15 | 3.569 | 8.44% / **8.48%** | 42.16 / 44.11 | 7,684.72 | 113.97 |
-| `short_debug` | 269 / 64 | 22,823.32 | 11.79 | 23,031.15 | **45.870** | 45.867, 45.870, 45.891 | 22.15 | 3.612 | 7.74% / **7.87%** | 45.95 / 48.67 | 25,833.50 | 117.43 |
-| `short_review` | 1,087 / 64 | 96,298.30 | 11.29 | 96,536.12 | **58.984** | 58.984, 58.993, 58.984 | 17.22 | 3.763 | 6.02% / **6.38%** | 58.99 / 60.52 | 100,135.95 | 121.08 |
-| **Suite Pooled (`n=9`)** | **269 / 64** | **22,823.32** | — | **23,031.15** | **45.870** | — | **22.15** | — | — | **45.95 / 48.67** | **25,833.50** | **117.43** |
+| `short_chat` | 59 / 64 | 4,921.07 | 11.99 | 5,131.30 | **42.059** | 41.952, 42.059, 42.063 | 23.78 | 3.569 | 8.44% / **8.48%** | 42.16 / 44.11 | 7,684.72 | 113.97 |
+| `short_debug` | 269 / 64 | 22,823.32 | 11.79 | 23,031.15 | **45.870** | 45.867, 45.870, 45.891 | 21.80 | 3.612 | 7.74% / **7.87%** | 45.95 / 48.67 | 25,833.50 | 117.43 |
+| `short_review` | 1,087 / 64 | 96,298.30 | 11.29 | 96,536.12 | **58.984** | 58.984, 58.993, 58.984 | 16.95 | 3.763 | 6.02% / **6.38%** | 58.99 / 60.52 | 100,135.95 | 121.08 |
+| **Suite Pooled (`n=9`)** | **269 / 64** | **22,823.32** | — | **23,031.15** | **45.870** | — | **21.80** | — | — | **45.95 / 48.67** | **25,833.50** | **117.43** |
 
 *Notes*:
-- `server_decode_tok_s` is `decode_tokens / (decode_ms / 1000)` (`64 / decode_s`), while `server_tpot_ms` is `decode_ms / decode_rounds` (`decode_ms / 63`).
+- `server_decode_tok_s` is `(decode_tokens - 1) / (decode_ms / 1000)`. It excludes the first token emitted during prefill, leaving 63 timed output tokens in each `short` request. `server_tpot_ms` is `decode_ms / decode_rounds` (`decode_ms / 63`).
 - `http_overhead_ms` (`114–121 ms`) includes SSH tunnel LAN round-trip from the Mac client plus HTTP/SSE framing.
 
 ### 2. Canary Suite (6 Cases, 7 Requests, 100% Pass)
 
 | Case | Mode | Prompt / Output (tok) | Cached Prefix | Prefill (ms) | TPOT (ms/round) | Decode (tok/s) | Finish Reason | Tool Calls | Result |
 |---|---|---:|---:|---:|---:|---:|---|---:|---|
-| `math_reasoning` | stream | 27 / 50 | 0 / 27 | 2,401.14 | 41.654 | 24.01 | `stop` | 0 | PASS |
-| `code_bugfix` | stream | 58 / 67 | 0 / 58 | 4,838.17 | 41.961 | 23.83 | `stop` | 0 | PASS |
-| `tool_call_single` | stream | 106 / 61 | 0 / 106 | 8,884.10 | 42.805 | 23.36 | `tool_calls` | 1 | PASS |
-| `tool_call_multi` | stream | 121 / 95 | 0 / 121 | 10,174.98 | 43.432 | 23.02 | `tool_calls` | 2 | PASS |
-| `stop_sequence` | stream | 50 / 118 | 0 / 50 | 4,198.89 | 42.412 | 23.58 | `stop` | 0 | PASS |
-| `utf8_stream_parity` | stream | 36 / 123 | 0 / 36 | 3,033.40 | 42.198 | 23.70 | `stop` | 0 | PASS |
-| `utf8_stream_parity` | non-stream | 36 / 123 | **36 / 36** | **1.08** | 42.194 | 23.70 | `stop` | 0 | PASS (exact parity) |
+| `math_reasoning` | stream | 27 / 50 | 0 / 27 | 2,401.14 | 41.654 | 23.53 | `stop` | 0 | PASS |
+| `code_bugfix` | stream | 58 / 67 | 0 / 58 | 4,838.17 | 41.961 | 23.48 | `stop` | 0 | PASS |
+| `tool_call_single` | stream | 106 / 61 | 0 / 106 | 8,884.10 | 42.805 | 22.98 | `tool_calls` | 1 | PASS |
+| `tool_call_multi` | stream | 121 / 95 | 0 / 121 | 10,174.98 | 43.432 | 22.78 | `tool_calls` | 2 | PASS |
+| `stop_sequence` | stream | 50 / 118 | 0 / 50 | 4,198.89 | 42.412 | 23.38 | `stop` | 0 | PASS |
+| `utf8_stream_parity` | stream | 36 / 123 | 0 / 36 | 3,033.40 | 42.198 | 23.51 | `stop` | 0 | PASS |
+| `utf8_stream_parity` | non-stream | 36 / 123 | **36 / 36** | **1.08** | 42.194 | 23.51 | `stop` | 0 | PASS (exact parity) |
 
 ### 3. Engine Runtime Telemetry (Post-`short` Run)
 

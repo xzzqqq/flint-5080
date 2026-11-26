@@ -3,16 +3,17 @@ import io
 import json
 import shlex
 import shutil
+import sys
 from pathlib import Path
 
 import httpx
 import pytest
 
 from tools.bench_cli import __main__ as cli
-from tools.bench_cli import client, commands
+from tools.bench_cli import client
 from tools.bench_cli.stats import paired_bootstrap_ci
 from tools.bench_cli.workloads import PERF, evaluate, load_workloads
-from tools.common.remote import CommandResult, SyncResult
+from tools.common.remote import Executor
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -23,6 +24,7 @@ class Endpoint:
     def __init__(self):
         self.requests = []
         self.active = self.peak = 0
+        self.model = "test-model"
         self.external = False
         self.fault = None
         self.prefill = 20
@@ -36,13 +38,14 @@ class Endpoint:
             return httpx.Response(
                 200,
                 json={
+                    "model": self.model,
                     "engine": {
                         "gpu_name": "mock",
                         "max_context": 4096,
                         "prefix_cache_slots": 3,
                         "use_cuda_graph": True,
                         "completed_requests": 101,
-                    }
+                    },
                 },
             )
         if req.url.path == "/v1/models":
@@ -65,7 +68,7 @@ class Endpoint:
             for i, city in enumerate(["Tokyo", "Paris"] if "Paris" in prompt else ["Tokyo"]):
                 calls.append(
                     {
-                        "id": f"call-{i}",
+                        "id": f"call-{len(self.chat)}-{i}",
                         "type": "function",
                         "function": {
                             "name": "get_weather",
@@ -187,8 +190,14 @@ def test_suites(suite, harness, monkeypatch):
     suites = [*PERF, "canary"] if suite == "all" else [suite]
     assert list(data["cases"]) == suites
     assert data["metadata"]["suites"] == suites
+    assert data["metadata"]["metrics_version"] == 2
+    assert data["metadata"]["client_location"] == "local"
     assert data["metadata"]["server"] == dict(
-        gpu_name="mock", max_context=4096, prefix_cache_slots=3, use_cuda_graph=True
+        model="test-model",
+        gpu_name="mock",
+        max_context=4096,
+        prefix_cache_slots=3,
+        use_cuda_graph=True,
     )
     assert data["metadata"]["canary_passed"] == (True if "canary" in suites else None)
     if "short" in suites:
@@ -198,10 +207,10 @@ def test_suites(suite, harness, monkeypatch):
             if b["messages"][0]["content"].startswith("[bench-short")
         ]
         assert [s.split()[0] for s in short] == [
-            "[bench-short-w00]",
-            "[bench-short-r01]",
-            "[bench-short-r02]",
-        ] * 3
+            f"[bench-short-{case_id}-{phase}]"
+            for case_id in data["cases"]["short"]
+            for phase in ("w00", "r01", "r02")
+        ]
         for case in data["cases"]["short"].values():
             assert [r["round"] for r in case["samples"]] == [1, 2]
             assert case["summary"]["prefill_ms"] == {"median": 20, "mean": 20, "n": 2}
@@ -211,10 +220,12 @@ def test_suites(suite, harness, monkeypatch):
             b for b in endpoint.chat if b["messages"][0]["content"].startswith("[bench-agent")
         ]
         assert len(agent_reqs) == 12
-        for i, tag in enumerate(
-            ["[bench-agent-w00]", "[bench-agent-r01]", "[bench-agent-r02]"] * 4
-        ):
-            b = agent_reqs[i]
+        tags = [
+            f"[bench-agent-{case_id}-{phase}] "
+            for case_id in data["cases"]["agent"]
+            for phase in ("w00", "r01", "r02")
+        ]
+        for b, tag in zip(agent_reqs, tags, strict=True):
             assert b["messages"][0]["content"].startswith(tag)
             assert b["tools"][0]["function"]["description"].startswith(tag)
         for case in data["cases"]["agent"].values():
@@ -230,7 +241,7 @@ def test_suites(suite, harness, monkeypatch):
         assert stream["metrics"]["chunk_count"] == 2
         m = plain["metrics"]
         assert m["client_ttft_ms"] == m["client_e2e_ms"] and m["client_itl_p50_ms"] is None
-        assert m["server_tpot_ms"] == 10 and m["server_decode_tok_s"] == 200
+        assert m["server_tpot_ms"] == 10 and m["server_decode_tok_s"] == 175
         assert m["cached_prefix_ratio"] == 0.3 and m["spec_accepted"] == 3
         assert m["http_overhead_ms"] == max(0, m["client_e2e_ms"] - 60)
 
@@ -248,7 +259,7 @@ def test_client_fallback(harness, external, off):
         "--suite",
         "short",
         "--model",
-        "explicit",
+        "explicit" if external else "test-model",
         "--telemetry",
         "off" if off else "auto",
         "--rounds",
@@ -301,21 +312,38 @@ def test_canary_gate(harness, fault, case, error):
     assert json.loads(Path(result["run_file"]).read_text())["ok"] is False
 
 
+def test_model_typo(harness):
+    endpoint, invoke, _ = harness
+    result = invoke("run", "--json", "--model", "tset-model", code=1)
+    assert (
+        "Requested model 'tset-model' does not match server model 'test-model'" in result["error"]
+    )
+    assert not endpoint.chat
+
+
 def test_compare(harness):
     endpoint, invoke, repo = harness
     base = invoke("run", "--json", "--suite", "short", "--rounds", "2")
+    endpoint.model = "other"
     candidate = invoke("run", "--json", "--suite", "short", "--rounds", "1", "--model", "other")
     # JSON stdout is also a supported input. Give each case a different ratio.
     for i, case in enumerate(candidate["data"]["cases"]["short"].values()):
         case["summary"]["prefill_ms"]["median"] = 20 * (2**i)
     path = repo / "candidate.json"
     path.write_text(json.dumps(candidate))
-    args = ["compare", base["run_file"], str(path)]
+    # Earlier archives have no metric version. Exercise a mismatched client location too.
+    del base["data"]["metadata"]["metrics_version"]
+    base["data"]["metadata"]["client_location"] = "remote_loopback"
+    older = repo / "baseline.json"
+    older.write_text(json.dumps(base))
+    args = ["compare", str(older), str(path)]
     result = invoke("--json", *args)
     assert "run_file" not in result
     data = result["data"]
     assert any("model:" in w for w in data["warnings"])
     assert any("rounds:" in w for w in data["warnings"])
+    assert "metrics_version: baseline=None, candidate=2" in data["warnings"]
+    assert "client_location: baseline='remote_loopback', candidate='local'" in data["warnings"]
     metric = data["metrics"]["prefill_ms"]
     assert sorted(p["ratio"] for p in metric["pairs"]) == [1, 2, 4]
     assert metric["candidate_over_baseline"] == pytest.approx(
@@ -489,16 +517,17 @@ def test_cli_overrides_and_custom_bench(harness):
     assert data["metadata"]["canary_passed"]
 
 
-def test_zero_decode_and_empty_stream():
+@pytest.mark.parametrize(("decode_tokens", "decode_ms"), [(0, 0), (1, 20)])
+def test_zero_decode_and_empty_stream(decode_tokens, decode_ms):
     async def run():
         frame = {
             "choices": [{"delta": {}, "finish_reason": "stop"}],
             "x_flint_telemetry": dict(
                 prefill_tokens=0,
                 cached_prefix_tokens=0,
-                decode_tokens=0,
+                decode_tokens=decode_tokens,
                 prefill_ms=0,
-                decode_ms=0,
+                decode_ms=decode_ms,
                 decode_rounds=0,
                 spec_accepted=0,
             ),
@@ -525,30 +554,32 @@ def test_remote_dispatch_and_local_overrides(harness, monkeypatch, tmp_path):
     )
     calls = []
 
-    class FakeExecutor:
-        def __init__(self, cfg):
-            self.cfg = cfg
+    # Substitute the SSH transport only. The real Executor streams to and from the child.
+    def local_transport(self, cmd, cwd):
+        argv = shlex.split(cmd)
+        calls.append(("run", argv))
+        return [
+            sys.executable,
+            "-c",
+            """
+import json, sys
+assert "--api-key-stdin" in sys.argv and sys.stdin.read() == "secret-token\\n"
+failed = "canary" in sys.argv
+data = {"metadata": {"client_location": "local", "suites": ["short"]}}
+error = "Canary failed: math_reasoning" if failed else None
+print(json.dumps({"ok": not failed, "data": data, "error": error}))
+sys.exit(int(failed))
+""",
+            *argv,
+        ]
 
-        def sync(self):
-            calls.append(("sync", self.cfg.remote.host))
-            return SyncResult(False, 1.0, "/workspace", 1, [])
-
-        def run(self, cmd, **kwargs):
-            calls.append(("run", shlex.split(cmd), kwargs))
-            payload = {
-                "command": "bench run",
-                "ok": False if "canary" in cmd else True,
-                "data": {"metadata": {"suites": ["short"]}, "cases": {}, "suite_summary": {}},
-                "error": "Canary failed: math_reasoning" if "canary" in cmd else None,
-            }
-            return CommandResult(0 if payload["ok"] else 1, json.dumps(payload), "", 1.0, [])
-
-    monkeypatch.setattr(commands, "Executor", FakeExecutor)
+    monkeypatch.setattr(Executor, "_args", local_transport)
+    monkeypatch.setattr(Executor, "sync", lambda self: calls.append(("sync", self.cfg.remote.host)))
     monkeypatch.setenv("FLINT_API_KEY", "secret-token")
     res = invoke("run", "--suite", "short", "--rounds", "2", "--warmup", "1", "--json")
     assert res["ok"] and Path(res["run_file"]).parent == repo / ".runs"
     assert calls[0] == ("sync", "gpu-5080")
-    _, argv, kwargs = calls[1]
+    _, argv = calls[1]
     assert argv[:9] == [
         "/remote/bench/python",
         "-m",
@@ -561,7 +592,7 @@ def test_remote_dispatch_and_local_overrides(harness, monkeypatch, tmp_path):
         "http://127.0.0.1:9090",
     ]
     assert "--api-key-stdin" in argv and "secret-token" not in argv
-    assert kwargs["input_text"] == "secret-token\n"
+    assert res["data"]["metadata"]["client_location"] == "remote_loopback"
 
     # Canary failure propagates remote exit code and diagnostics cleanly.
     failed = invoke("run", "--suite", "canary", "--json", code=1)
@@ -592,3 +623,14 @@ def test_remote_dispatch_and_local_overrides(harness, monkeypatch, tmp_path):
     outside.write_text("{}")
     err = invoke("run", "--suite", "short", "--bench-file", str(outside), "--json", code=1)
     assert "inside the repository" in err["error"]
+
+
+def test_tool_call_parity_uses_payload(harness):
+    _, invoke, repo = harness
+    source = json.loads((repo / "workloads/canary_cases.json").read_text())
+    case = next(c for c in source["canary"] if c["id"] == "tool_call_single")
+    case["checks"]["check_stream_parity"] = True
+    path = repo / "parity.json"
+    path.write_text(json.dumps({"canary": [case]}))
+    result = invoke("run", "--json", "--suite", "canary", "--canary-file", str(path))
+    assert result["data"]["metadata"]["canary_passed"]

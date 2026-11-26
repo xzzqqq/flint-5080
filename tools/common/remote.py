@@ -124,11 +124,31 @@ def _capture(
                     for index, pipe in enumerate((proc.stdout, proc.stderr)):
                         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
                         selector.register(pipe, selectors.EVENT_READ, (index, decoder))
+                    if proc.stdin is not None:
+                        pending = memoryview(input_text.encode())
+                        if pending:
+                            os.set_blocking(proc.stdin.fileno(), False)
+                            selector.register(proc.stdin, selectors.EVENT_WRITE)
+                        else:
+                            proc.stdin.close()
                     while selector.get_map():
                         remaining = None if timeout is None else start + timeout - time.monotonic()
                         if remaining is not None and remaining <= 0:
                             raise subprocess.TimeoutExpired(cmd[0], timeout)
-                        for key, _ in selector.select(remaining):
+                        for key, events in selector.select(remaining):
+                            if events & selectors.EVENT_WRITE:
+                                try:
+                                    written = os.write(key.fd, pending[:65536])
+                                    pending = pending[written:]
+                                    if pending:
+                                        continue
+                                except BlockingIOError:
+                                    continue
+                                except BrokenPipeError:
+                                    pass
+                                selector.unregister(key.fileobj)
+                                key.fileobj.close()
+                                continue
                             index, decoder = key.data
                             block = os.read(key.fd, 65536)
                             value = decoder.decode(block, final=not block)
@@ -201,8 +221,6 @@ class Executor:
         echo_stdout: bool = True,
         input_text: str | None = None,
     ) -> CommandResult:
-        if stream_stderr and input_text is not None:
-            raise ValueError("input_text requires buffered capture")
         result = _capture(
             self._args(shell_cmd, cwd),
             stream=stream_stderr,

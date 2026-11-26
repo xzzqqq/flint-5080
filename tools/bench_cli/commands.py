@@ -39,7 +39,12 @@ async def canary(send, case):
         try:
             response = await send(body, stream=stream)
             failures.extend(evaluate(checks, response))
-            outputs.append((response.content, response.reasoning_content, response.tool_calls))
+            # IDs identify a single request. Compare the ordered call payloads across requests.
+            calls = [
+                {k: v for k, v in call.items() if k != "id"} if isinstance(call, dict) else call
+                for call in response.tool_calls
+            ]
+            outputs.append((response.content, response.reasoning_content, calls))
             samples.append(
                 dict(
                     stream=stream,
@@ -128,6 +133,8 @@ def run_remote(cfg, args, root, result):
     result.ok = bool(remote["ok"])
     result.error = remote.get("error")
     result.data.update(remote["data"])
+    if "metadata" in result.data:
+        result.data["metadata"]["client_location"] = "remote_loopback"
 
 
 def dispatch_run(args, root, result):
@@ -154,11 +161,17 @@ async def run(args, root, result, *, cfg=None):
     url = (args.url or _default_url(cfg.server.bind)).rstrip("/")
     model = args.model or await client.discover_model(url, args.api_key, args.timeout)
     server = await client.probe_ready(url, args.timeout)
+    if args.model is not None and server and "model" in server and server["model"] != args.model:
+        raise ValueError(
+            f"Requested model {args.model!r} does not match server model {server['model']!r}"
+        )
     hashes = {
         s: hashlib.sha256(json.dumps(cases, sort_keys=True).encode()).hexdigest()
         for s, cases in workloads.items()
     }
     meta = dict(
+        metrics_version=2,
+        client_location="local",
         model=model,
         suites=list(suites),
         rounds=args.rounds,
@@ -232,6 +245,8 @@ def compare(args, result):
     left, right = baseline["data"], candidate["data"]
     a, b = left["metadata"], right["metadata"]
     for field in (
+        "metrics_version",
+        "client_location",
         "model",
         "suites",
         "rounds",

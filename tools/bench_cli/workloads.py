@@ -126,7 +126,7 @@ def requests_for(suite, case, number, warmup, width=2):
     phase = "w" if warmup else "r"
     index = f"{number:0{width}d}"
     if suite in PERF and case.get("cold_nonce"):
-        tag = f"[bench-{suite}-{phase}{index}] "
+        tag = f"[bench-{suite}-{case['id']}-{phase}{index}] "
         # Inkling renders tool declarations before the system message. Isolate those too.
         if options.get("tools"):
             options["tools"] = deepcopy(options["tools"])

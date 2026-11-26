@@ -39,9 +39,16 @@ async def probe_ready(url, timeout):
             response = await client.get(url + "/ready")
             response.raise_for_status()
             body = response.json()
-            engine = body.get("engine") if isinstance(body, dict) else None
-            if isinstance(engine, dict):
-                return {k: engine[k] for k in fields if k in engine} or None
+            if isinstance(body, dict):
+                engine = body.get("engine")
+                server = (
+                    {k: engine[k] for k in fields if k in engine}
+                    if isinstance(engine, dict)
+                    else {}
+                )
+                if isinstance(body.get("model"), str) and body["model"]:
+                    server["model"] = body["model"]
+                return server or None
     except (httpx.HTTPError, TimeoutError, ValueError):
         pass
     return None
@@ -81,8 +88,9 @@ def record_usage(metrics, frame, telemetry):
         metrics["telemetry_source"] = "server"
         if t["decode_rounds"] > 0:
             metrics["server_tpot_ms"] = t["decode_ms"] / t["decode_rounds"]
-        if t["decode_ms"] > 0:
-            metrics["server_decode_tok_s"] = t["decode_tokens"] / (t["decode_ms"] / 1000)
+        decode_generated = max(0, t["decode_tokens"] - 1)
+        if t["decode_ms"] > 0 and decode_generated > 0:
+            metrics["server_decode_tok_s"] = decode_generated / (t["decode_ms"] / 1000)
         metrics["cached_prefix_ratio"] = t["cached_prefix_tokens"] / max(1, t["prefill_tokens"])
 
 

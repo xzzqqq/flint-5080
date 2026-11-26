@@ -7,8 +7,9 @@ When `.dev.toml` enables `[remote]` and `--url`/`--local` are omitted, `bench ru
 syncs the workspace, runs on the execution host over loopback using `[bench].python`,
 and archives the run record locally under `.runs/`.
 Set `FLINT_API_KEY` for authenticated endpoints. The harness discovers the first
-model in `/v1/models` unless given `--model`. It samples static engine metadata
-from Flint's `/ready`. All generation goes through OpenAI Chat Completions.
+model in `/v1/models` unless given `--model`. It checks an explicit model against
+the name reported by Flint's `/ready` and samples static engine metadata there.
+All generation goes through OpenAI Chat Completions.
 
 ## Fixed synthetic inputs
 
@@ -16,7 +17,7 @@ from Flint's `/ready`. All generation goes through OpenAI Chat Completions.
 | --- | --- | --- |
 | short | Serial short chat, medium debugging, long code review. Nominal input sizes ~40/256/1024 tokens, maximum 64 output tokens. | Short-context steady C1 decode and SOL |
 | agent | Four frozen SWE-bench Verified coding-agent snapshots spanning Q1–Q4 context lengths (8.5K / 15.1K / 22.4K / 47.1K tokens) across edit, explore and debug stages. `reasoning_effort: "max"`, maximum 8,192 output tokens, natural EOS. | Realistic long-context C1 decode under Full-Attention KV load and DSpark acceptance |
-| canary | One greedy pass over arithmetic, code, single/multiple tool calls, stop strings and bilingual UTF-8. The parity case also sends one non-streaming request. | All assertions pass, including exact reconstructed content, reasoning and tool calls for parity |
+| canary | One greedy pass over arithmetic, code, single/multiple tool calls, stop strings and bilingual UTF-8. The parity case also sends one non-streaming request. | All assertions pass, including exact reconstructed content, reasoning and tool-call payloads for parity, excluding request-specific IDs |
 
 Inputs and checks live in `workloads/{bench,canary}_cases.json`. All cases use
 temperature zero. The `agent` cases are a 4-request stratified subset extracted
@@ -25,11 +26,12 @@ from `coding_agent_48` (`django__django-11099`, `pydata__xarray-4687`,
 The multi-city canary validates every call and records the actual count,
 accepting one or more valid calls.
 
-Cold requests prefix the first message with `[bench-<suite>-w00] ` during warmup
-and `[bench-<suite>-r01] ` in the first measured round. For `agent` cases with
-tools, the first tool description carries that tag too because Inkling
-serializes tools before messages. Tags repeat across invocations. For official
-comparisons start from equivalent, empty server caches. Inspect actual cached
+Cold requests prefix the first message with `[bench-<suite>-<case-id>-w00] `
+during warmup and `[bench-<suite>-<case-id>-r01] ` in the first measured round.
+For cases with tools, the first tool description carries the same tag because
+Inkling serializes tools before messages. The case ID isolates cases sharing
+tool definitions and system prompts. Tags repeat across invocations. For
+official comparisons start from equivalent, empty server caches. Inspect actual cached
 token counts on cold requests: templates may contribute a common prefix. Record
 the returned prompt lengths.
 
@@ -42,8 +44,12 @@ suite. A suite summary pools its measured requests.
 
 Request `X-Flint-Telemetry: 1` and streaming `stream_options.include_usage`.
 Use the returned `x_flint_telemetry` as the primary engine measurement.
-TPOT is decode ms per decode **round**. Output rate is decode tokens per decode
-second. These can differ under speculative decoding. Report cached tokens over
+TPOT is decode ms per decode **round**. With `metrics_version=2`,
+`server_decode_tok_s` is
+`(decode_tokens - 1) / (decode_ms / 1000)`. It counts tokens emitted during
+decode rounds, excluding the first token generated during prefill. The rate is
+unavailable when no such tokens were emitted or decode time is zero. Tokens per
+round can vary under speculative decoding. Report cached tokens over
 total prefill tokens and the nonnegative residual of client E2E minus server
 prefill and decode time. That residual includes queueing, transport and server
 overhead. Exact queue wait requires an explicit server timer.
@@ -70,7 +76,9 @@ their original values in the metric's exclusions.
 
 Check warnings for model, selected suites, workload hashes, round and warmup
 counts, telemetry mode, canary status and available GPU/engine configuration.
-Also match weights, precision, client location, cache state, driver, GPU
+`bench compare` also warns on mismatched `metrics_version` or `client_location`
+(`local` or `remote_loopback`), including fields missing from older archives.
+Also match weights, precision, cache state, driver, GPU
 clocks/power and background load. Record deliberate changes. A comparison with
 unmatched conditions is diagnostic.
 
