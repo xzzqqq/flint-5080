@@ -3,16 +3,11 @@
 #include <algorithm>
 #include <limits>
 
-#include "common/cuda_check.h"
-
 namespace flint {
 namespace {
 constexpr uint32_t kMinPinGap = 16;
 size_t CommonPrefix(std::span<const int32_t> a, std::span<const int32_t> b) {
   return std::mismatch(a.begin(), a.end(), b.begin(), b.end()).first - a.begin();
-}
-void Copy(void* dst, const void* src, size_t bytes, cudaStream_t stream) {
-  CheckCuda(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, stream), "prefix snapshot");
 }
 }  // namespace
 
@@ -28,9 +23,7 @@ PrefixCache::PrefixCache(uint32_t slots, const ModelConfig& config, uint32_t max
   sizes_ = ComputeKvArenaSizes(config);
   if (slots > std::numeric_limits<size_t>::max() / sizes_.Fixed())
     throw std::length_error("prefix cache size overflow");
-  void* ptr;
-  CheckCuda(cudaMalloc(&ptr, slots * sizes_.Fixed()), "allocate prefix cache");
-  device_.reset(ptr);
+  snapshots_ = AllocateDeviceBuffer(slots * sizes_.Fixed());
 }
 
 PrefixPlan PrefixCache::Match(std::span<const int32_t> prompt) {
@@ -73,10 +66,9 @@ PrefixPlan PrefixCache::Match(std::span<const int32_t> prompt) {
 void PrefixCache::Restore(int index, const KvStateArenaView& kv, cudaStream_t stream) {
   auto& slot = slots_.at(index);
   if (!slot.valid) throw std::logic_error("invalid prefix snapshot");
-  if (device_) {
-    auto* src = static_cast<const std::byte*>(device_.get()) + index * sizes_.Fixed();
-    Copy(kv.swa_kv, src, sizes_.swa, stream);
-    Copy(kv.kv_conv_state, src + sizes_.swa, sizes_.kv_conv + sizes_.sublayer_conv, stream);
+  if (snapshots_) {
+    auto* src = static_cast<const std::byte*>(snapshots_.get()) + index * sizes_.Fixed();
+    CopySnapshotToFixedKv(kv, src, sizes_, stream);
   }
   live_tokens_ = slot.tokens;
   slot.lru_tick = ++tick_;
@@ -94,10 +86,9 @@ void PrefixCache::Save(std::span<const int32_t> tokens, const KvStateArenaView& 
     });
   if (!last_logits.empty() && it->last_logits.size() != last_logits.size())
     throw std::invalid_argument("invalid prefix logits size");
-  if (device_) {
-    auto* dst = static_cast<std::byte*>(device_.get()) + (it - slots_.begin()) * sizes_.Fixed();
-    Copy(dst, kv.swa_kv, sizes_.swa, stream);
-    Copy(dst + sizes_.swa, kv.kv_conv_state, sizes_.kv_conv + sizes_.sublayer_conv, stream);
+  if (snapshots_) {
+    auto* dst = static_cast<std::byte*>(snapshots_.get()) + (it - slots_.begin()) * sizes_.Fixed();
+    CopyFixedKvToSnapshot(dst, kv, sizes_, stream);
   }
   it->tokens.assign(tokens.begin(), tokens.end());
   it->has_logits = !last_logits.empty();

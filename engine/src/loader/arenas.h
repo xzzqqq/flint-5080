@@ -3,7 +3,6 @@
 
 #include <cuda_runtime_api.h>
 
-#include <array>
 #include <filesystem>
 #include <memory>
 #include <utility>
@@ -16,6 +15,12 @@ namespace detail {
 struct DeviceFree {
   void operator()(void* ptr) const noexcept { cudaFree(ptr); }
 };
+}  // namespace detail
+
+using DeviceBuffer = std::unique_ptr<void, detail::DeviceFree>;
+[[nodiscard]] DeviceBuffer AllocateDeviceBuffer(size_t bytes);
+
+namespace detail {
 template <class View>
 class DeviceArena {
  public:
@@ -31,7 +36,7 @@ class DeviceArena {
     }
     return *this;
   }
-  std::unique_ptr<void, DeviceFree> allocation_;
+  DeviceBuffer allocation_;
   View view_{};
 };
 }  // namespace detail

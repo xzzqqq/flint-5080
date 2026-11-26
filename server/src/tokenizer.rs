@@ -1,13 +1,12 @@
 use std::{
     collections::{HashMap, HashSet},
-    error::Error,
     fs,
     path::Path,
     str,
 };
 use tokenizers::Tokenizer as Backend;
 
-pub type TokenizerError = Box<dyn Error + Send + Sync>;
+pub type TokenizerError = crate::BoxError;
 
 #[derive(Clone, Debug)]
 pub struct SpecialTokens {

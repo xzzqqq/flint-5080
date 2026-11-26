@@ -26,6 +26,7 @@ struct Capture {
   std::vector<int32_t> tokens;
   EngineTelemetry telemetry{};
   EngineStatus status{};
+  EngineStopReason stop_reason{};
   bool valid = true;
   std::thread::id caller = std::this_thread::get_id();
   std::promise<void>* done{};
@@ -43,6 +44,8 @@ void Collect(const EngineEvent* event, void* user_data) {
   capture.request_id = event->req_id;
   capture.kinds.push_back(event->kind);
   capture.status = event->status;
+  capture.stop_reason = event->stop_reason;
+  capture.valid &= event->kind == ENGINE_EVENT_DONE || event->stop_reason == ENGINE_STOP_NONE;
   capture.telemetry = event->telemetry;
 
   if (event->kind == ENGINE_EVENT_TOKENS && event->token_ids != nullptr) {
@@ -87,7 +90,8 @@ void CheckRequests(EngineHandle* engine) {
 
   const auto success = submit(kPrompt);
   Require(success.kinds == std::vector{ENGINE_EVENT_TOKENS, ENGINE_EVENT_DONE} &&
-              success.tokens == std::vector<int32_t>{42} && success.status == ENGINE_OK,
+              success.tokens == std::vector<int32_t>{42} && success.status == ENGINE_OK &&
+              success.stop_reason == ENGINE_STOP_EOS,
           "token stream");
   const auto& telemetry = success.telemetry;
   Require(telemetry.prefill_tokens == 4 && telemetry.decode_tokens == 1 &&
@@ -111,7 +115,8 @@ void CheckRequests(EngineHandle* engine) {
 
   params.max_tokens = 0;
   const auto empty = submit(kPrompt);
-  Require(empty.kinds == std::vector{ENGINE_EVENT_DONE} && empty.telemetry.decode_tokens == 0,
+  Require(empty.kinds == std::vector{ENGINE_EVENT_DONE} && empty.telemetry.decode_tokens == 0 &&
+              empty.stop_reason == ENGINE_STOP_MAX_TOKENS,
           "zero token limit");
 
   std::unique_ptr<char, decltype(&engine_string_free)> stats(engine_stats_json(engine),
@@ -173,6 +178,8 @@ void CheckQueue(bool destroy) {
   Require(order == std::vector<uint64_t>{a, b, c}, "FIFO terminal order");
   Require(first.valid && second.valid && third.valid && second.status == ENGINE_ERR_CANCELLED &&
               third.tokens.empty() &&
+              first.stop_reason == (destroy ? ENGINE_STOP_NONE : ENGINE_STOP_MAX_TOKENS) &&
+              third.stop_reason == (destroy ? ENGINE_STOP_NONE : ENGINE_STOP_STOP_TOKEN) &&
               third.status == (destroy ? ENGINE_ERR_CANCELLED : ENGINE_OK) &&
               first.status == (destroy ? ENGINE_ERR_CANCELLED : ENGINE_OK),
           "pending request outcomes");

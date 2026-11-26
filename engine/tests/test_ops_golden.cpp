@@ -11,18 +11,19 @@
 #include <iostream>
 #include <map>
 #include <numeric>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <vector>
 
 #include "loader/arenas.h"
 #include "loader/safetensors.h"
+#include "model/submodules.h"
 #include "model/visit_plan.h"
 #include "ops/attention_ops.h"
 #include "ops/moe_ops.h"
 #include "ops/norm_ops.h"
 #include "ops/sconv_ops.h"
-#include "ops/submodules.h"
 
 namespace {
 using namespace flint;
@@ -225,8 +226,8 @@ void Golden(const char* dir, const char* file, const Gemm& g) {
                       FLINT_BF16,
                       FLINT_BF16};
       if (full) {
-        RunRowMatmul(g, ws.view(), f.data(p + "condition"), l.k_weight_proj, delta.get(), t, 32,
-                     2304, FLINT_BF16, FLINT_BF16, true);
+        RunParityRowMatmul(g, ws.view(), f.data(p + "condition"), l.k_weight_proj, delta.get(), t,
+                           32, 2304, FLINT_BF16, FLINT_BF16, true);
         Check(flint_dynamic_sconv(conv, nullptr));
       } else
         Check(flint_static_sconv(conv, nullptr));
@@ -256,8 +257,9 @@ void Golden(const char* dir, const char* file, const Gemm& g) {
   Buffer<uint16_t> y(t * 2304);
   Buffer<float> logits(t * 128), weights(t * 8);
   Buffer<int> ids(t * 8);
-  RunSparseMoeBlock(g, ws.view(), m.layers[0], f.data("moe.x"), y.get(), t, logits.get(), ids.get(),
-                    weights.get());
+  RunSparseMoeBlock(g, ws.view(), m.layers[0], f.data("moe.x"), y.get(), t,
+                    reinterpret_cast<const ExpertProjection*>(m.expert_table), logits.get(),
+                    ids.get(), weights.get());
   Compare("moe.router_logits", logits.read(), f.host<float>("moe.router_logits"), 0, 0);
   auto ref_ids = f.host<int>("moe.top8_ids"), actual_ids = ids.read();
   Require(actual_ids == ref_ids, "moe.top8_ids slot mismatch");
@@ -631,6 +633,13 @@ void SyntheticLoop(const Gemm& g) {
                   ((1 - tanhf(block[2 + i])) * block[i] + tanhf(partial[i]) * partial[i])) < 1e-6,
             "message mix");
 }
+Buffer<ExpertProjection> UploadSyntheticExperts(const LayerWeightsView& layer) {
+  std::vector<ExpertProjection> table;
+  for (auto projection : {std::span(layer.gate_up_proj), std::span(layer.down_proj)})
+    for (const auto& matrix : projection)
+      table.push_back({matrix.trellis, matrix.suh, matrix.svh, matrix.k2});
+  return Buffer<ExpertProjection>(table);
+}
 void SyntheticComposition(const Gemm& g) {
   auto scratch = ScratchArena::Allocate(48u << 20);
   // A zero trellis decodes to a constant inner matrix. The two Hadamard
@@ -655,7 +664,8 @@ void SyntheticComposition(const Gemm& g) {
   std::vector<uint16_t> x(2304);
   x[0] = B(1);
   Buffer<uint16_t> input(x), output(2304);
-  RunSparseMoeBlock(g, scratch.view(), layer, input.get(), output.get(), 1);
+  auto experts = UploadSyntheticExperts(layer);
+  RunSparseMoeBlock(g, scratch.view(), layer, input.get(), output.get(), 1, experts.get());
   float code = __half2float(__float2half(1024.f * __half2float(__ushort_as_half(0x1eee)) +
                                          __half2float(__ushort_as_half(0xc931))));
   float factor = code * 128 / 256;
@@ -682,6 +692,7 @@ void SyntheticComposition(const Gemm& g) {
       projection[e].k2 = 6 + e % 2;
     }
   }
+  experts = UploadSyntheticExperts(layer);
   for (int t : {5, 35}) {
     int rows = t * 8;
     std::vector<uint16_t> values(t * 2304);
@@ -693,8 +704,8 @@ void SyntheticComposition(const Gemm& g) {
         activated(1152);
     Buffer<int> ids(rows);
     Buffer<float> weights(rows);
-    RunSparseMoeBlock(g, scratch.view(), layer, src.get(), grouped.get(), t, nullptr, ids.get(),
-                      weights.get());
+    RunSparseMoeBlock(g, scratch.view(), layer, src.get(), grouped.get(), t, experts.get(), nullptr,
+                      ids.get(), weights.get());
     auto selected = ids.read();
     for (int s = 0; s < rows; ++s) {
       RunExl3Linear(g, scratch.view(), layer.gate_up_proj[selected[s]], src.get() + (s / 8) * 2304,

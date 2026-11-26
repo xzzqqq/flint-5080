@@ -12,8 +12,8 @@
 #include "forge/forward_abi.h"
 #include "loader/arenas.h"
 #include "loader/safetensors.h"
+#include "loader/scratch_workspace.h"
 #include "model/visit_plan.h"
-#include "ops/scratch_workspace.h"
 
 namespace {
 using namespace flint;
@@ -131,7 +131,7 @@ bool Case(Runner& run, const ModelConfig& c, const KvStateArenaView& kv,
   auto t = unsigned(ids.size()), vocab = c.unpadded_vocab_size;
   size_t n = size_t(t) * c.hidden_size;
   auto io = ScratchArena::Allocate(2 * n * (1 + 8 + 53) + vocab * 4 + t * 4 + 32768);
-  ops_detail::ScratchWorkspace ws(io.view());
+  ScratchWorkspace ws(io.view());
   auto hidden = ws.Take<uint16_t>(n), carry = ws.Take<uint16_t>(8 * n);
   ForwardCapture cap{};
   cap.embed = ws.Take<uint16_t>(n);

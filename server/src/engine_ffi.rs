@@ -2,7 +2,7 @@ use serde::Serialize;
 use std::fmt;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
-pub const FLINT_ENGINE_ABI_VERSION: u32 = 1;
+pub const FLINT_ENGINE_ABI_VERSION: u32 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -20,6 +20,16 @@ pub enum EngineEventKind {
     Tokens = 0,
     Done = 1,
     Error = 2,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EngineStopReason {
+    None = 0,
+    Eos = 1,
+    StopToken = 2,
+    MaxTokens = 3,
+    ContextLimit = 4,
 }
 
 #[repr(C)]
@@ -41,6 +51,7 @@ pub struct EngineEvent {
     pub req_id: u64,
     pub kind: EngineEventKind,
     pub status: EngineStatus,
+    pub stop_reason: EngineStopReason,
     pub token_ids: *const i32,
     pub n_tokens: usize,
     pub telemetry: EngineTelemetry,
@@ -82,7 +93,7 @@ pub struct Request<'a> {
 #[derive(Debug)]
 pub enum Event {
     Tokens(Vec<i32>, Telemetry),
-    Done(Telemetry),
+    Done(Telemetry, EngineStopReason),
 }
 
 #[derive(Debug)]
@@ -114,16 +125,12 @@ pub use backend::Engine;
 pub type EventReceiver = UnboundedReceiver<Result<Event, EngineError>>;
 
 impl Engine {
-    pub fn max_context(&self) -> Option<u32> {
-        self.max_context
-    }
-
     pub fn submit(&self, req: &Request<'_>) -> Result<(u64, Vec<Event>), EngineError> {
         let (id, mut rx) = self.submit_stream(req)?;
         let mut events = Vec::new();
         while let Some(message) = rx.blocking_recv() {
             let event = message?;
-            let done = matches!(event, Event::Done(_));
+            let done = matches!(event, Event::Done(..));
             events.push(event);
             if done {
                 return Ok((id, events));
@@ -157,7 +164,6 @@ mod backend {
     type Handler = dyn Fn(&Request<'_>, UnboundedSender<Result<Event, EngineError>>) + Send + Sync;
 
     pub struct Engine {
-        pub(super) max_context: Option<u32>,
         submitted: AtomicU64,
         cancellations: Mutex<Vec<u64>>,
         handler: Box<Handler>,
@@ -176,7 +182,14 @@ mod backend {
                 if emit {
                     let _ = tx.send(Ok(Event::Tokens(vec![42], t)));
                 }
-                let _ = tx.send(Ok(Event::Done(t)));
+                let reason = if t.decode_tokens >= req.max_tokens {
+                    EngineStopReason::MaxTokens
+                } else if emit {
+                    EngineStopReason::Eos
+                } else {
+                    EngineStopReason::StopToken
+                };
+                let _ = tx.send(Ok(Event::Done(t, reason)));
             }))
         }
         pub fn with_stub(
@@ -186,15 +199,10 @@ mod backend {
             + 'static,
         ) -> Self {
             Self {
-                max_context: None,
                 submitted: AtomicU64::new(0),
                 cancellations: Mutex::default(),
                 handler: Box::new(handler),
             }
-        }
-        pub fn with_max_context(mut self, max_context: u32) -> Self {
-            self.max_context = Some(max_context);
-            self
         }
         pub fn cancelled_ids(&self) -> Vec<u64> {
             self.cancellations.lock().unwrap().clone()
@@ -291,7 +299,7 @@ mod backend {
                 let ids = unsafe { slice::from_raw_parts(event.token_ids, event.n_tokens) };
                 Ok(Event::Tokens(ids.to_vec(), event.telemetry))
             }
-            EngineEventKind::Done => Ok(Event::Done(event.telemetry)),
+            EngineEventKind::Done => Ok(Event::Done(event.telemetry, event.stop_reason)),
             EngineEventKind::Error => {
                 let msg = if event.error_message.is_null() {
                     "engine error without a diagnostic".into()
@@ -316,7 +324,6 @@ mod backend {
 
     pub struct Engine {
         handle: NonNull<EngineHandle>,
-        pub(super) max_context: Option<u32>,
     }
     // The runtime serializes GPU execution and synchronizes all shared request state.
     // Drop requires exclusive ownership and joins the worker before releasing the handle.
@@ -340,21 +347,7 @@ mod backend {
                     telemetry: Telemetry::default(),
                     message: take_string(err).unwrap_or_else(|| "engine creation failed".into()),
                 })?;
-                #[derive(serde::Deserialize)]
-                struct Limits {
-                    max_context: u32,
-                }
-                let mut engine = Self {
-                    handle,
-                    max_context: None,
-                };
-                engine.max_context = engine
-                    .stats_json()
-                    .ok()
-                    .and_then(|s| serde_json::from_str::<Limits>(&s).ok())
-                    .map(|limits| limits.max_context)
-                    .filter(|&n| n > 0);
-                Ok(engine)
+                Ok(Self { handle })
             }
         }
         pub fn stats_json(&self) -> Result<String, EngineError> {
@@ -442,7 +435,11 @@ mod tests {
             ..Default::default()
         };
         let (id, events) = engine.submit(&request).unwrap();
-        let [Event::Tokens(ids, _), Event::Done(t)] = events.as_slice() else {
+        let [
+            Event::Tokens(ids, _),
+            Event::Done(t, EngineStopReason::MaxTokens),
+        ] = events.as_slice()
+        else {
             panic!("unexpected events: {events:?}")
         };
         assert_eq!(ids, &[42]);
@@ -461,7 +458,25 @@ mod tests {
             })
             .unwrap();
         assert!(next > id);
-        assert!(matches!(&events[..], [Event::Done(t)] if t.decode_tokens == 0));
-        assert_eq!(stats()["submitted_requests"], 2);
+        assert!(
+            matches!(&events[..], [Event::Done(t, EngineStopReason::MaxTokens)] if t.decode_tokens == 0)
+        );
+        for (stops, reason, count) in [
+            (&[42][..], EngineStopReason::StopToken, 0),
+            (&[][..], EngineStopReason::Eos, 1),
+        ] {
+            let (_, events) = engine
+                .submit(&Request {
+                    max_tokens: 2,
+                    stop_token_ids: stops,
+                    ..request
+                })
+                .unwrap();
+            assert!(
+                matches!(events.last(), Some(Event::Done(t, r)) if *r == reason && t.decode_tokens == count)
+            );
+            assert_eq!(events.len(), count as usize + 1);
+        }
+        assert_eq!(stats()["submitted_requests"], 4);
     }
 }

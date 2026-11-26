@@ -1,5 +1,8 @@
 use crate::{
-    engine_ffi::{Engine, EngineError, EngineStatus, Event, EventReceiver, Request, Telemetry},
+    engine_ffi::{
+        Engine, EngineError, EngineStatus, EngineStopReason, Event, EventReceiver, Request,
+        Telemetry,
+    },
     parser::{ParseDelta, ParsedMessage, ResponseParser},
     template::{ChatTemplate, TemplateError},
     tokenizer::Tokenizer,
@@ -169,7 +172,7 @@ async fn receive(
     guard: &mut CancelGuard,
 ) -> Result<Event, GenerationError> {
     let item = before_deadline(deadline, rx.recv()).await?;
-    if matches!(item, Some(Ok(Event::Done(_)) | Err(_))) {
+    if matches!(item, Some(Ok(Event::Done(..)) | Err(_))) {
         guard.disarm();
     }
     item.unwrap_or_else(|| {
@@ -192,7 +195,7 @@ async fn drain_cancelled(
     while let Some(event) = before_deadline(deadline, rx.recv()).await? {
         match event {
             Ok(Event::Tokens(_, t)) => latest = t,
-            Ok(Event::Done(t)) => return Ok(t),
+            Ok(Event::Done(t, _)) => return Ok(t),
             Err(e) => return Ok(e.telemetry),
         }
     }
@@ -249,10 +252,9 @@ pub async fn start_generation(
         top_p: req.top_p,
         top_k: req.top_k,
         seed: req.seed,
-        stop_token_ids: &[tokenizer.special.eos_token_id],
+        stop_token_ids: &[],
         ignore_eos: false,
     })?;
-    let max_context = engine.max_context();
     let mut guard = CancelGuard::new(engine, id, deadline);
     // Before committing SSE headers, observe the first worker callback so
     // prompt admission errors and prefill timeouts can set the HTTP status.
@@ -268,23 +270,18 @@ pub async fn start_generation(
         let mut decoder = tokenizer.stream_decoder();
         let mut filter = StopFilter { stops: req.stop_strings, pending: String::new(), matched: false };
         let mut calls = false;
-        let mut eos = false;
-        let telemetry = loop {
+        let (telemetry, finish_reason) = loop {
             let (deltas, telemetry, done) = match event {
                 Event::Tokens(ids, t) => {
                     let mut deltas = Vec::new();
                     for id in ids {
                         deltas.extend(parser.push_token(id, &decoder.push(id)));
-                        if id == tokenizer.special.eos_token_id {
-                            eos = true;
-                            break;
-                        }
                     }
-                    (deltas, t, false)
+                    (deltas, t, None)
                 }
-                Event::Done(t) => {
+                Event::Done(t, reason) => {
                     let tail = parser.push_token(tokenizer.special.eos_token_id, &decoder.finish());
-                    (tail, t, true)
+                    (tail, t, Some(reason))
                 }
             };
             for delta in deltas {
@@ -298,31 +295,27 @@ pub async fn start_generation(
                 }
                 if filter.matched { break; }
             }
-            if done { break telemetry; }
             if filter.matched {
-                break drain_cancelled(&mut rx, telemetry, deadline).await?;
+                let telemetry = if done.is_some() {
+                    telemetry
+                } else {
+                    drain_cancelled(&mut rx, telemetry, deadline).await?
+                };
+                break (telemetry, FinishReason::Stop);
+            }
+            if let Some(reason) = done {
+                let finish_reason = match reason {
+                    EngineStopReason::MaxTokens | EngineStopReason::ContextLimit => FinishReason::Length,
+                    _ if calls => FinishReason::ToolCalls,
+                    EngineStopReason::None | EngineStopReason::Eos | EngineStopReason::StopToken => FinishReason::Stop,
+                };
+                break (telemetry, finish_reason);
             }
             event = receive(&mut rx, deadline, &mut guard).await?;
         };
         if !filter.pending.is_empty() && !filter.matched {
             yield GenerationEvent::Delta(ParseDelta::Content(filter.pending));
         }
-        // Prefill emits the first output token before decode consumes another context slot.
-        let hit_context_limit = max_context.is_some_and(|limit| {
-            limit > 0
-                && telemetry.decode_tokens > 0
-                && u64::from(telemetry.prefill_tokens) + u64::from(telemetry.decode_tokens)
-                    > u64::from(limit)
-        });
-        let finish_reason = if filter.matched {
-            FinishReason::Stop
-        } else if !eos && (telemetry.decode_tokens >= req.max_tokens || hit_context_limit) {
-            FinishReason::Length
-        } else if calls {
-            FinishReason::ToolCalls
-        } else {
-            FinishReason::Stop
-        };
         yield GenerationEvent::Finished { finish_reason, telemetry };
     };
     Ok((id, Box::pin(stream)))

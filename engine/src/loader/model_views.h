@@ -35,6 +35,12 @@ typedef struct Exl3MatrixView {
   uint8_t k2;
 } Exl3MatrixView;
 
+typedef struct Exl3ExpertDesc {
+  const int16_t* trellis;
+  const void *suh, *svh;
+  int32_t k2;
+} Exl3ExpertDesc;
+
 typedef struct ControllerWeightsView {
   const void *down_weight, *forget_weight, *gain_weight;
 } ControllerWeightsView;
@@ -62,6 +68,8 @@ typedef struct ModelWeightsView {
   void* arena_base;
   size_t arena_bytes;
   uint32_t mapped_tensor_count, verified_mul1_count;
+  /* Device table [physical layer][gate_up, down][expert]. */
+  const Exl3ExpertDesc* expert_table;
 } ModelWeightsView;
 
 typedef struct VisitPlanEntry {

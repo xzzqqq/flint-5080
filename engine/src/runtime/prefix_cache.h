@@ -49,6 +49,6 @@ class PrefixCache {
   uint64_t tick_ = 0;
   PrefixCacheStats stats_;
   KvArenaSizes sizes_{};
-  std::unique_ptr<void, detail::DeviceFree> device_;
+  DeviceBuffer snapshots_;
 };
 }  // namespace flint

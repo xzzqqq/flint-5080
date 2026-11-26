@@ -1,11 +1,4 @@
 #include <cuda_runtime.h>
-#if __has_include(<cuda_profiler_api.h>)
-#include <cuda_profiler_api.h>
-#else
-// CUDA runtime-only toolkit installations export both APIs without the profiler header.
-extern "C" cudaError_t CUDARTAPI cudaProfilerStart(void);
-extern "C" cudaError_t CUDARTAPI cudaProfilerStop(void);
-#endif
 
 #include <algorithm>
 #include <array>
@@ -15,6 +8,7 @@ extern "C" cudaError_t CUDARTAPI cudaProfilerStop(void);
 #include <span>
 
 #include "common/cuda_check.h"
+#include "common/cuda_profiler.h"
 #include "forge/forward_abi.h"
 #include "loader/kv_layout.h"
 #include "model/visit_plan.h"

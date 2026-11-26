@@ -12,17 +12,17 @@
 #include "loader/safetensors.h"
 
 namespace flint {
+DeviceBuffer AllocateDeviceBuffer(size_t bytes) {
+  void* ptr = nullptr;
+  CheckCuda(cudaMalloc(&ptr, bytes), "allocate device arena");
+  return DeviceBuffer(ptr);
+}
+
 namespace {
 using D = TensorDType;
 using Shape = std::vector<int64_t>;
 constexpr size_t kAlignment = 256;
 size_t Align(size_t offset) { return (offset + kAlignment - 1) & ~(kAlignment - 1); }
-
-void* AllocateDevice(size_t bytes) {
-  void* ptr = nullptr;
-  CheckCuda(cudaMalloc(&ptr, bytes), "allocate device arena");
-  return ptr;
-}
 
 // Enumerate the model once. An empty setter denotes a host-only codebook marker.
 struct Binding {
@@ -155,7 +155,7 @@ struct Copy {
   size_t offset;
   std::function<void(const void*)> set;
 };
-std::vector<Copy> PlanWeights(const SafetensorsFile& file, ModelWeightsView& model) {
+std::vector<Copy> PlanRawExl3Weights(const SafetensorsFile& file, ModelWeightsView& model) {
   static_assert(std::endian::native == std::endian::little);
   auto schema = WeightSchema(model);
   std::vector<Copy> plan;
@@ -187,6 +187,21 @@ std::vector<Copy> PlanWeights(const SafetensorsFile& file, ModelWeightsView& mod
   return plan;
 }
 
+constexpr size_t kExpertCount = FLINT_NUM_PHYSICAL_LAYERS * 2 * FLINT_NUM_EXPERTS;
+
+std::vector<Exl3ExpertDesc> BuildExpertTable(const ModelWeightsView& model) {
+  std::vector<Exl3ExpertDesc> table;
+  table.reserve(kExpertCount);
+  for (const auto& layer : model.layers)
+    for (auto projection : {std::span(layer.gate_up_proj), std::span(layer.down_proj)})
+      for (const auto& matrix : projection) {
+        if (matrix.k2 != 6 && matrix.k2 != 7)
+          throw std::runtime_error("unsupported EXL3 expert bitrate");
+        table.push_back({matrix.trellis, matrix.suh, matrix.svh, matrix.k2});
+      }
+  return table;
+}
+
 struct Event {
   cudaEvent_t event{};
   Event() { CheckCuda(cudaEventCreate(&event), "create transfer event"); }
@@ -215,7 +230,6 @@ float Upload(const std::vector<Copy>& plan, std::byte* device, cudaStream_t stre
     used = 0;
   };
   for (const auto& copy : plan) {
-    copy.set(device + copy.offset);
     // Each staging chunk starts on a 256-byte boundary, so the padding always fits.
     size_t pad = copy.offset - (sent + used);
     std::memset(buffer + used, 0, pad);
@@ -240,10 +254,20 @@ WeightsArena WeightsArena::Load(const std::filesystem::path& dir, cudaStream_t s
   auto& view = result.view_;
   view.config = LoadModelConfig(dir / "config.json");
   auto file = SafetensorsFile::Open(dir / "model.safetensors");
-  auto plan = PlanWeights(file, view);
-  result.allocation_.reset(AllocateDevice(view.arena_bytes));
+  const auto& metadata = file.metadata();
+  if (auto tag = metadata.find("layout_tag"); tag != metadata.end() && tag->second != "raw_exl3")
+    throw std::runtime_error("unsupported weight layout_tag: " + tag->second);
+  auto plan = PlanRawExl3Weights(file, view);
+  const size_t table_offset = Align(view.arena_bytes);
+  view.arena_bytes = table_offset + kExpertCount * sizeof(Exl3ExpertDesc);
+  result.allocation_ = AllocateDeviceBuffer(view.arena_bytes);
   view.arena_base = result.allocation_.get();
-  result.transfer_ms_ = Upload(plan, static_cast<std::byte*>(view.arena_base), stream);
+  auto* base = static_cast<std::byte*>(view.arena_base);
+  for (const auto& copy : plan) copy.set(base + copy.offset);
+  const auto table = BuildExpertTable(view);
+  view.expert_table = reinterpret_cast<const Exl3ExpertDesc*>(base + table_offset);
+  plan.push_back({std::as_bytes(std::span(table)), table_offset, {}});
+  result.transfer_ms_ = Upload(plan, base, stream);
   return result;
 }
 
@@ -258,7 +282,7 @@ KvStateArena KvStateArena::Allocate(const ModelConfig& c, uint32_t tokens) {
   KvStateArena result;
   auto& v = result.view_;
   v.arena_bytes = l.Fixed() + tokens * l.per_token;
-  result.allocation_.reset(AllocateDevice(v.arena_bytes));
+  result.allocation_ = AllocateDeviceBuffer(v.arena_bytes);
   auto* base = static_cast<std::byte*>(result.allocation_.get());
   v.arena_base = v.swa_kv = base;
   v.full_kv = base + l.swa;
@@ -282,7 +306,7 @@ void KvStateArena::Reset(cudaStream_t stream) {
 ScratchArena ScratchArena::Allocate(size_t bytes) {
   if (!bytes) throw std::invalid_argument("empty scratch arena");
   ScratchArena result;
-  result.allocation_.reset(AllocateDevice(bytes));
+  result.allocation_ = AllocateDeviceBuffer(bytes);
   result.view_ = {result.allocation_.get(), bytes};
   return result;
 }

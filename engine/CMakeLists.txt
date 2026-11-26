@@ -27,12 +27,16 @@ if(CMAKE_CUDA_COMPILER_ID STREQUAL "NVIDIA" AND CMAKE_CUDA_COMPILER_VERSION VERS
 endif()
 set(CMAKE_BUILD_RPATH "${CUDAToolkit_LIBRARY_DIR}")
 
+function(flint_configure_cuda_target target)
+    if(NOT CMAKE_CUDA_ARCHITECTURES)
+        target_compile_options(${target} PRIVATE
+            "$<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_${FLINT_CUDA_ARCH},code=sm_${FLINT_CUDA_ARCH}>")
+    endif()
+endfunction()
+
 add_library(smoke_op OBJECT src/ops/smoke_add.cu)
 set_target_properties(smoke_op PROPERTIES POSITION_INDEPENDENT_CODE ON)
-if(NOT CMAKE_CUDA_ARCHITECTURES)
-    target_compile_options(smoke_op PRIVATE
-        "-gencode=arch=compute_${FLINT_CUDA_ARCH},code=sm_${FLINT_CUDA_ARCH}")
-endif()
+flint_configure_cuda_target(smoke_op)
 
 add_library(engine_loader_obj OBJECT src/loader/safetensors.cpp src/loader/arenas.cpp)
 set_target_properties(engine_loader_obj PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -45,21 +49,19 @@ target_link_libraries(engine_loader PUBLIC CUDA::cudart)
 add_library(engine_ops OBJECT
     src/ops/exl3_linear.cu src/ops/norm_embed.cu src/ops/sconv.cu
     src/ops/attention.cu src/ops/moe.cu src/ops/loop_res.cu
-    src/ops/gemm_cublas.cpp src/ops/submodules.cpp)
+    src/ops/gemm_cublas.cpp)
 set_target_properties(engine_ops PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(engine_ops PUBLIC src)
 target_link_libraries(engine_ops PUBLIC CUDA::cudart CUDA::cublas)
 target_compile_options(engine_ops PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:-rdc=false>")
-if(NOT CMAKE_CUDA_ARCHITECTURES)
-    target_compile_options(engine_ops PRIVATE
-        "$<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_${FLINT_CUDA_ARCH},code=sm_${FLINT_CUDA_ARCH}>")
-endif()
+flint_configure_cuda_target(engine_ops)
 
-add_library(engine_model OBJECT src/model/inkling2_forward.cpp)
+add_library(engine_model OBJECT src/model/inkling2_forward.cpp src/model/submodules.cpp)
 set_target_properties(engine_model PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(engine_model PUBLIC engine_ops CUDA::cudart CUDA::cublas)
 
-add_library(engine STATIC src/runtime/engine_api.cpp src/runtime/sampler.cpp src/runtime/prefix_cache.cpp
+add_library(engine STATIC src/runtime/engine_api.cpp src/runtime/engine_runtime.cpp
+    src/runtime/sampler.cpp src/runtime/prefix_cache.cpp
     $<TARGET_OBJECTS:smoke_op> $<TARGET_OBJECTS:engine_loader_obj>
     $<TARGET_OBJECTS:engine_ops> $<TARGET_OBJECTS:engine_model>)
 set_target_properties(engine PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -75,10 +77,7 @@ add_library(stub_forward SHARED src/forge/stub_forward_entry.cpp src/ops/stub_la
 set_target_properties(stub_forward PROPERTIES PREFIX "" OUTPUT_NAME "stub_forward")
 target_include_directories(stub_forward PRIVATE src)
 target_link_libraries(stub_forward PRIVATE CUDA::cudart)
-if(NOT CMAKE_CUDA_ARCHITECTURES)
-    target_compile_options(stub_forward PRIVATE
-        "$<$<COMPILE_LANGUAGE:CUDA>:-gencode=arch=compute_${FLINT_CUDA_ARCH},code=sm_${FLINT_CUDA_ARCH}>")
-endif()
+flint_configure_cuda_target(stub_forward)
 
 # Keep CUDA source-line attribution for nsys/ncu without bloating Release binaries.
 foreach(target engine_ops forward)
@@ -89,7 +88,9 @@ add_library(forge_smoke STATIC src/forge/forge_smoke.cpp)
 target_include_directories(forge_smoke PUBLIC src)
 target_link_libraries(forge_smoke PRIVATE engine_loader CUDA::cudart ${CMAKE_DL_LIBS})
 
-add_library(forge_replay STATIC src/forge/replay.cpp src/forge/safetensors_writer.cpp)
+add_library(forge_replay STATIC
+    src/forge/forward_module.cpp src/forge/replay_metrics.cpp
+    src/forge/replay.cpp src/forge/safetensors_writer.cpp)
 target_link_libraries(forge_replay PUBLIC engine_loader PRIVATE ${CMAKE_DL_LIBS})
 add_executable(forge-host src/forge/forge_host.cpp src/forge/forge_daemon.cpp)
 target_link_libraries(forge-host PRIVATE forge_smoke forge_replay)
@@ -112,7 +113,7 @@ add_test(NAME forge_tests COMMAND forge_tests $<TARGET_FILE:forge-host> $<TARGET
 set_tests_properties(forge_tests PROPERTIES TIMEOUT 60)
 
 add_executable(ops_tests tests/test_ops_golden.cpp)
-target_link_libraries(ops_tests PRIVATE engine_ops engine_loader)
+target_link_libraries(ops_tests PRIVATE engine_model engine_ops engine_loader)
 add_test(NAME ops_tests COMMAND ops_tests)
 
 add_executable(e2e_tests tests/test_e2e_golden.cpp)
@@ -125,7 +126,7 @@ target_include_directories(sampler_tests PRIVATE src)
 add_test(NAME sampler_tests COMMAND sampler_tests)
 add_executable(prefix_cache_tests tests/test_prefix_cache.cpp src/runtime/prefix_cache.cpp)
 target_include_directories(prefix_cache_tests PRIVATE src)
-target_link_libraries(prefix_cache_tests PRIVATE CUDA::cudart)
+target_link_libraries(prefix_cache_tests PRIVATE engine_loader)
 add_test(NAME prefix_cache_tests COMMAND prefix_cache_tests)
 add_executable(runtime_tests tests/test_runtime_gpu.cpp)
 target_include_directories(runtime_tests PRIVATE src)

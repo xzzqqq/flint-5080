@@ -1,7 +1,10 @@
 use super::*;
 use crate::{
     config::Options,
-    engine_ffi::{EngineError, Event as EngineEvent, Request as EngineRequest},
+    engine_ffi::{
+        EngineError, EngineStopReason, Event as EngineEvent, FLINT_ENGINE_ABI_VERSION,
+        Request as EngineRequest,
+    },
     tokenizer::tests::byte_tokenizer,
 };
 use axum::{body::Body, http::Request as HttpRequest};
@@ -33,11 +36,13 @@ fn state(engine: Engine) -> AppState {
 }
 
 fn script(text: &str) -> AppState {
-    state(script_engine(text))
+    state(script_engine(text, EngineStopReason::Eos))
 }
 
-fn script_engine(text: &str) -> Engine {
-    let ids = byte_tokenizer().encode(text).unwrap();
+fn script_engine(text: &str, end_reason: EngineStopReason) -> Engine {
+    let tokenizer = byte_tokenizer();
+    let ids = tokenizer.encode(text).unwrap();
+    let eos = tokenizer.special.eos_token_id;
     Engine::with_stub(move |req, tx| {
         let mut t = Telemetry {
             prefill_tokens: req.token_ids.len() as u32,
@@ -46,11 +51,19 @@ fn script_engine(text: &str) -> Engine {
             decode_ms: 2.25,
             ..Default::default()
         };
+        let mut reason = end_reason;
         for id in ids.iter().copied().take(req.max_tokens as usize) {
+            if id == eos && !req.ignore_eos {
+                reason = EngineStopReason::Eos;
+                break;
+            }
             t.decode_tokens += 1;
             tx.send(Ok(EngineEvent::Tokens(vec![id], t))).unwrap();
         }
-        tx.send(Ok(EngineEvent::Done(t))).unwrap();
+        if t.decode_tokens >= req.max_tokens {
+            reason = EngineStopReason::MaxTokens;
+        }
+        tx.send(Ok(EngineEvent::Done(t, reason))).unwrap();
     })
 }
 fn chat_request(extra: Value, telemetry: Option<&str>) -> HttpRequest<Body> {
@@ -284,8 +297,11 @@ async fn forwards_sampling_and_tools_to_template() {
             r.top_k,
             r.seed,
         ));
-        tx.send(Ok(EngineEvent::Done(Telemetry::default())))
-            .unwrap();
+        tx.send(Ok(EngineEvent::Done(
+            Telemetry::default(),
+            EngineStopReason::Eos,
+        )))
+        .unwrap();
     });
     let mut app = state(engine);
     app.config.temperature = 0.4;
@@ -334,7 +350,7 @@ async fn auth_probes_and_models() {
         let body: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(body["status"], status);
         if path == "/ready" {
-            assert_eq!(body["engine"]["abi_version"], 1);
+            assert_eq!(body["engine"]["abi_version"], FLINT_ENGINE_ABI_VERSION);
             assert_eq!(body["model"], "mini");
         }
     }
@@ -559,6 +575,7 @@ async fn eos_at_token_limit_finishes_with_stop() {
     let body: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(body["choices"][0]["finish_reason"], "stop");
     assert_eq!(body["choices"][0]["message"]["content"], "a");
+    assert_eq!(body["usage"]["completion_tokens"], 1);
 }
 
 #[tokio::test]
@@ -574,8 +591,11 @@ async fn tool_call_ids_resolve_across_turns() {
         let ids = replies.lock().unwrap().next().unwrap();
         tx.send(Ok(EngineEvent::Tokens(ids, Telemetry::default())))
             .unwrap();
-        tx.send(Ok(EngineEvent::Done(Telemetry::default())))
-            .unwrap();
+        tx.send(Ok(EngineEvent::Done(
+            Telemetry::default(),
+            EngineStopReason::Eos,
+        )))
+        .unwrap();
     }));
     let golden: Value =
         serde_json::from_str(include_str!("../../../workloads/chat_golden.json")).unwrap();
@@ -607,9 +627,14 @@ async fn tool_call_ids_resolve_across_turns() {
 
 #[tokio::test]
 async fn context_window_finish_reason() {
-    // "hello" uses five prompt tokens. The engine omits its sampled stop token.
-    for (reply, reason) in [("ab", "length"), ("a", "stop")] {
-        let router = build_router(Arc::new(state(script_engine(reply).with_max_context(6))));
+    // Identical token counts can end at the context boundary or at a sampled stop.
+    let reply = "ab";
+    for (stop_reason, reason) in [
+        (EngineStopReason::ContextLimit, "length"),
+        (EngineStopReason::Eos, "stop"),
+        (EngineStopReason::StopToken, "stop"),
+    ] {
+        let router = build_router(Arc::new(state(script_engine(reply, stop_reason))));
         let (status, body) = query(router, chat_request(json!({"max_tokens":10}), None)).await;
         assert_eq!(status, 200);
         let body: Value = serde_json::from_str(&body).unwrap();

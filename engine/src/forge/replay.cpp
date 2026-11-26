@@ -1,12 +1,10 @@
 #include "forge/replay.h"
 
-#include <dlfcn.h>
 #include <unistd.h>
 
 #include <algorithm>
 #include <bit>
 #include <chrono>
-#include <cmath>
 #include <cstring>
 #include <iostream>
 #include <numeric>
@@ -14,7 +12,6 @@
 #include "common/cuda_check.h"
 #include "forge/safetensors_writer.h"
 #include "loader/kv_layout.h"
-#include "loader/safetensors.h"
 
 namespace flint {
 namespace fs = std::filesystem;
@@ -36,238 +33,19 @@ void Upload(cudaStream_t stream, T* device, const std::vector<T>& data) {
   CheckCuda(cudaMemcpyAsync(device, data.data(), data.size() * sizeof(T), cudaMemcpyHostToDevice,
                             stream));
 }
-Object Diff(std::span<const float> a, std::span<const float> b) {
-  if (a.empty() || a.size() != b.size()) throw std::runtime_error("incompatible comparison shapes");
-  double mx = 0, sum = 0, sq = 0, aa = 0, bb = 0, ab = 0;
-  size_t nonfinite = 0;
-  for (size_t i = 0; i < a.size(); ++i) {
-    double x = a[i], y = b[i], d = std::abs(x - y);
-    if (!std::isfinite(d)) ++nonfinite;
-    mx = std::max(mx, d);
-    sum += d;
-    sq += d * d;
-    aa += x * x;
-    bb += y * y;
-    ab += x * y;
-  }
-  return {{"exact_match", !std::memcmp(a.data(), b.data(), a.size_bytes())},
-          {"nonfinite", nonfinite},
-          {"max_abs_err", nonfinite ? Json(nullptr) : Json(mx)},
-          {"mean_abs_err", sum / a.size()},
-          {"rmse", std::sqrt(sq / a.size())},
-          {"cosine_sim", aa && bb ? ab / std::sqrt(aa * bb) : double(aa == bb)}};
-}
-double Median(std::vector<double> v) {
-  std::sort(v.begin(), v.end());
-  return (v[(v.size() - 1) / 2] + v[v.size() / 2]) / 2;
-}
 unsigned Count(const Json& q, const char* name, unsigned fallback, unsigned lo, unsigned hi) {
   auto n = q.get<unsigned>(name, fallback);
   if (n < lo || n > hi) throw std::runtime_error(std::string(name) + " out of range");
   return n;
 }
-// Safetensors payloads and byte slices need not be aligned for T.
-template <class T>
-T ValueAt(std::span<const std::byte> bytes, size_t index) {
-  T value;
-  std::memcpy(&value, bytes.data() + index * sizeof(T), sizeof(T));
-  return value;
-}
-float FromBf16(uint16_t bits) { return std::bit_cast<float>(uint32_t(bits) << 16); }
-
-struct StateError {
-  bool exact = true;
-  size_t nonfinite = 0;
-  double max_abs = 0;
-
-  void Compare(std::span<const std::byte> a, std::span<const std::byte> b, bool bf16) {
-    if (a.size() != b.size()) throw std::logic_error("incompatible state slices");
-    exact &= std::equal(a.begin(), a.end(), b.begin());
-    const size_t count = a.size() / (bf16 ? sizeof(uint16_t) : sizeof(float));
-    for (size_t i = 0; i < count; ++i) {
-      double x = bf16 ? FromBf16(ValueAt<uint16_t>(a, i)) : ValueAt<float>(a, i);
-      double y = bf16 ? FromBf16(ValueAt<uint16_t>(b, i)) : ValueAt<float>(b, i);
-      if (std::isfinite(x) && std::isfinite(y))
-        max_abs = std::max(max_abs, std::abs(x - y));
-      else
-        ++nonfinite;
-    }
-  }
-  Object Report() const {
-    return {{"exact_match", exact},
-            {"max_abs_err", nonfinite ? Json(nullptr) : Json(max_abs)},
-            {"nonfinite", nonfinite}};
-  }
-};
-
-Object TopLogits(const SafetensorsFile& file, const std::string& phase,
-                 std::span<const float> values) {
-  const auto key = phase + "top64_logits";
-  auto* ids = file.Find(phase + "top64_ids");
-  auto* logits = file.Find(key);
-  if (!ids || !logits || ids->dtype != TensorDType::kI32 || logits->dtype != TensorDType::kF32 ||
-      ids->shape.size() != 1 || ids->shape != logits->shape || !ids->nbytes)
-    return {};
-  std::vector<float> ref(logits->shape[0]), actual(ref.size());
-  std::memcpy(ref.data(), file.Bytes(*logits).data(), logits->nbytes);
-  auto indices = file.Bytes(*ids);
-  for (size_t i = 0; i < ref.size(); ++i) {
-    int id = ValueAt<int>(indices, i);
-    if (id < 0 || size_t(id) >= values.size()) return {};
-    actual[i] = values[id];
-  }
-  auto diff = Diff(ref, actual);
-  diff["tensor"] = key;
-  diff["top_k"] = ref.size();
-  return diff;
-}
-void Golden(Object& reply, const fs::path& dir, const std::string& name,
-            const std::vector<int>& ids, const Recording& recording, unsigned end, bool head,
-            std::span<const float> values, unsigned width, int next_token) {
-  if (dir.empty() || name.empty() ||
-      name.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.") !=
-          std::string::npos)
-    return;
-  auto path = dir / ("e2e_" + name + ".safetensors");
-  if (!fs::exists(path)) return;
-  auto file = SafetensorsFile::Open(path);
-  auto* prompt = file.Find("input_ids");
-  if (!prompt || prompt->dtype != TensorDType::kI32 || prompt->nbytes != ids.size() * sizeof(int) ||
-      std::memcmp(file.Bytes(*prompt).data(), ids.data(), prompt->nbytes))
-    return;
-  std::string phase = "prefill.";
-  bool decode = !recording.generated.empty();
-  auto* generated = file.Find("generated_ids");
-  if (decode) {
-    const size_t nbytes = recording.generated.size() * sizeof(int);
-    if (!generated || generated->dtype != TensorDType::kI32 || generated->nbytes < nbytes ||
-        std::memcmp(file.Bytes(*generated).data(), recording.generated.data(), nbytes))
-      return;
-    phase = "decode_" + std::to_string(recording.generated.size() - 1) + ".";
-  }
-  auto key =
-      phase + (head ? (decode ? "logits" : "last_logits") : "step_" + std::to_string(end - 1));
-  auto* t = file.Find(key);
-  std::vector<int64_t> shape =
-      head ? std::vector<int64_t>{(int64_t)values.size()}
-           : std::vector<int64_t>{static_cast<int64_t>(recording.ids.size()), width};
-  Object diff;
-  if (t && t->shape == shape && (t->dtype == TensorDType::kF32 || t->dtype == TensorDType::kBF16)) {
-    auto bytes = file.Bytes(*t);
-    std::vector<float> ref(values.size());
-    if (t->dtype == TensorDType::kF32)
-      std::memcpy(ref.data(), bytes.data(), bytes.size());
-    else {
-      for (size_t i = 0; i < ref.size(); ++i) ref[i] = FromBf16(ValueAt<uint16_t>(bytes, i));
-    }
-    diff = Diff(ref, values);
-    diff["tensor"] = key;
-  } else if (!t && head) {
-    diff = TopLogits(file, phase, values);
-  }
-  if (head) {
-    size_t offset = recording.generated.size() * sizeof(int);
-    if (generated && generated->dtype == TensorDType::kI32 &&
-        offset + sizeof(int) <= generated->nbytes) {
-      int id;
-      std::memcpy(&id, file.Bytes(*generated).data() + offset, sizeof(id));
-      diff["expected_next_token_id"] = id;
-      diff["next_token_match"] = id == next_token;
-    }
-  }
-  if (!diff.empty()) reply["golden"] = std::move(diff);
-}
 }  // namespace
 
-Object CompareState(const PostState& reference, const PostState& actual) {
-  StateError carry, kv, conv;
-  carry.Compare(std::as_bytes(std::span(reference.carry)), std::as_bytes(std::span(actual.carry)),
-                true);
-  // VisitSnapshotRanges emits K, V (BF16), then KV and sublayer convolution state (F32).
-  for (size_t i = 0; i < reference.state.size(); ++i) {
-    const bool is_kv = i % 4 < 2;
-    (is_kv ? kv : conv).Compare(reference.state[i].bytes, actual.state.at(i).bytes, is_kv);
-  }
-  const bool blocks_match = reference.blocks == actual.blocks;
-  return {{"exact_match", blocks_match && carry.exact && kv.exact && conv.exact},
-          {"blocks_match", blocks_match},
-          {"carry", carry.Report()},
-          {"kv", kv.Report()},
-          {"conv", conv.Report()}};
+std::optional<ForwardModule> Replay::Load(const fs::path& path) {
+  return std::make_optional<ForwardModule>(path, config_.state_dir / "loaded",
+                                           weights_ ? &weights_->view() : nullptr, kv_->view(),
+                                           scratch_->view(), stream_);
 }
 
-class Replay::Module {
- public:
-  Module(Replay& host, const fs::path& path, bool independent_scratch)
-      : copy_(host.config_.state_dir / "loaded" /
-              (std::to_string(++host.serial_) + "_" + path.stem().string() + ".so")) {
-    fs::copy_file(path, copy_, fs::copy_options::overwrite_existing);
-    try {
-      handle_ = dlopen(copy_.c_str(), RTLD_NOW | RTLD_LOCAL);
-      if (!handle_) throw std::runtime_error(dlerror());
-      if (Symbol<decltype(&flint_forward_abi_version)>("flint_forward_abi_version")() !=
-          FLINT_FORWARD_ABI_VERSION)
-        throw std::runtime_error("forward ABI version mismatch");
-      destroy_ = Symbol<decltype(destroy_)>("flint_forward_destroy");
-      run_ = Symbol<decltype(run_)>("flint_forward_run_layers");
-      stats_ = reinterpret_cast<decltype(stats_)>(dlsym(handle_, "flint_forward_graph_stats"));
-      if (independent_scratch)
-        scratch_.emplace(ScratchArena::Allocate(host.scratch_->view().bytes));
-      const auto& scratch = scratch_ ? scratch_->view() : host.scratch_->view();
-      context_ = Symbol<decltype(&flint_forward_create)>("flint_forward_create")(
-          host.weights_ ? &host.weights_->view() : nullptr, &host.kv_->view(), &scratch,
-          host.stream_);
-      if (!context_) throw std::runtime_error("forward context creation failed");
-    } catch (...) {
-      Close();
-      throw;
-    }
-  }
-  ~Module() { Close(); }
-  void ReportGraphStats(Object& reply, const char* key) const {
-    if (stats_) {
-      auto stats = stats_(context_);
-      reply[key] = Object{{"captures", stats.captures}, {"launches", stats.launches}};
-    }
-  }
-  ForwardRunResult Run(const ForwardRunSpec& s, const ForwardOptions& o = {}) {
-    ForwardRunResult r{};
-    int code = run_(context_, &s, &o, &r);
-    CheckCuda(code ? code : r.status, "run_layers");
-    if (r.num_stages > FLINT_MAX_STAGE_TIMINGS || !std::isfinite(r.elapsed_ms) || r.elapsed_ms < 0)
-      throw std::runtime_error("invalid forward timing result");
-    return r;
-  }
-
- private:
-  template <class F>
-  F Symbol(const char* name) {
-    auto* addr = dlsym(handle_, name);
-    if (!addr) throw std::runtime_error(dlerror());
-    return reinterpret_cast<F>(addr);
-  }
-  void Close() {
-    if (context_) {
-      // A candidate may report an error after enqueueing work on its stream.
-      cudaDeviceSynchronize();
-      destroy_(context_);
-    }
-    if (handle_) dlclose(handle_);
-    std::error_code ec;
-    fs::remove(copy_, ec);
-  }
-  // A/B candidates can reserve different persistent tables within their scratch.
-  std::optional<ScratchArena> scratch_;
-  fs::path copy_;
-  void* handle_{};
-  ForwardContext* context_{};
-  decltype(&flint_forward_destroy) destroy_{};
-  decltype(&flint_forward_graph_stats) stats_{};
-  decltype(&flint_forward_run_layers) run_{};
-};
-std::unique_ptr<Replay::Module> Replay::Load(const fs::path& path, bool independent_scratch) {
-  return std::make_unique<Module>(*this, path, independent_scratch);
-}
 Replay::Replay(DaemonConfig cfg) : config_(std::move(cfg)) {
   CheckCuda(cudaSetDevice(0));
   model_config_ = model::MakeDefaultInklingConfig();
@@ -313,7 +91,7 @@ Replay::Replay(DaemonConfig cfg) : config_(std::move(cfg)) {
       spec.is_decode = 1;
       spec.reset_kv = 1;
       {
-        auto a = Load(config_.baseline), b = Load(config_.baseline, true);
+        auto a = Load(config_.baseline), b = Load(config_.baseline);
         ForwardOptions opts{.use_cuda_graph = 1, .return_logits = 1};
         a->Run(spec, opts);
         b->Run(spec, opts);
@@ -385,9 +163,10 @@ Recording Replay::Record(const std::vector<int>& ids, unsigned begin, unsigned e
   r.hidden = ReadHidden(count);
   r.carry = Read(carry_, model::kCarryPlanes * count);
   for (unsigned v = begin; v < end; ++v) {
-    for (auto [offset, bytes] : VisitSnapshotRanges(state, plan_[v], r.position + r.ids.size()))
-      r.state.push_back(
-          {offset, Read(static_cast<const std::byte*>(state.arena_base) + offset, bytes)});
+    for (auto [offset, bytes, kind, dtype] :
+         VisitSnapshotRanges(state, plan_[v], r.position + r.ids.size()))
+      r.state.push_back({offset, kind, dtype,
+                         Read(static_cast<const std::byte*>(state.arena_base) + offset, bytes)});
   }
   UploadHidden(r.hidden);
   bool head = begin == 0 && end == model::kNumLogicalVisits;
@@ -416,7 +195,8 @@ PostState Replay::ReadPostState(const Recording& r, unsigned blocks) const {
   const auto* base = static_cast<const std::byte*>(kv_->view().arena_base);
   post.state.reserve(r.state.size());
   for (const auto& slice : r.state)
-    post.state.push_back({slice.offset, Read(base + slice.offset, slice.bytes.size())});
+    post.state.push_back(
+        {slice.offset, slice.kind, slice.dtype, Read(base + slice.offset, slice.bytes.size())});
   return post;
 }
 void Replay::Restore(const Recording& r) {
@@ -481,33 +261,32 @@ const Recording& Replay::ResolveRecording(const Measurement& m, Object& reply,
   if (it == cache_.end()) it = cache_.emplace(key, Record(m.ids, m.begin, m.end, m.step)).first;
   return it->second;
 }
-ForwardRunResult Replay::RunRestored(Module& module, const ForwardRunSpec& spec,
+ForwardRunResult Replay::RunRestored(ForwardModule& module, const ForwardRunSpec& spec,
                                      const ForwardOptions& opts, const Recording& r) {
   Restore(r);
   return module.Run(spec, opts);
 }
-ForwardRunResult Replay::RunSingle(Module& a, const ForwardRunSpec& spec,
+ForwardRunResult Replay::RunSingle(ForwardModule& a, const ForwardRunSpec& spec,
                                    const ForwardOptions& opts, const Recording& r, unsigned iters,
                                    Object& reply) {
   std::vector<double> times_a;
+  times_a.reserve(iters);
   ForwardRunResult last{};
   for (unsigned i = 0; i < iters; ++i) {
     last = RunRestored(a, spec, opts, r);
     times_a.push_back(last.elapsed_ms);
   }
+  const double mean = std::accumulate(times_a.begin(), times_a.end(), 0.) / times_a.size();
   double median = Median(times_a), bw = last.logical_bytes / (1e6 * median);
   reply["elapsed_ms"] =
-      Object{{"median", median},
-             {"min", *std::min_element(times_a.begin(), times_a.end())},
-             {"max", *std::max_element(times_a.begin(), times_a.end())},
-             {"mean", std::accumulate(times_a.begin(), times_a.end(), 0.) / times_a.size()}};
+      Object{{"median", median}, {"min", times_a.front()}, {"max", times_a.back()}, {"mean", mean}};
   reply["logical_bytes"] = last.logical_bytes;
   reply["effective_bw_gbs"] = bw;
-  reply["sol_pct"] = bw / 9.6;
+  reply["sol_pct"] = bw / kRtx5080SolDivisor;
   reply["traffic_basis"] = "model.md 6.1 single-token logical weight budget, mean expert bitrate";
   return last;
 }
-ForwardRunResult Replay::RunPair(Module& a, Module& b, const ForwardRunSpec& spec,
+ForwardRunResult Replay::RunPair(ForwardModule& a, ForwardModule& b, const ForwardRunSpec& spec,
                                  const ForwardOptions& opts, const Recording& r,
                                  const Measurement& m, Object& reply) {
   ForwardRunResult last{};
@@ -516,11 +295,14 @@ ForwardRunResult Replay::RunPair(Module& a, Module& b, const ForwardRunSpec& spe
   std::vector<float> a_output, a_logits;
   PostState a_state;
   int a_next = -1;
+  round_a.reserve(m.rounds);
+  round_b.reserve(m.rounds);
+  pairs.reserve(m.rounds);
+  std::vector<double> group_a(m.iters), group_b(m.iters);
   for (unsigned round = 0; round < m.rounds; ++round) {
-    std::vector<double> group_a, group_b;
     for (unsigned i = 0; i < m.iters; ++i) {
       last = RunRestored(a, spec, opts, r);
-      group_a.push_back(last.elapsed_ms);
+      group_a[i] = last.elapsed_ms;
       if (round + 1 == m.rounds && i + 1 == m.iters) {
         a_state = ReadPostState(r, last.num_block_out);
         a_output = ReadHidden(r.hidden.size());
@@ -528,7 +310,7 @@ ForwardRunResult Replay::RunPair(Module& a, Module& b, const ForwardRunSpec& spe
         a_next = last.next_token_id;
       }
       last = RunRestored(b, spec, opts, r);
-      group_b.push_back(last.elapsed_ms);
+      group_b[i] = last.elapsed_ms;
     }
     round_a.push_back(Median(group_a));
     round_b.push_back(Median(group_b));
@@ -541,9 +323,9 @@ ForwardRunResult Replay::RunPair(Module& a, Module& b, const ForwardRunSpec& spe
   reply["delta_ms"] = am - bm;
   reply["speedup"] = am / bm;
   reply["state_error"] = CompareState(a_state, ReadPostState(r, last.num_block_out));
-  reply["numerical_error"] = Diff(a_output, ReadHidden(r.hidden.size()));
+  reply["numerical_error"] = ComputeDiff(a_output, ReadHidden(r.hidden.size()));
   if (m.e2e()) {
-    reply["logits_error"] = Diff(a_logits, Read(logits_, vocab_));
+    reply["logits_error"] = ComputeDiff(a_logits, Read(logits_, vocab_));
     reply["next_token_match"] = a_next == last.next_token_id;
   }
   return last;
@@ -560,7 +342,7 @@ void Replay::FormatStages(const ForwardRunResult& last, Object& reply) {
                                  {"pct_total", 100. * t.elapsed_ms / last.elapsed_ms},
                                  {"traffic_bytes", t.traffic_bytes},
                                  {"bw_gbs", bw},
-                                 {"sol_pct", bw / 9.6}});
+                                 {"sol_pct", bw / kRtx5080SolDivisor}});
     }
     reply["stages"] = std::move(stages);
   }
@@ -615,7 +397,7 @@ Object Replay::Measure(const Json& q, const std::string& cmd) {
                          .enable_profiling = cmd == "profile" || q.get("enable_profiling", false)};
   auto load_start = Clock::now();
   auto a = Load(q.at(cmd == "ab" ? "so_a" : "so_path").as<std::string>());
-  auto b = cmd == "ab" ? Load(q.at("so_b").as<std::string>(), true) : nullptr;
+  auto b = cmd == "ab" ? Load(q.at("so_b").as<std::string>()) : std::nullopt;
   reply["module_load_ms"] = elapsed_ms(load_start);
   for (unsigned i = 0; i < m.warmup; ++i) {
     RunRestored(*a, spec, options, r);
@@ -628,9 +410,9 @@ Object Replay::Measure(const Json& q, const std::string& cmd) {
   auto logits = e2e ? Read(logits_, vocab_) : std::vector<float>{};
   if (!b) {
     reply["state_error"] = CompareState(r.post, ReadPostState(r, last.num_block_out));
-    reply["numerical_error"] = Diff(r.reference, output);
+    reply["numerical_error"] = ComputeDiff(r.reference, output);
     if (e2e) {
-      reply["logits_error"] = Diff(r.logits, logits);
+      reply["logits_error"] = ComputeDiff(r.logits, logits);
       reply["next_token_id"] = last.next_token_id;
       reply["next_token_match"] = last.next_token_id == r.next;
     }
@@ -642,8 +424,8 @@ Object Replay::Measure(const Json& q, const std::string& cmd) {
   b.reset();
   a.reset();
   reply["module_unload_ms"] = elapsed_ms(unload_start);
-  Golden(reply, config_.golden_dir, m.name, m.ids, r, m.end, e2e, e2e ? logits : output, width_,
-         last.next_token_id);
+  CompareGolden(reply, config_.golden_dir, m.name, m.ids, r.generated, spec, e2e ? logits : output,
+                width_, last.next_token_id);
   if (cmd == "dump") Dump(q, m, r, output, reply);
   return reply;
 }

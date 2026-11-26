@@ -31,6 +31,7 @@ struct Result {
   std::vector<int32_t> ids;
   EngineTelemetry t{};
   EngineStatus status{};
+  EngineStopReason stop_reason{};
   std::string error;
 };
 struct Capture {
@@ -46,6 +47,7 @@ struct Capture {
     } else {
       c.result.t = event->telemetry;
       c.result.status = event->status;
+      c.result.stop_reason = event->stop_reason;
       if (event->error_message) c.result.error = event->error_message;
       // Transfer all callback-owned state before waking the submitting thread.
       auto done = std::move(c.done);
@@ -232,8 +234,9 @@ void PrefixTests(const std::filesystem::path& model_dir, const std::vector<int32
   Require(before == after, "prefix cache VRAM drift after destroy");
 }
 void ModelTests(const std::filesystem::path& model_dir, const std::filesystem::path& golden_dir) {
-  auto config = Encode(
-      Object{{"model_dir", model_dir.string()}, {"max_context", 2048}, {"prefill_chunk_size", 8}});
+  constexpr unsigned kMaxContext = 521;
+  auto config = Encode(Object{
+      {"model_dir", model_dir.string()}, {"max_context", kMaxContext}, {"prefill_chunk_size", 8}});
   auto file = [&](std::string name) {
     return SafetensorsFile::Open(golden_dir / ("e2e_short_" + name + ".safetensors"));
   };
@@ -261,7 +264,7 @@ void ModelTests(const std::filesystem::path& model_dir, const std::filesystem::p
     auto hits =
         std::mismatch(gold.begin(), gold.end(), r.ids.begin(), r.ids.end()).first - gold.begin();
     std::cout << name << " chunk=8 greedy=" << hits << "/" << gold.size() << std::endl;
-    Require(r.ids == gold, "greedy mismatch");
+    Require(r.ids == gold && r.stop_reason == ENGINE_STOP_MAX_TOKENS, "greedy mismatch");
     total += hits;
   }
   auto graphs = Counter(e, "graph_captures"), launches = Counter(e, "graph_launches");
@@ -287,17 +290,32 @@ void ModelTests(const std::filesystem::path& model_dir, const std::filesystem::p
        .ignore_eos = 1};
   auto stop = Run(e, prompt, p);
   Success(stop);
-  Require(stop.ids.empty() && stop.t.decode_rounds == 0, "stop on first token");
-  p.stop_token_ids = nullptr;
-  p.n_stop_token_ids = 0;
-  p.ignore_eos = 0;
+  Require(
+      stop.ids.empty() && stop.t.decode_rounds == 0 && stop.stop_reason == ENGINE_STOP_STOP_TOKEN,
+      "stop on first token");
   auto eos = LoadModelConfig(model_dir / "config.json").eos_token_id;
   auto at = std::find(gold.begin(), gold.end(), int(eos));
   Require(at != gold.end(), "missing EOS fixture");
+  p.stop_token_ids = nullptr;
+  p.n_stop_token_ids = 0;
+  p.ignore_eos = 0;
   auto stopped = Run(e, prompt, p);
   Success(stopped);
-  Require(stopped.ids == std::vector<int32_t>(gold.begin(), at), "EOS stop");
-  std::vector<int32_t> long_prompt(520, 42);
+  Require(stopped.ids == std::vector<int32_t>(gold.begin(), at) &&
+              stopped.stop_reason == ENGINE_STOP_EOS,
+          "model EOS stop");
+  p.stop_token_ids = &*at;
+  p.n_stop_token_ids = 1;
+  auto both = Run(e, prompt, p);
+  Success(both);
+  Require(both.ids == stopped.ids && both.stop_reason == ENGINE_STOP_EOS,
+          "model EOS takes priority over caller stop");
+  p.ignore_eos = 1;
+  auto explicit_stop = Run(e, prompt, p);
+  Success(explicit_stop);
+  Require(explicit_stop.ids == stopped.ids && explicit_stop.stop_reason == ENGINE_STOP_STOP_TOKEN,
+          "caller stop remains active when model EOS is ignored");
+  std::vector<int32_t> long_prompt(kMaxContext - 1, 42);
   p = {.max_tokens = 1, .ignore_eos = 1};
   auto long_run = Run(e, long_prompt, p);
   Success(long_run);
@@ -309,7 +327,7 @@ void ModelTests(const std::filesystem::path& model_dir, const std::filesystem::p
   std::copy(prefix.begin(), prefix.end(), long_prompt.begin());
   auto cancelled = Run(e, long_prompt, p, 0,
                        std::chrono::milliseconds(std::max<int>(1, long_run.t.prefill_ms / 4)));
-  Require(cancelled.status == ENGINE_ERR_CANCELLED &&
+  Require(cancelled.status == ENGINE_ERR_CANCELLED && cancelled.stop_reason == ENGINE_STOP_NONE &&
               cancelled.t.cached_prefix_tokens == prefix.size() &&
               cancelled.t.prefill_tokens > prefix.size() &&
               cancelled.t.prefill_tokens < long_prompt.size() && cancelled.ids.empty(),
@@ -320,6 +338,16 @@ void ModelTests(const std::filesystem::path& model_dir, const std::filesystem::p
               resumed.t.prefill_tokens == long_prompt.size(),
           "resume cancelled prefill at live tail");
   p.max_tokens = 8;
+  auto limited = Run(e, long_prompt, p);
+  Success(limited);
+  Require(limited.ids.size() == 2 && limited.stop_reason == ENGINE_STOP_CONTEXT_LIMIT,
+          "context limit after one decode step");
+  p.max_tokens = 2;
+  auto exact_limit = Run(e, long_prompt, p);
+  Success(exact_limit);
+  Require(exact_limit.ids == limited.ids && exact_limit.stop_reason == ENGINE_STOP_MAX_TOKENS,
+          "max tokens takes priority at context limit");
+  p.max_tokens = 8;
   auto interrupted = Run(e, prompt, p, 2);
   Require(interrupted.status == ENGINE_ERR_CANCELLED && interrupted.ids.size() == 2 &&
               interrupted.t.decode_rounds == 1,
@@ -327,8 +355,10 @@ void ModelTests(const std::filesystem::path& model_dir, const std::filesystem::p
   Require(Run(e, {-1}, p).status == ENGINE_ERR_INVALID_INPUT &&
               Run(e, {201024}, p).status == ENGINE_ERR_INVALID_INPUT,
           "invalid prompt token");
-  Require(Run(e, std::vector<int32_t>(2049), p).status == ENGINE_ERR_CONTEXT_OVERFLOW,
-          "context overflow");
+  auto overflow = Run(e, std::vector<int32_t>(kMaxContext + 1), p);
+  Require(
+      overflow.status == ENGINE_ERR_CONTEXT_OVERFLOW && overflow.stop_reason == ENGINE_STOP_NONE,
+      "context overflow");
   auto healthy = Run(e, prompt, p);
   Success(healthy);
   Require(healthy.ids == std::vector<int32_t>(gold.begin(), gold.begin() + 8),

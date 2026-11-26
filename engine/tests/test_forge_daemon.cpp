@@ -86,14 +86,17 @@ struct Fixture {
 
 void TestStateError() {
   PostState ref{2, {0x3f80}, {}};
-  for (size_t size : {2, 2, 4, 4}) ref.state.push_back({0, std::vector<std::byte>(size)});
+  ref.state = {{0, KvSliceKind::kKvConv, KvSliceDType::kF32, std::vector<std::byte>(4)},
+               {4, KvSliceKind::kSublayerConv, KvSliceDType::kF32, std::vector<std::byte>(4)},
+               {8, KvSliceKind::kKey, KvSliceDType::kBF16, std::vector<std::byte>(2)},
+               {10, KvSliceKind::kValue, KvSliceDType::kBF16, std::vector<std::byte>(2)}};
   auto changed = ref;
   changed.blocks = 1;
   changed.carry[0] = 0x4000;  // BF16 1 -> 2
   uint16_t v = 0x4040;        // BF16 0 -> 3
-  std::memcpy(changed.state[1].bytes.data(), &v, sizeof(v));
+  std::memcpy(changed.state[3].bytes.data(), &v, sizeof(v));
   float conv = -4.5f;
-  std::memcpy(changed.state[3].bytes.data(), &conv, sizeof(conv));
+  std::memcpy(changed.state[1].bytes.data(), &conv, sizeof(conv));
   auto error = CompareState(ref, changed);
   Require(!error.at("exact_match").as<bool>() && !error.at("blocks_match").as<bool>(),
           "block count");
@@ -106,7 +109,7 @@ void TestStateError() {
   }
   changed = ref;
   conv = std::numeric_limits<float>::quiet_NaN();
-  std::memcpy(changed.state[2].bytes.data(), &conv, sizeof(conv));
+  std::memcpy(changed.state[0].bytes.data(), &conv, sizeof(conv));
   error = CompareState(ref, changed);
   Require(!error.at("exact_match").as<bool>() && error.at("blocks_match").as<bool>() &&
               error.at("conv").at("nonfinite").as<uint64_t>() == 1,

@@ -4,7 +4,7 @@
 
 #include "loader/model_views.h"
 
-namespace flint::ops_detail {
+namespace flint {
 
 class ScratchWorkspace {
  public:
@@ -21,4 +21,4 @@ class ScratchWorkspace {
   }
   ScratchArenaView rest;
 };
-}  // namespace flint::ops_detail
+}  // namespace flint

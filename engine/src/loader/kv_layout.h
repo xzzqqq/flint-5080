@@ -3,7 +3,9 @@
 #include <array>
 #include <cstddef>
 #include <stdexcept>
+#include <utility>
 
+#include "common/cuda_check.h"
 #include "loader/model_constants.h"
 namespace flint {
 struct KvArenaSizes {
@@ -42,8 +44,41 @@ inline float* VisitSublayerConvState(const KvStateArenaView& kv, uint32_t visit_
   return kv.sublayer_conv_state +
          (size_t(visit_idx) * 2 + sublayer) * kv.hidden_size * kv.conv_state_len;
 }
+// Packed prefix snapshots contain only fixed state. Full KV remains live in the arena.
+inline std::array<std::pair<void*, size_t>, 3> FixedKvRegions(const KvStateArenaView& kv,
+                                                              const KvArenaSizes& sizes) {
+  return {{{kv.swa_kv, sizes.swa},
+           {kv.kv_conv_state, sizes.kv_conv},
+           {kv.sublayer_conv_state, sizes.sublayer_conv}}};
+}
+
+inline void CopyFixedKvToSnapshot(void* snapshot_base, const KvStateArenaView& kv,
+                                  const KvArenaSizes& sizes, cudaStream_t stream) {
+  auto* dst = static_cast<std::byte*>(snapshot_base);
+  for (auto [src, bytes] : FixedKvRegions(kv, sizes)) {
+    CheckCuda(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, stream),
+              "save prefix snapshot");
+    dst += bytes;
+  }
+}
+
+inline void CopySnapshotToFixedKv(const KvStateArenaView& kv, const void* snapshot_base,
+                                  const KvArenaSizes& sizes, cudaStream_t stream) {
+  auto* src = static_cast<const std::byte*>(snapshot_base);
+  for (auto [dst, bytes] : FixedKvRegions(kv, sizes)) {
+    CheckCuda(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, stream),
+              "restore prefix snapshot");
+    src += bytes;
+  }
+}
+
+enum class KvSliceKind : uint8_t { kKey, kValue, kKvConv, kSublayerConv };
+enum class KvSliceDType : uint8_t { kBF16, kF32 };
+
 struct KvByteRange {
   size_t offset, bytes;
+  KvSliceKind kind;
+  KvSliceDType dtype;
 };
 inline std::array<KvByteRange, 4> VisitSnapshotRanges(const KvStateArenaView& kv,
                                                       const VisitPlanEntry& visit,
@@ -51,13 +86,17 @@ inline std::array<KvByteRange, 4> VisitSnapshotRanges(const KvStateArenaView& kv
   auto [k, v, cap] = VisitKvCache(kv, visit);
   size_t dim = size_t(kv.num_kv_heads) * kv.head_dim;
   size_t bytes = std::min<size_t>(cap, live_tokens) * dim * sizeof(*k);
-  auto range = [&](const void* p, size_t n) {
+  auto range = [&](const void* p, size_t n, KvSliceKind kind, KvSliceDType dtype) {
     return KvByteRange{
-        size_t(static_cast<const std::byte*>(p) - static_cast<const std::byte*>(kv.arena_base)), n};
+        size_t(static_cast<const std::byte*>(p) - static_cast<const std::byte*>(kv.arena_base)), n,
+        kind, dtype};
   };
-  return {range(k, bytes), range(v, bytes),
-          range(VisitKvConvState(kv, visit.visit_idx), 2 * dim * kv.conv_state_len * sizeof(float)),
+  return {range(k, bytes, KvSliceKind::kKey, KvSliceDType::kBF16),
+          range(v, bytes, KvSliceKind::kValue, KvSliceDType::kBF16),
+          range(VisitKvConvState(kv, visit.visit_idx), 2 * dim * kv.conv_state_len * sizeof(float),
+                KvSliceKind::kKvConv, KvSliceDType::kF32),
           range(VisitSublayerConvState(kv, visit.visit_idx),
-                2 * size_t(kv.hidden_size) * kv.conv_state_len * sizeof(float))};
+                2 * size_t(kv.hidden_size) * kv.conv_state_len * sizeof(float),
+                KvSliceKind::kSublayerConv, KvSliceDType::kF32)};
 }
 }  // namespace flint

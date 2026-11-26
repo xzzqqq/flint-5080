@@ -1,23 +1,16 @@
 #pragma once
+#include <map>
 #include <optional>
+#include <string>
+#include <vector>
 
 #include "forge/forge_daemon.h"
-#include "forge/forward_abi.h"
+#include "forge/forward_module.h"
+#include "forge/replay_metrics.h"
 #include "loader/arenas.h"
 #include "model/visit_plan.h"
 
 namespace flint {
-struct StateSlice {
-  size_t offset;
-  std::vector<std::byte> bytes;
-};
-struct PostState {
-  unsigned blocks{};
-  std::vector<uint16_t> carry;
-  std::vector<StateSlice> state;
-};
-Object CompareState(const PostState& reference, const PostState& actual);
-
 struct Recording {
   PostState post;
   std::vector<StateSlice> state;
@@ -37,7 +30,6 @@ class Replay {
   Object Request(const Json& request);
 
  private:
-  class Module;
   struct Measurement {
     unsigned begin, end, step, warmup, iters, rounds;
     std::string name;
@@ -46,17 +38,17 @@ class Replay {
   };
   Measurement ParseMeasurement(const Json&, const std::string&) const;
   const Recording& ResolveRecording(const Measurement&, Object&, Recording&);
-  ForwardRunResult RunSingle(Module&, const ForwardRunSpec&, const ForwardOptions&,
+  ForwardRunResult RunSingle(ForwardModule&, const ForwardRunSpec&, const ForwardOptions&,
                              const Recording&, unsigned, Object&);
-  ForwardRunResult RunPair(Module&, Module&, const ForwardRunSpec&, const ForwardOptions&,
-                           const Recording&, const Measurement&, Object&);
-  ForwardRunResult RunRestored(Module&, const ForwardRunSpec&, const ForwardOptions&,
+  ForwardRunResult RunPair(ForwardModule&, ForwardModule&, const ForwardRunSpec&,
+                           const ForwardOptions&, const Recording&, const Measurement&, Object&);
+  ForwardRunResult RunRestored(ForwardModule&, const ForwardRunSpec&, const ForwardOptions&,
                                const Recording&);
   static void FormatStages(const ForwardRunResult&, Object&);
   void Dump(const Json&, const Measurement&, const Recording&, const std::vector<float>&, Object&);
 
   Object Measure(const Json& request, const std::string& command);
-  std::unique_ptr<Module> Load(const std::filesystem::path& path, bool independent_scratch = false);
+  [[nodiscard]] std::optional<ForwardModule> Load(const std::filesystem::path& path);
   Recording Record(const std::vector<int>& ids, unsigned begin, unsigned end, unsigned step);
   ForwardRunSpec Spec(unsigned begin, unsigned end, unsigned length, unsigned position, bool embed,
                       bool head, unsigned blocks = 0);
@@ -73,7 +65,7 @@ class Replay {
   cudaStream_t stream_{};
   ModelConfig model_config_;
   VisitPlan plan_;
-  unsigned width_, vocab_, capacity_{}, serial_{};
+  unsigned width_, vocab_, capacity_{};
   uint16_t* carry_{};
   int *ids_{}, *next_{};
   uint16_t *hidden_{}, *out_{};

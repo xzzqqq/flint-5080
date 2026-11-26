@@ -13,6 +13,7 @@
 #include <type_traits>
 
 #include "loader/arenas.h"
+#include "loader/kv_layout.h"
 #include "loader/safetensors.h"
 #include "model/visit_plan.h"
 
@@ -206,6 +207,9 @@ void TestBadWeights(const fs::path& dir) {
     Reject(reason, [&] { WeightsArena::Load(dir); });
   };
   check("{}", "", "missing tensor");
+  check(R"({"__metadata__":{"layout_tag":"raw_exl3"}})", "", "missing tensor");
+  check(R"({"__metadata__":{"layout_tag":"unknown"}})", "",
+        "unsupported weight layout_tag: unknown");
   check(R"({"0.self_attn.q_proj.linear.mul1":{"dtype":"I32","shape":[],"data_offsets":[0,4]}})",
         "1234", "bad mul1 magic");
   check(R"({"extra":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}})", "x",
@@ -220,6 +224,26 @@ size_t FreeBytes() {
 }
 void Aligned(const void* p) {
   Require(p && reinterpret_cast<uintptr_t>(p) % 256 == 0, "unaligned arena pointer");
+}
+void TestFixedSnapshot() {
+  // Gaps between the live planes must survive restore. The snapshot itself is packed.
+  const std::array<float, 7> input{1, 0, 2, 3, 0, 4, 5};
+  auto live = AllocateDeviceBuffer(sizeof(input));
+  auto* base = static_cast<float*>(live.get());
+  KvStateArenaView kv{.swa_kv = base, .kv_conv_state = base + 2, .sublayer_conv_state = base + 5};
+  KvArenaSizes sizes{
+      .swa = sizeof(float), .kv_conv = 2 * sizeof(float), .sublayer_conv = 2 * sizeof(float)};
+  auto snapshot = AllocateDeviceBuffer(sizes.Fixed());
+  Cuda(cudaMemcpy(base, input.data(), sizeof(input), cudaMemcpyHostToDevice));
+  CopyFixedKvToSnapshot(snapshot.get(), kv, sizes, nullptr);
+  std::array<float, 5> packed;
+  Cuda(cudaMemcpy(packed.data(), snapshot.get(), sizeof(packed), cudaMemcpyDeviceToHost));
+  Require(packed == std::array{1.f, 2.f, 3.f, 4.f, 5.f}, "packed fixed KV snapshot");
+  Cuda(cudaMemsetAsync(base, 0, sizeof(input), nullptr));
+  CopySnapshotToFixedKv(kv, snapshot.get(), sizes, nullptr);
+  std::array<float, 7> restored;
+  Cuda(cudaMemcpy(restored.data(), base, sizeof(restored), cudaMemcpyDeviceToHost));
+  Require(restored == input, "noncontiguous fixed KV snapshot");
 }
 void TestArenas(const ModelConfig& config) {
   size_t before = FreeBytes();
@@ -268,6 +292,26 @@ void Compare(const SafetensorsFile& file, const char* name, const void* device) 
   }
   std::cout << "readback " << name << " " << source.size() << " B OK\n";
 }
+void CheckExperts(const ModelWeightsView& w) {
+  Aligned(w.expert_table);
+  constexpr size_t count = FLINT_NUM_PHYSICAL_LAYERS * 2 * FLINT_NUM_EXPERTS;
+  Require(reinterpret_cast<uintptr_t>(w.expert_table) + count * sizeof(Exl3ExpertDesc) ==
+              reinterpret_cast<uintptr_t>(w.arena_base) + w.arena_bytes,
+          "expert table at end of weights arena");
+  std::vector<Exl3ExpertDesc> table(count);
+  Cuda(cudaMemcpy(table.data(), w.expert_table, count * sizeof(Exl3ExpertDesc),
+                  cudaMemcpyDeviceToHost));
+  size_t index = 0;
+  for (const auto& layer : w.layers)
+    for (auto projection : {std::span(layer.gate_up_proj), std::span(layer.down_proj)})
+      for (const auto& m : projection) {
+        const auto& desc = table[index++];
+        Require(
+            desc.trellis == m.trellis && desc.suh == m.suh && desc.svh == m.svh && desc.k2 == m.k2,
+            "expert descriptor binding");
+      }
+}
+
 void TestModel(const fs::path& dir) {
   const size_t before = FreeBytes();
   size_t peak_free = 0;
@@ -277,6 +321,7 @@ void TestModel(const fs::path& dir) {
     double seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     const auto& w = weights.view();
+    CheckExperts(w);
     Require(w.mapped_tensor_count == 25582 && w.verified_mul1_count == 6264, "real tensor counts");
     auto scratch = ScratchArena::Allocate();
     const size_t kv_budget = FreeBytes();
@@ -343,6 +388,7 @@ int main(int argc, char** argv) {
     auto config = TestConfig(temp.dir / "config.json");
     TestBadWeights(temp.dir);
     Cuda(cudaFree(nullptr));
+    TestFixedSnapshot();
     TestArenas(config);
     if (dir) TestModel(dir);
     if (golden) {

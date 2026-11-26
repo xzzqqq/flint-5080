@@ -220,6 +220,8 @@
 | **KV & State Cache Arena（剩余可用）** | **3,267.9 MiB 实测余量**（64K 占 `2,211.7 MiB`，仍余 `1,055.9 MiB`） | **~2,444 MiB** | 含主干 40 SWA + 8 Full BF16 KV 与 48 逻辑步 FP32 短卷积状态（单序列 `3.80 MiB`） |
 | **合计** | **16,303 MiB** | **16,303 MiB** | 单次静态预分配，热路径严禁动态 `cudaMalloc`（析构实测零泄漏） |
 
+上表的主干权重实测值计入张量和对齐填充。当前加载器接受 safetensors 元数据中缺省或为 `raw_exl3` 的 `layout_tag`，并在权重区末尾按 256 B 对齐追加专家描述符表。表按物理层、投影（gate/up、down）、专家编号排列，在 64 位平台占 `24 × 2 × 128 × 32 = 196,608` B。
+
 ### 5.2 KV Cache 容量测算（按 40 SWA + 8 Full 精确折算）
 
 Inkling 2 Mini 的 48 逻辑层中仅 **8 层为 Full Attention**（`8 KV heads × 128 head_dim × 2(K,V)`），其余 40 层为固定窗长 `1024` 的 SWA；DSpark 3 层中 2 层 SWA + 1 层 Full：

@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define FLINT_ENGINE_ABI_VERSION 1u
+#define FLINT_ENGINE_ABI_VERSION 2u
 
 /* All CUDA and request state is private to the engine. */
 typedef struct EngineHandle EngineHandle;
@@ -27,6 +27,14 @@ typedef enum EngineEventKind {
   ENGINE_EVENT_ERROR = 2
 } EngineEventKind;
 
+typedef enum EngineStopReason {
+  ENGINE_STOP_NONE = 0,
+  ENGINE_STOP_EOS = 1,
+  ENGINE_STOP_STOP_TOKEN = 2,
+  ENGINE_STOP_MAX_TOKENS = 3,
+  ENGINE_STOP_CONTEXT_LIMIT = 4
+} EngineStopReason;
+
 /* Counts are per request. Times are elapsed milliseconds. */
 typedef struct EngineTelemetry {
   uint32_t prefill_tokens;
@@ -39,12 +47,14 @@ typedef struct EngineTelemetry {
 } EngineTelemetry;
 
 /* All pointers in an event are borrowed for the duration of the callback.
- * TOKENS has n_tokens IDs, DONE carries final telemetry, and ERROR carries
- * the failure status and a NUL-terminated diagnostic. */
+ * TOKENS has n_tokens IDs, DONE carries final telemetry and the stop reason,
+ * and ERROR carries the failure status and a NUL-terminated diagnostic.
+ * stop_reason is ENGINE_STOP_NONE for TOKENS and ERROR. */
 typedef struct EngineEvent {
   uint64_t req_id;
   EngineEventKind kind;
   EngineStatus status;
+  EngineStopReason stop_reason;
   const int32_t* token_ids;
   size_t n_tokens;
   EngineTelemetry telemetry;

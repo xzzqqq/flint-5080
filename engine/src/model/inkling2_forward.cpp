@@ -2,30 +2,28 @@
 
 #include <cuda_runtime.h>
 
+#include <array>
+#include <cstdio>
+#include <type_traits>
+
 #include "common/cuda_check.h"
+#include "common/cuda_profiler.h"
 #include "loader/kv_layout.h"
+#include "loader/scratch_workspace.h"
+#include "model/submodules.h"
+#include "model/visit_plan.h"
 #include "ops/norm_ops.h"
 #include "ops/sconv_ops.h"
 
-#if __has_include(<cuda_profiler_api.h>)
-#include <cuda_profiler_api.h>
-#else
-// CUDA runtime-only toolkit installations export both APIs without the profiler header.
-extern "C" cudaError_t CUDARTAPI cudaProfilerStart(void);
-extern "C" cudaError_t CUDARTAPI cudaProfilerStop(void);
-#endif
-
-#include <cstdio>
-#include <vector>
-
-#include "model/visit_plan.h"
-#include "ops/scratch_workspace.h"
-#include "ops/submodules.h"
-
 namespace flint {
 
-using ops_detail::ScratchWorkspace;
 namespace {
+static_assert(sizeof(Exl3ExpertDesc) == sizeof(ExpertProjection) &&
+              alignof(Exl3ExpertDesc) == alignof(ExpertProjection) &&
+              offsetof(Exl3ExpertDesc, trellis) == offsetof(ExpertProjection, trellis) &&
+              offsetof(Exl3ExpertDesc, suh) == offsetof(ExpertProjection, suh) &&
+              offsetof(Exl3ExpertDesc, svh) == offsetof(ExpertProjection, svh) &&
+              offsetof(Exl3ExpertDesc, k2) == offsetof(ExpertProjection, k2));
 uint64_t MatrixBytes(const Exl3MatrixView& m) {
   return uint64_t(m.k) * m.n * m.k2 / 16 + 2ull * (m.k + m.n);
 }
@@ -51,8 +49,16 @@ uint64_t VisitBytes(const ModelConfig& c, const LayerWeightsView& l, VisitPlanEn
   return bytes + pair * c.num_experts_per_tok / 2;
 }
 struct GraphKey {
-  ForwardBatch batch;
-  ForwardRunOptions options;
+  // Decode position and KV reset are applied on the stream outside the graph.
+  uint32_t begin_visit, end_visit, seq_len, num_block_in;
+  uint8_t run_embed, run_lm_head, is_decode;
+  const int32_t* input_ids;
+  const void *hidden_in, *block_in;
+  void *hidden_out, *block_out;
+  float* logits_out;
+  int32_t* next_token;
+  uint8_t use_cuda_graph, use_speculative, return_logits, enable_profiling, profiler_range;
+
   bool operator==(const GraphKey&) const = default;
 };
 }  // namespace
@@ -62,16 +68,15 @@ struct InklingRunner::Impl {
   VisitPlan plan;
   ScratchArenaView activations{};
   std::unique_ptr<Gemm> gemm;
-  ExpertProjection* d_experts{};
   int32_t *d_next_token{}, *d_decode_pos{}, *host_token{};
   cudaStream_t stream{}, owned_stream{};
   cudaEvent_t start{}, stop{};
-  std::array<cudaEvent_t, std::extent_v<decltype(ForwardOutput::stages)> + 1> marks{};
+  std::array<cudaEvent_t, std::extent_v<decltype(ForwardRunResult::stages)> + 1> marks{};
   cudaGraphExec_t graph{};
   cudaGraph_t source_graph{};
   GraphKey key{};
-  ForwardOutput graph_output{};
-  GraphStats stats{};
+  ForwardRunResult graph_output{};
+  ForwardGraphStats stats{};
   Impl(const ModelWeightsView& w, const KvStateArenaView& k)
       : weights(w), kv(k), plan(BuildVisitPlan(w.config)) {}
   ~Impl() {
@@ -85,14 +90,15 @@ struct InklingRunner::Impl {
     if (stop) cudaEventDestroy(stop);
     if (owned_stream) cudaStreamDestroy(owned_stream);
   }
-  void RunInkling(const ForwardBatch&, const ForwardRunOptions&, ForwardOutput&,
-                  const CaptureBuffers*);
-  void PrepareGraph(const ForwardBatch&, const ForwardRunOptions&);
+  void RunInkling(const ForwardRunSpec&, const ForwardOptions&, ForwardRunResult&,
+                  const ForwardCapture*);
+  void PrepareGraph(const ForwardRunSpec&, const ForwardOptions&);
 };
 InklingRunner::InklingRunner(const ModelWeightsView& w, const KvStateArenaView& kv,
                              ScratchArenaView scratch, cudaStream_t stream)
     : impl_(std::make_unique<Impl>(w, kv)) {
   auto& c = *impl_;
+  if (!w.expert_table) throw std::invalid_argument("missing expert table");
   if (!scratch.device_ptr) throw std::invalid_argument("missing scratch");
   if (!stream) CheckCuda(cudaStreamCreateWithFlags(&c.owned_stream, cudaStreamNonBlocking));
   c.stream = stream ? stream : c.owned_stream;
@@ -100,32 +106,19 @@ InklingRunner::InklingRunner(const ModelWeightsView& w, const KvStateArenaView& 
   CheckCuda(cudaEventCreate(&c.stop));
   for (auto& e : c.marks) CheckCuda(cudaEventCreate(&e));
   CheckCuda(cudaHostAlloc(&c.host_token, sizeof(int32_t), cudaHostAllocDefault));
+  // Graphs retain these addresses. Each run initializes their contents before use.
   ScratchWorkspace ws(scratch);
   constexpr size_t bytes = 4 << 20;
   auto workspace = ws.Take<char>(bytes);
   c.d_next_token = ws.Take<int32_t>(1);
   c.d_decode_pos = ws.Take<int32_t>(1);
-  std::vector<ExpertProjection> descriptors;
-  descriptors.reserve(2 * model::kNumExperts * model::kNumPhysicalLayers);
-  for (const auto& layer : w.layers)
-    for (const auto* projection : {layer.gate_up_proj, layer.down_proj})
-      for (int e = 0; e < model::kNumExperts; ++e) {
-        const auto& m = projection[e];
-        if (m.k2 != 6 && m.k2 != 7) throw std::invalid_argument("unsupported expert bitrate");
-        descriptors.push_back({m.trellis, m.suh, m.svh, m.k2});
-      }
-  c.d_experts = ws.Take<ExpertProjection>(descriptors.size());
   c.activations = ws.rest;
-  CheckCuda(cudaMemcpyAsync(c.d_experts, descriptors.data(),
-                            descriptors.size() * sizeof(ExpertProjection), cudaMemcpyHostToDevice,
-                            c.stream));
-  CheckCuda(cudaStreamSynchronize(c.stream));
   c.gemm = std::make_unique<Gemm>(c.stream, workspace, bytes);
 }
 InklingRunner::~InklingRunner() = default;
-GraphStats InklingRunner::graph_stats() const { return impl_->stats; }
-void InklingRunner::Impl::RunInkling(const ForwardBatch& s, const ForwardRunOptions& o,
-                                     ForwardOutput& result, const CaptureBuffers* capture) {
+ForwardGraphStats InklingRunner::graph_stats() const { return impl_->stats; }
+void InklingRunner::Impl::RunInkling(const ForwardRunSpec& s, const ForwardOptions& o,
+                                     ForwardRunResult& result, const ForwardCapture* capture) {
   const auto& g = *gemm;
   const auto& w = weights;
   const auto* d_pos = s.is_decode && s.seq_len == 1 ? d_decode_pos : nullptr;
@@ -243,8 +236,9 @@ void InklingRunner::Impl::RunInkling(const ForwardBatch& s, const ForwardRunOpti
     if (visit.has_messages)
       RunMessageGate(g, ws.rest, l.controllers[3], attn, messages + 3 * n, attn, t);
     norm(attn, FLINT_F32, l.mlp_norm, normalized);
-    RunSparseMoeBlock(g, ws.rest, l, normalized, tmp, t, nullptr, nullptr, nullptr,
-                      d_experts + visit.physical_layer * 2 * model::kNumExperts);
+    const auto* experts = w.expert_table + visit.physical_layer * 2 * model::kNumExperts;
+    RunSparseMoeBlock(g, ws.rest, l, normalized, tmp, t,
+                      reinterpret_cast<const ExpertProjection*>(experts));
     conv(l.mlp_sconv, VisitSublayerConvState(kv, v, 1));
     CheckCuda(flint_add_residual(partial, tmp, hidden, n, FLINT_BF16, stream));
     if (visit.is_prologue_end) {
@@ -266,8 +260,8 @@ void InklingRunner::Impl::RunInkling(const ForwardBatch& s, const ForwardRunOpti
     auto* raw = ws.Take<float>(vocab);
     auto* rounded = ws.Take<uint16_t>(vocab);
     // Match the fixture's BF16 linear output before applying softcap in FP32.
-    RunRowMatmul(g, ws.rest, hidden + (t - 1) * h, w.unembed_weight, raw, 1, vocab, h, FLINT_BF16,
-                 FLINT_F32, true);
+    RunParityRowMatmul(g, ws.rest, hidden + (t - 1) * h, w.unembed_weight, raw, 1, vocab, h,
+                       FLINT_BF16, FLINT_F32, true);
     CheckCuda(flint_cast({raw, rounded, vocab, FLINT_F32, FLINT_BF16}, stream));
     CheckCuda(flint_logit_softcap_argmax({rounded, o.return_logits ? s.d_logits_out : raw,
                                           s.d_next_token, 1, vocab, vocab, FLINT_BF16},
@@ -276,12 +270,30 @@ void InklingRunner::Impl::RunInkling(const ForwardBatch& s, const ForwardRunOpti
   }
 }
 
-void InklingRunner::Impl::PrepareGraph(const ForwardBatch& batch, const ForwardRunOptions& opts) {
+void InklingRunner::Impl::PrepareGraph(const ForwardRunSpec& batch, const ForwardOptions& opts) {
   // Position is uploaded before each launch. KV reset also runs outside capture.
   auto captured = batch;
   captured.pos_offset = 0;
   captured.reset_kv = 0;
-  GraphKey requested{captured, opts};
+  const GraphKey requested{.begin_visit = batch.begin_visit,
+                           .end_visit = batch.end_visit,
+                           .seq_len = batch.seq_len,
+                           .num_block_in = batch.num_block_in,
+                           .run_embed = batch.run_embed,
+                           .run_lm_head = batch.run_lm_head,
+                           .is_decode = batch.is_decode,
+                           .input_ids = batch.d_input_ids,
+                           .hidden_in = batch.d_hidden_in,
+                           .block_in = batch.d_block_in,
+                           .hidden_out = batch.d_hidden_out,
+                           .block_out = batch.d_block_out,
+                           .logits_out = batch.d_logits_out,
+                           .next_token = batch.d_next_token,
+                           .use_cuda_graph = opts.use_cuda_graph,
+                           .use_speculative = opts.use_speculative,
+                           .return_logits = opts.return_logits,
+                           .enable_profiling = opts.enable_profiling,
+                           .profiler_range = opts.profiler_range};
   if (graph && key == requested) return;
   if (graph) {
     CheckCuda(cudaGraphExecDestroy(graph));
@@ -304,8 +316,8 @@ void InklingRunner::Impl::PrepareGraph(const ForwardBatch& batch, const ForwardR
   key = requested;
   ++stats.captures;
 }
-ForwardOutput InklingRunner::Run(const ForwardBatch& batch, const ForwardRunOptions& o,
-                                 const CaptureBuffers* capture) {
+ForwardRunResult InklingRunner::Run(const ForwardRunSpec& batch, const ForwardOptions& o,
+                                    const ForwardCapture* capture) {
   auto& c = *impl_;
   auto s = batch;
   if (!s.seq_len || s.begin_visit > s.end_visit || s.end_visit > c.plan.size() || !s.d_hidden_out ||
@@ -317,7 +329,7 @@ ForwardOutput InklingRunner::Run(const ForwardBatch& batch, const ForwardRunOpti
   if (s.run_lm_head && !s.d_next_token) s.d_next_token = c.d_next_token;
   bool decode = s.is_decode && s.seq_len == 1;
   bool graph = o.use_cuda_graph && decode && !capture && !o.enable_profiling;
-  ForwardOutput r{};
+  ForwardRunResult r{};
   if (graph) {
     c.PrepareGraph(s, o);
     r = c.graph_output;

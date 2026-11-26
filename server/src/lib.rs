@@ -5,3 +5,5 @@ pub mod http;
 pub mod parser;
 pub mod template;
 pub mod tokenizer;
+
+pub type BoxError = Box<dyn std::error::Error + Send + Sync>;

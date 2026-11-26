@@ -1,4 +1,4 @@
-use crate::tokenizer::TokenizerError;
+use crate::BoxError;
 use clap::Args;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -50,7 +50,7 @@ pub struct Config {
 }
 
 impl Options {
-    pub fn resolve(self, env_api_key: Option<String>) -> Result<Config, TokenizerError> {
+    pub fn resolve(self, env_api_key: Option<String>) -> Result<Config, BoxError> {
         let file: Options = match self.config {
             Some(path) => toml::from_str(&fs::read_to_string(path)?)?,
             None => Options::default(),
