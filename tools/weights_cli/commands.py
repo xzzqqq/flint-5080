@@ -34,7 +34,7 @@ def golden(cfg, args, result):
     path = cfg.resolve_model_dir(args.path)
     if args.steps is not None and args.steps < 1:
         raise ValueError("--steps must be positive")
-    if args.skip_e2e and args.skip_ops:
+    if args.skip_e2e and args.skip_ops and args.skip_mtp:
         raise ValueError("Select at least one fixture tier.")
     out = args.out or str(cfg.resolve_golden_dir(path))
     python = args.python or cfg.weights.python or ("python3" if cfg.is_remote else sys.executable)
@@ -59,6 +59,8 @@ def golden(cfg, args, result):
         command.append("--skip-ops")
     if args.skip_e2e:
         command.append("--skip-e2e")
+    if args.skip_mtp:
+        command.append("--skip-mtp")
     executor = Executor(cfg)
     if cfg.is_remote:
         executor.sync()

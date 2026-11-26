@@ -109,6 +109,8 @@
 - **特征融合与掩码**：`fuse_weight` (`[4, 4]`)、`mask_embed` (`[2304]`)、`norm.weight` (`[2304]`)。
 - **Markov RNN Head**（`111,979,008` B，106.79 MiB，`block_size = 8`, `markov_rank = 256`, `markov_head_type = "rnn_hidden"`）：`dflare_norm`、`rnn_proj` (`[768, 5120]` + bias)、`hidden_out` (`[2304, 256]` + bias)、`markov_w1.weight` (`[201024, 256]`, 102.92 MB)。
 
+草拟器与 target 共用 `embed`、`embed_norm` 和 `unembed[:200058]`。块大小为 8，位置上限为 1,048,576。每个请求按草拟层维护已提交上下文的 K/V；本轮的 8 对块内 K/V 仅用于本轮计算。
+
 ### 3.5 核心算子数学语义与前向数据流
 
 以下精确语义对照上游 `huggingface/transformers#51050`（`430050f6`）并在 [tools/weights_cli/_inkling2_ref.py](../tools/weights_cli/_inkling2_ref.py) 中针对 `Maxrio/Inkling-2-Mini-exl3`（`3.3bpw`）实测锁死。公式使用零基位置 $t$，单请求省略 batch 维，定义 $\text{cap}(x, a) = a \tanh(x / a)$、$\text{RMS}(x) = x \cdot \text{rsqrt}(\text{mean}(x^2) + 10^{-6})$。
@@ -143,15 +145,31 @@
      $$z = [\text{RMS}(x),\, \text{RMS}(m)] W_{\text{down}}^T, \qquad y = (1 - \tanh(z W_{\text{forget}}^T)) \odot x + \tanh(z W_{\text{gain}}^T) \odot m$$
    - **独立状态槽位**：48 个逻辑步各自持有独立的 KV Cache 与 4 份卷积历史（`k_sconv`、`v_sconv`、`attn_sconv`、`mlp_sconv`）。
 
+6. **DSpark 上下文与草拟块**（[PyTorch 参考](../tools/weights_cli/_dspark_ref.py)）：
+   - 将已提交位置的四路 tap 叠成 `T[L,4,2304]`。沿列计算 `A = softmax(fuse_weight.float(), dim=-1)`。对第 $i$ 行求 $m_i(t)=\sum_j A_{ij} T_{tj}$，在 FP32 中计算 $D_i(t)=\mathrm{RMS}(m_i(t))\odot w_i$ 后舍入 BF16。行 0–2 使用对应层的 `dflare_norm`，行 3 使用 Markov 头的 `dflare_norm`；`f_rnn = D_3[-1:]`。
+   - 每层投影 `D_i` 得到上下文 K/V。K 经逐头带权 RMSNorm 舍入 BF16，再在绝对位置 $p$ 应用 Neox RoPE。将每头等分为 $(a,b)$，$\phi_j=p/10^{6(2j/128)}$，以 FP32 计算 $(a\cos\phi-b\sin\phi, b\cos\phi+a\sin\phi)$ 并舍入 BF16。V 直接进入缓存。
+   - 块输入为 `[embed_norm(embed[anchor]), mask_embed × 7]`，绝对位置从末个已提交位置加一开始。每层在 `input_layernorm` 后投影 Q/K/V，Q/K 逐头归一化、舍入并旋转。24 个 Q 头按每 3 头共用一组 K/V，计算 $\mathrm{softmax}(QK^T/\sqrt{128})V$。块内双向可见，层 0、2 共用最近 1024 个上下文位置加整个块（最多 1032 键），层 1 使用全部上下文加整个块。注意力只有上述点积打分，输出直接经 `o_proj` 加回残差。
+   - 经 `post_attention_layernorm` 得到 $h$，令 $g=W_g h, u=W_u h$，以 FP32 计算 $g\,\sigma(g)\odot u$，舍入 BF16 后经 `down_proj` 加回残差。三层之后执行最终带权 RMSNorm。
+
+7. **Markov 顺序采样**：记 $B$ 为舍入 BF16，$U$ 为未填充的共享输出头。仅取最终隐藏态的 7 个 mask 位置 $H_s$，基准 logits 为 BF16 投影 $U H_s$。
+   - 设 $W=$ `rnn_proj.weight`。预计算 FP32 的 $C_s=b+W_{[:,512:]}[H_s;f_{rnn}]$。初值 $z=0$（256 维 BF16）、$p=\mathrm{anchor}$；每步将 $B(C_s+W_{[:,:512]}[z;\mathrm{markov\_w1}[p]])$ 均分为 $(g,c,o)$。
+   - $g'=B(\sigma(g)),\ c'=B(\tanh(c)),\ z=B(B(g'z)+B(B(1-g')c')),\ l=B(\tanh(o))$。本步的偏置 logits 来自 $l$，更新后的 $z$ 传入下一步。
+   - 偏置投影依次计算 $h'=B(B(W_h l)+b_h)$、$d=B(Uh')$。令 $p=\arg\max B(30\tanh(B(B(UH_s)+d)/30))$，并列取最小 ID。独立自检用 FP64 验证折叠式 $(UW_h)l+Ub_h=U(W_hl+b_h)$，并测量它与实际 BF16 偏置 logits 的最大绝对差。
+   - Target 一次验证 `[anchor, draft[0:7]]`。连续匹配 $a$ 个草稿后，下一 anchor 为 `target_ids[a]`。拒绝时恢复验证前各逻辑步的 KV 与四份短卷积历史，再前向已提交前缀；草拟器仅追加这些位置的 target taps。
+
 ### 3.6 Golden Reference 与 Fixture 契约（`weights golden`）
 
-`./bin/weights golden` 使用 [workloads/golden_cases.json](../workloads/golden_cases.json) 中锁定的 `messages`、`reasoning_effort` 与经 checkpoint tokenizer 校验的 `input_ids`，在 5080 上持单卡 lease 生成两级标准 `.safetensors` 夹具及 `manifest.json`（默认输出至 `<weights.golden_dir>/<model_name>`）：
+`./bin/weights golden` 使用 [workloads/golden_cases.json](../workloads/golden_cases.json) 中锁定的 `messages`、`reasoning_effort` 与经 checkpoint tokenizer 校验的 `input_ids`，在 5080 上持单卡 lease 生成三级标准 `.safetensors` 夹具及 `manifest.json`（默认输出至 `<weights.golden_dir>/<model_name>`）：
 
-| 产出文件 | 核心内容与命名约定 | 消费方式（Phase 1 对齐） |
+| 产出文件 | 核心内容与命名约定 | 消费方式 |
 |---|---|---|
 | `ops_golden.safetensors` | • `exl3.{3_0,3_5,6_0}.*`：真实权重切片、`inner_f16_slice`、`inner_sha256` 及 `x`/`y`<br>• `{static,dynamic}_sconv.{prefill,decode_0,decode_1}.*`（层 `0` / 层 `5` `k_sconv`）<br>• `{sliding,full}_attention.{prefill,decode_0}.*`（层 `0` / 层 `5`）<br>• `moe.*`（层 `0` router logits/top-8/weights/output）<br>• `block_residual.layer_{1,5}.*`、`message_residual.layer_6_pass_1.*`、`message_gate.{attn,k,v,mlp}.*` | 单算子与子模块独立单元测试（卷积用例需按 `prefill → decode_0 → decode_1` 顺序回放状态） |
 | `e2e_<case>.safetensors` | • `input_ids` / `generated_ids`（`I32`，共 `decode_steps + 1` 个生成 token）<br>• `prefill.{embed,step_0..47,mtp_tap_{5,23,41,48}}`（`BF16`）与 `prefill.{last_logits,top64_*}`<br>• `decode_0.{step_0..47,logits}` 及每步 `decode_{s}.{final_hidden,top64_ids,top64_logits}` | 48 逻辑步逐段对齐（`forge run --layers`）与端到端多步 decode 验收 |
+| `mtp_golden.safetensors` | `short_math` 的 `prompt_ids`、`prefill_taps[L,4,2304]`、`prefill_bonus_id[1]`、`mix_rmsnorm.{layer_0..2,markov}`、`ctx_kv.layer_{0..2}.{k,v}`。首轮保存 `round_0.{embed_block,layer_0..2_out,head_hidden,f_rnn}` 及 `round_0.markov.{context,states,latents,draft_ids,top64_ids,top64_logits}` | 模块对齐；Markov 的 context 为 FP32，隐藏态、K/V、状态、latent 与 top logits 为 BF16，ID 为 I32 |
+| 同一文件的逐轮轨迹 | `round_N.{anchor_id[1],draft_ids[7],target_ids[8],accepted_count[1],next_bonus_id[1]}`；`spec_generated_ids` 含 prefill bonus，共 `decode_steps + 1` 个 ID | 逐轮回放和 AR 全序列比对；最后一轮仍验证完整块，输出按预算截断 |
 | `manifest.json` | Checkpoint / 生成器 SHA256、张量清单元数据、生成文本、全位置 cached decode vs teacher-forced prefill 自检误差、峰值 VRAM 与耗时 | 可追溯的 provenance 与 CI / 回归基线核验 |
+
+`mtp_verification` 记录 greedy 匹配率（须为 1）、轮数、生成数、连续接受的草稿总数和占全部提案的比例。平均每轮新增 token 数按实际输出计，扣除 prefill bonus。折叠误差覆盖首轮 7 个 latent 与全部 200058 个有效词表行。可用三个 `--skip-*` 参数选择生成层级；部分生成时，文本权重与配置 SHA256 一致即可保留已有层级的登记。
 
 ---
 
@@ -168,7 +186,7 @@
   - **`3.5` bits**（3,072 模块）：全部 24 层的**奇数专家** `j ∈ {1, 3, ..., 127}`（`gate_up_proj` 与 `down_proj` 成对一致）。
   - **`6.0` bits**（120 模块）：全部 24 层的 5 个 Attention 投影。
 
-> **架构优化提示（Phase 3 `weights repack`）**：由于每层 128 个专家严格呈“64 个偶数 3.0-bit + 64 个奇数 3.5-bit”且 `gate_up` / `down` 比特率成对一致，后续 `weights repack` 可按奇偶拆成两块等步长（fixed-stride）连续设备数组，直接消除 MoE kernel 中的变长指针查找与 warp 分化；同时全局常量 `mul1 = 0x83dcd12d` 可直接编译期常量化。
+> **架构优化提示（Phase 4 `weights repack`）**：由于每层 128 个专家严格呈“64 个偶数 3.0-bit + 64 个奇数 3.5-bit”且 `gate_up` / `down` 比特率成对一致，后续 `weights repack` 可按奇偶拆成两块等步长（fixed-stride）连续设备数组，直接消除 MoE kernel 中的变长指针查找与 warp 分化；同时全局常量 `mul1 = 0x83dcd12d` 可直接编译期常量化。
 
 ### 4.2 全部 7 种量化投影形状清单
 
@@ -233,7 +251,7 @@ Inkling 2 Mini 的 48 逻辑层中仅 **8 层为 Full Attention**（`8 KV heads 
 
 > **工程结论**：
 > - Phase 1–2 直接采用 **BF16 KV** 即可在 16 GiB 上轻松覆盖 64K–96K 单序列（或双并发 C2 各 32K+），实现简单且零 KV 量化误差。
-> - Phase 3 开启 DSpark 并追求更高 Prefix Cache 命中率与 C2 长上下文时，引入 **FP8 KV** 可将有效 KV 容量翻倍至 ~150K tokens（同时将长上下文 KV 读带宽减半）。
+> - Phase 4 优化 DSpark 的 Prefix Cache 命中率与 C2 长上下文时，引入 **FP8 KV** 可将有效 KV 容量翻倍至 ~150K tokens（同时将长上下文 KV 读带宽减半）。
 > - 若未来需要额外 ~880 MiB 显存余量，可将 `model.llm.embed.weight`（883 MiB，decode 每 token 仅查表 1 行 4.5 KiB）迁移至 pinned host memory，几乎无延迟损失。
 
 ---

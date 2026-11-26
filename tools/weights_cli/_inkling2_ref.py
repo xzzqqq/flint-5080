@@ -318,12 +318,19 @@ class Inkling2LoopReference:
         y = self.conv(i, "mlp_sconv", self.moe(i, y)[0], cache)
         return (partial + y.float()).to(x.dtype), blocks
 
-    @torch.inference_mode()
-    def _forward(self, ids):
+    def embed_tokens(self, ids):
         x = self.file.get_tensor("model.llm.embed.weight")[torch.as_tensor(ids, device="cpu")].to(
             self.device
         )
-        x = rms(x, self.weight("embed_norm.weight"))
+        return rms(x, self.weight("embed_norm.weight"))
+
+    def unembedding(self):
+        head = self.file.get_tensor("model.llm.unembed.weight")
+        return head[: self.c.unpadded_vocab_size].to(self.device)
+
+    @torch.inference_mode()
+    def _forward(self, ids):
+        x = self.embed_tokens(ids)
         states = {"embed": x}
         blocks = []
         loop = self.c.loop_config
@@ -360,8 +367,7 @@ class Inkling2LoopReference:
         states["final_hidden"] = final
         if visit in self.taps:
             states[f"mtp_tap_{visit}"] = final
-        head = self.file.get_tensor("model.llm.unembed.weight")[: self.c.unpadded_vocab_size]
-        logits = linear(final, head.to(self.device))
+        logits = linear(final, self.unembedding())
         states["logits"] = softcap(logits, self.c.final_logit_softcapping)
         self.position += len(ids)
         return states
@@ -375,3 +381,16 @@ class Inkling2LoopReference:
         if not self.cache:
             raise ValueError("prefill must precede decode_step")
         return self._forward([token])
+
+    def snapshot_cache(self):
+        """Cache updates replace tensors, so a shallow copy of each visit is sufficient."""
+        return self.position, [visit.copy() for visit in self.cache]
+
+    def restore_cache(self, snapshot):
+        self.position, visits = snapshot
+        self.cache = [visit.copy() for visit in visits]
+
+    def verify_block(self, tokens):
+        if not self.cache:
+            raise ValueError("prefill must precede verify_block")
+        return self._forward(tokens)

@@ -59,6 +59,7 @@ def test_golden_dispatch(cfg, monkeypatch, capsys, mode):
             directory = ".forge/golden" if mode == "local_default" else "/goldens"
             assert args[args.index("--out") + 1] == directory + "/model name"
         assert args.count("--case") == 2 and "--skip-ops" in args and "--steps" in args
+        assert "--skip-mtp" in args
         return SimpleNamespace(stdout=json.dumps(data))
 
     executor.run.side_effect = run
@@ -71,7 +72,7 @@ def test_golden_dispatch(cfg, monkeypatch, capsys, mode):
     monkeypatch.setattr(cli, "find_repo_root", lambda _: cfg.repo_root)
     monkeypatch.setattr(commands, "Executor", make_executor)
     monkeypatch.setattr(commands, "GpuLeaseManager", lambda *args: SimpleNamespace(hold=hold))
-    args = ["golden", "--case", "a", "--case", "b", "--steps", "2", "--skip-ops"]
+    args = ["golden", "--case", "a", "--case", "b", "--steps", "2", "--skip-ops", "--skip-mtp"]
     if mode == "local_override":
         args += ["--local", "--path", "/other", "--out", "/dir", "--python", "my python"]
     if mode.startswith("remote"):
@@ -279,3 +280,244 @@ def test_loop_prefill_and_cached_decode(pt, tmp_path):
     assert fixture["decode_0.step_15"].dtype == pt.bfloat16
     assert fixture["decode_0.logits"].dtype == pt.float32
     assert inventory["tensors"]["generated_ids"] == dict(shape=[3], dtype="int32")
+
+
+@pytest.fixture
+def dspark(pt, tmp_path):
+    from safetensors.torch import save_file
+
+    from tools.weights_cli._dspark_ref import Inkling2DSparkReference
+
+    tiny_checkpoint(pt, tmp_path)
+    config_path = tmp_path / "config.json"
+    config = json.loads(config_path.read_text())
+    config["mtp_config"].update(
+        hidden_size=128,
+        num_hidden_layers=3,
+        local_layer_ids=[0, 2],
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=4,
+        sliding_window_size=1024,
+        rope_theta=1e6,
+        rms_norm_eps=1e-6,
+        block_size=8,
+        markov_rank=4,
+        intermediate_size=16,
+    )
+    config_path.write_text(json.dumps(config))
+    rng = pt.Generator().manual_seed(21)
+    weights = {}
+
+    def add(key, *shape):
+        offset = 1 if "norm" in key else 0
+        weights[key] = (pt.randn(shape, generator=rng) / 8 + offset).bfloat16()
+
+    add("fuse_weight", 4, 4)
+    add("mask_embed", 128)
+    add("norm.weight", 128)
+    for i in range(3):
+        p = f"layers.{i}."
+        for norm in ("dflare_norm", "input_layernorm", "post_attention_layernorm"):
+            add(p + norm + ".weight", 128)
+        for name, shape in (
+            ("q_proj", (16, 128)),
+            ("o_proj", (128, 16)),
+            ("k_proj", (8, 128)),
+            ("v_proj", (8, 128)),
+            ("k_proj_ctx", (8, 128)),
+            ("v_proj_ctx", (8, 128)),
+            ("k_norm_ctx", (4,)),
+            ("k_norm", (4,)),
+            ("q_norm", (4,)),
+        ):
+            add(p + f"self_attn.{name}.weight", *shape)
+        for name in ("gate", "up", "down"):
+            add(p + f"mlp.{name}_proj.weight", *((128, 16) if name == "down" else (16, 128)))
+    for name, shape in (
+        ("dflare_norm.weight", (128,)),
+        ("markov_w1.weight", (72, 4)),
+        ("rnn_proj.weight", (12, 264)),
+        ("rnn_proj.bias", (12,)),
+        ("hidden_out.weight", (128, 4)),
+        ("hidden_out.bias", (128,)),
+    ):
+        add("markov_head." + name, *shape)
+    save_file(weights, tmp_path / "model-mtp.safetensors")
+    return Inkling2DSparkReference(tmp_path, "cpu")
+
+
+def test_dspark_mix_rope_and_attention(pt, dspark):
+    from tools.weights_cli._dspark_ref import neox_rope
+
+    rng = pt.Generator().manual_seed(10)
+    taps = pt.randn(1025, 4, 128, generator=rng).bfloat16()
+    w = dspark.weights
+    for i in range(4):
+        alpha = w["fuse_weight"][i].float().softmax(0)
+        x = sum(taps[:, j].float() * alpha[j] for j in range(4))
+        norm = "markov_head" if i == 3 else f"layers.{i}"
+        expected = x * pt.rsqrt(x.square().mean(-1, keepdim=True) + 1e-6)
+        assert pt.equal(
+            dspark.mix_rmsnorm(taps, i), (expected * w[norm + ".dflare_norm.weight"]).bfloat16()
+        )
+    assert pt.equal(dspark.compute_f_rnn(taps), dspark.mix_rmsnorm(taps, 3)[-1:])
+
+    x = pt.tensor([[[1.0, 2.0, 3.0, 4.0]]]).bfloat16()
+    p = 123
+    expected = [
+        x[0, 0, j].item() * math.cos(p * f) + sign * x[0, 0, (j + 2) % 4].item() * math.sin(p * f)
+        for j, (f, sign) in enumerate(((1, -1), (0.001, -1), (1, 1), (0.001, 1)))
+    ]
+    assert pt.equal(neox_rope(x, pt.tensor([p]), 1e6).flatten(), pt.tensor(expected).bfloat16())
+
+    dspark.store_context_kv(taps[:-1], pt.arange(1024))
+    original = dspark.cache.copy()
+    dspark.store_context_kv(taps[-1:], pt.tensor([1024]))
+    block = dspark.embed_block(2)
+    assert pt.equal(block[1:], w["mask_embed"].expand(7, -1))
+    for i in range(3):
+        k, v = dspark.cache[i]
+        dropped = int(i in (0, 2))
+        assert pt.equal(k[:-1], original[i][0][dropped:])
+        assert pt.equal(v[:-1], original[i][1][dropped:])
+        # Zero queries yield uniform attention: every row sees all eight block
+        # values, including future ones, and exactly the retained context.
+        base = f"layers.{i}.self_attn."
+        w[base + "q_proj.weight"].zero_()
+        block_v = (block @ w[base + "v_proj.weight"].T).reshape(8, 2, 4)
+        values = pt.cat((v, block_v))
+        assert len(values) == (1032 if dropped else 1033)
+        mean = values.float().mean(0).repeat_interleave(2, dim=0).flatten().bfloat16()
+        expected = mean.expand(8, -1) @ w[base + "o_proj.weight"].T
+        actual = dspark.attention(i, block, pt.arange(1025, 1033))
+        pt.testing.assert_close(actual, expected, atol=2e-4, rtol=0.015)
+        assert dspark.cache[i][0] is k and dspark.cache[i][1] is v
+
+
+def test_dspark_markov(pt, dspark):
+    rng = pt.Generator().manual_seed(7)
+    h = pt.randn(8, 128, generator=rng).bfloat16()
+    f = pt.randn(1, 128, generator=rng).bfloat16()
+    trace = {}
+    draft = dspark.markov_sample_greedy(h, f, 2, trace)
+    w = {
+        k.removeprefix("markov_head."): v
+        for k, v in dspark.weights.items()
+        if k.startswith("markov_head.")
+    }
+    u = dspark.unembed
+    assert len(u) == 70
+    prev, state = 2, pt.zeros(4)
+    errors = []
+    for s, row in enumerate(h[1:]):
+        raw = (
+            w["rnn_proj.weight"].double()
+            @ pt.cat((state, w["markov_w1.weight"][prev], row, f[0])).double()
+        )
+        g, c, o = (raw + w["rnn_proj.bias"]).bfloat16().float().chunk(3)
+        gate, cand = g.sigmoid().bfloat16().float(), c.tanh().bfloat16().float()
+        keep = (gate * state).bfloat16()
+        update = (1 - gate).bfloat16() * cand.bfloat16()
+        state = (keep + update).float()
+        latent = o.tanh().bfloat16()
+        assert pt.equal(trace["markov.states"][s], state)
+        assert pt.equal(trace["markov.latents"][s], latent)
+        hidden = w["hidden_out.weight"] @ latent + w["hidden_out.bias"]
+        bias_logits = u @ hidden
+        folded = (u.double() @ w["hidden_out.weight"].double()) @ latent.double() + u.double() @ w[
+            "hidden_out.bias"
+        ].double()
+        errors.append((bias_logits.double() - folded).abs().max().item())
+        logits = (30 * (((u @ row) + bias_logits).float() / 30).tanh()).bfloat16()
+        prev = int(logits.argmax())
+        assert prev == int(draft[s])
+        top = logits.argsort(descending=True, stable=True)[:64]
+        assert pt.equal(trace["markov.top64_ids"][s], top)
+        assert pt.equal(trace["markov.top64_logits"][s], logits[top])
+    assert dspark.folded_logit_error(trace["markov.latents"]) == pytest.approx(max(errors))
+    dspark.unembed.zero_()
+    assert dspark.markov_sample_greedy(h, f, 2).tolist() == [0] * 7
+
+
+def test_dspark_target_rollback_and_parity(pt, dspark, monkeypatch):
+    model = dspark.target
+    prompt = [2, 4, 6, 3]
+    ids = [int(model.prefill(prompt)["logits"][-1].argmax())]
+    for _ in range(11):
+        ids.append(int(model.decode_step(ids[-1])["logits"][-1].argmax()))
+    position, expected_cache = model.snapshot_cache()
+
+    def compare(count):
+        generated, trace = dspark.speculative_decode_greedy(model, prompt, count)
+        assert trace["spec_generated_ids"].tolist() == generated == ids[:count]
+        assert dspark.position == model.position == len(prompt) + count - 1
+        return trace
+
+    trace = compare(3)
+    assert trace["round_0.target_ids"].shape == (8,)
+    assert pt.equal(trace["round_0.f_rnn"], trace["mix_rmsnorm.markov"][-1:])
+
+    # Force 2/7 accepted (replay past SWA eviction), then 7/7 (no rollback).
+    def propose(anchor, f_rnn, details):
+        offset = model.position - len(prompt)
+        candidates = ids[offset + 1 : offset + 8]
+        if offset == 0:
+            candidates[2] = (candidates[2] + 1) % len(dspark.unembed)
+        return pt.tensor(candidates, dtype=pt.int32)
+
+    monkeypatch.setattr(dspark, "draft_greedy", propose)
+    trace = compare(12)
+    assert [int(trace[f"round_{r}.accepted_count"]) for r in range(2)] == [2, 7]
+    assert model.position == position
+    for got, expected in zip(model.cache, expected_cache, strict=True):
+        for key in expected:
+            assert pt.equal(got[key], expected[key]), key
+
+
+@pytest.mark.parametrize("same_checkpoint", [True, False])
+def test_partial_manifest(pt, tmp_path, monkeypatch, same_checkpoint):
+    from tools.weights_cli import _golden
+
+    out = tmp_path / "out"
+    out.mkdir()
+    checkpoint = {"model.safetensors": "text", "config.json": "cfg"}
+    cases = [{"name": "short_math", "generated_ids": [1, 2]}]
+    files = {"ops_golden.safetensors": {}, "e2e_short_math.safetensors": {}}
+    previous = dict(
+        checkpoint=checkpoint.copy(), files=files, cases=cases, self_verification={"positions": 2}
+    )
+    if not same_checkpoint:
+        previous["checkpoint"]["config.json"] = "other"
+    for name in files:
+        (out / name).write_bytes(b"original")
+    (out / "manifest.json").write_text(json.dumps(previous))
+
+    def generate(args, staging):
+        assert args.skip_e2e and args.skip_ops and not args.skip_mtp
+        (staging / "mtp_golden.safetensors").write_bytes(b"new")
+        return dict(
+            files={"mtp_golden.safetensors": {}},
+            checkpoint=checkpoint,
+            out_dir=str(out),
+            cases=[],
+            self_verification={},
+            wall_seconds=1,
+            peak_vram_bytes=1,
+        )
+
+    monkeypatch.setattr(_golden, "generate", generate)
+    args = ["--path", str(tmp_path), "--out", str(out), "--skip-ops", "--skip-e2e"]
+    _golden.main(args)
+    manifest = json.loads((out / "manifest.json").read_text())
+    assert manifest["cases"] == (cases if same_checkpoint else [])
+    assert manifest["self_verification"] == (
+        previous["self_verification"] if same_checkpoint else {}
+    )
+    assert set(manifest["files"]) == {"mtp_golden.safetensors"} | (
+        set(files) if same_checkpoint else set()
+    )
+    for name in files:
+        assert (out / name).read_bytes() == b"original"
+    with pytest.raises(ValueError, match="tier"):
+        _golden.main([*args, "--skip-mtp"])

@@ -20,6 +20,7 @@ from safetensors.torch import save_file
 from tools.common.config import load_config
 
 from .__main__ import build_parser
+from ._dspark_ref import Inkling2DSparkReference
 from ._inkling2_ref import (
     Inkling2LoopReference,
     decode_inner,
@@ -180,6 +181,49 @@ def e2e_case(model, case, steps):
     return saved, generated, metrics
 
 
+def mtp_fixture(path, device, model, case, steps, ar_ids=None):
+    if steps < 1:
+        raise ValueError("decode_steps must be positive")
+    prompt = case["input_ids"]
+    if ar_ids is None:
+        logits = model.prefill(prompt)["logits"]
+        ar_ids = [int(logits[-1].argmax())]
+        for _ in range(steps):
+            logits = model.decode_step(ar_ids[-1])["logits"]
+            ar_ids.append(int(logits[-1].argmax()))
+    drafter = Inkling2DSparkReference(path, device, model)
+    generated, trace = drafter.speculative_decode_greedy(model, prompt, steps + 1)
+    if generated != ar_ids:
+        mismatch = next(i for i, (a, b) in enumerate(zip(generated, ar_ids, strict=True)) if a != b)
+        raise ValueError(
+            f"DSpark greedy mismatch at token {mismatch}: "
+            f"spec={generated[mismatch]}, AR={ar_ids[mismatch]}"
+        )
+    accepted = [int(v) for k, v in trace.items() if k.endswith(".accepted_count")]
+    rounds = len(accepted)
+    error = drafter.folded_logit_error(trace["round_0.markov.latents"])
+    return trace, dict(
+        greedy_match_rate=1.0,
+        rounds_executed=rounds,
+        total_tokens_generated=len(generated),
+        total_draft_tokens_accepted=sum(accepted),
+        mean_tokens_per_round=(len(generated) - 1) / rounds,
+        mean_draft_acceptance_rate=sum(accepted) / (rounds * (drafter.c.block_size - 1)),
+        folded_vs_unfolded_max_abs_logit_diff=error,
+    )
+
+
+def summarize_checks(checks):
+    if not checks:
+        return {}
+    return dict(
+        positions=sum(c["positions"] for c in checks),
+        prefill_vs_decode_top1_match=min(c["prefill_vs_decode_top1_match"] for c in checks),
+        prefill_vs_decode_max_abs_err=max(c["prefill_vs_decode_max_abs_err"] for c in checks),
+        by_case=checks,
+    )
+
+
 def write_fixture(directory, name, tensors):
     # safetensors rejects overlapping storage (e.g. the final MTP tap and final_hidden).
     values = {k: v.cpu().contiguous().clone() for k, v in tensors.items()}
@@ -212,6 +256,7 @@ def generate(args, staging):
     if not cases:
         raise ValueError("Empty golden case manifest")
     operator_ids = cases[0]["input_ids"][:4]
+    mtp_case = next((c for c in cases if c["name"] == "short_math"), None)
     if args.case:
         cases = [c for c in cases if c["name"] in args.case]
     device = (
@@ -253,14 +298,15 @@ def generate(args, staging):
                     text=tok.decode(ids, skip_special_tokens=False),
                 )
             )
-    metrics = {}
-    if checks:
-        metrics = dict(
-            positions=sum(c["positions"] for c in checks),
-            prefill_vs_decode_top1_match=min(c["prefill_vs_decode_top1_match"] for c in checks),
-            prefill_vs_decode_max_abs_err=max(c["prefill_vs_decode_max_abs_err"] for c in checks),
-            by_case=checks,
-        )
+    mtp_check = None
+    if not args.skip_mtp:
+        if mtp_case is None:
+            raise ValueError("DSpark fixtures require the short_math case")
+        steps = mtp_case["decode_steps"] if args.steps is None else args.steps
+        print(f"Generating DSpark short_math ({steps} cached steps)", file=sys.stderr, flush=True)
+        ar_ids = next((c["generated_ids"] for c in outputs if c["name"] == "short_math"), None)
+        tensors, mtp_check = mtp_fixture(path, device, model, mtp_case, steps, ar_ids)
+        files["mtp_golden.safetensors"] = write_fixture(staging, "mtp_golden.safetensors", tensors)
     manifest = dict(
         schema_version=1,
         created_at=datetime.now(UTC).isoformat(),
@@ -271,7 +317,8 @@ def generate(args, staging):
         },
         cases_sha256=sha256(cases_path),
         generator_sha256={
-            p: sha256(Path(__file__).with_name(p)) for p in ("_golden.py", "_inkling2_ref.py")
+            p: sha256(Path(__file__).with_name(p))
+            for p in ("_golden.py", "_inkling2_ref.py", "_dspark_ref.py")
         },
         transformers_reference="430050f6f71195b76004b5d61bbb446ec0508fb3",
         python=platform.python_version(),
@@ -286,15 +333,50 @@ def generate(args, staging):
         gpu=torch.cuda.get_device_name() if device == "cuda" else None,
         files=files,
         cases=outputs,
-        self_verification=metrics,
+        self_verification=summarize_checks(checks),
         peak_vram_bytes=torch.cuda.max_memory_allocated() if device == "cuda" else 0,
         peak_reserved_bytes=torch.cuda.max_memory_reserved() if device == "cuda" else 0,
         float32_matmul_precision=torch.get_float32_matmul_precision(),
         wall_seconds=time.monotonic() - start,
         out_dir=str(Path(args.out).resolve()),
     )
-    (staging / "manifest.json").write_text(json.dumps(manifest, indent=2, allow_nan=False) + "\n")
+    if mtp_check is not None:
+        manifest["checkpoint"]["model-mtp.safetensors"] = sha256(path / "model-mtp.safetensors")
+        manifest["mtp_verification"] = mtp_check
     return manifest
+
+
+def preserve_skipped(manifest, previous, args):
+    for key in ("model.safetensors", "config.json"):
+        if previous.get("checkpoint", {}).get(key) != manifest["checkpoint"][key]:
+            return
+    old_files = previous["files"]
+    for name, skip in (
+        ("ops_golden.safetensors", args.skip_ops),
+        ("mtp_golden.safetensors", args.skip_mtp),
+    ):
+        if skip and name in old_files:
+            manifest["files"][name] = old_files[name]
+    if args.skip_mtp and "mtp_verification" in previous:
+        manifest["mtp_verification"] = previous["mtp_verification"]
+        manifest["checkpoint"]["model-mtp.safetensors"] = previous["checkpoint"][
+            "model-mtp.safetensors"
+        ]
+    if args.skip_e2e or args.case:
+        selected = {c["name"] for c in manifest["cases"]}
+        retained = [c for c in previous["cases"] if c["name"] not in selected]
+        for case in retained:
+            name = f"e2e_{case['name']}.safetensors"
+            manifest["files"][name] = old_files[name]
+        manifest["cases"].extend(retained)
+        if args.skip_e2e:
+            manifest["self_verification"] = previous["self_verification"]
+        else:
+            old_checks = previous["self_verification"].get("by_case", [])
+            checks = manifest["self_verification"].get("by_case", [])
+            manifest["self_verification"] = summarize_checks(
+                checks + [c for c in old_checks if c["case"] not in selected]
+            )
 
 
 def main(argv=None):
@@ -306,7 +388,7 @@ def main(argv=None):
         base = Path(cfg.weights.golden_dir or cfg.repo_root / ".forge/golden")
         args.out = str(base / Path(args.path).name)
     out = Path(args.out)
-    if args.skip_ops and args.skip_e2e:
+    if args.skip_ops and args.skip_e2e and args.skip_mtp:
         raise ValueError("Select at least one fixture tier.")
     out.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=out) as tmp:
@@ -317,15 +399,29 @@ def main(argv=None):
         descriptor = os.open(out, os.O_RDONLY)
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX)
-            (out / "manifest.json").unlink(missing_ok=True)
-            for name in [*manifest["files"], "manifest.json"]:
-                (staging / name).replace(out / name)
+            fresh = list(manifest["files"])
+            destination = out / "manifest.json"
+            if destination.exists() and (
+                args.skip_ops or args.skip_e2e or args.skip_mtp or args.case
+            ):
+                preserve_skipped(manifest, json.loads(destination.read_text()), args)
+            staged_manifest = staging / "manifest.json"
+            staged_manifest.write_text(json.dumps(manifest, indent=2, allow_nan=False) + "\n")
+            try:
+                for name in fresh:
+                    (staging / name).replace(out / name)
+                staged_manifest.replace(destination)
+            except OSError:
+                destination.unlink(missing_ok=True)
+                raise
         finally:
             os.close(descriptor)
     summary = {
         k: manifest[k]
         for k in ("out_dir", "cases", "self_verification", "wall_seconds", "peak_vram_bytes")
     }
+    if "mtp_verification" in manifest:
+        summary["mtp_verification"] = manifest["mtp_verification"]
     print(json.dumps(dict(**summary, files=[*manifest["files"], "manifest.json"]), allow_nan=False))
 
 

@@ -259,4 +259,5 @@ flint-5080/
 | **Phase 0：工程骨架与工具底座** | 建好目录、空壳 CMake/Cargo、`tools/common/`（远程同步 + 单卡 lease 锁 + JSON 输出）与 `dev status / build / check --local` | Mac 一键同步并在 5080 增量编通空壳 `libengine` + `forge-host` + `server` |
 | **Phase 1：C++ AR Baseline + `forge` 闭环** | 实现 `safetensors` loader、AR 前向、`weights golden` 逐层对齐、`forge start/run/ab/profile/dump` 热重载闭环 | `forge run --e2e` 与 HF 参考 logits/输出对齐；改单算子 6 秒内热重载生效 |
 | **Phase 2：Rust 薄壳 + `bench` 端到端** | 打通 `engine_api.h`、Chat Completions (SSE + reasoning + tool calls)、HF tokenizer/template golden 单测、VRAM Prefix Cache 与 `bench` | 真实 coding agent 客户端可流畅对话与调用工具；`bench` 跑出首份冻结基线 |
-| **Phase 3：`dspark` 投机解码与 5080 SOL 优化** | 接入 `dspark` verify 路径，全面进入 `forge` 高频优化循环（算子融合、量化/KV 压缩、PDL、布局重排）；按需补齐 P1 能力 | 端到端 decode 稳定逼近 RTX 5080 硬件带宽极限，canary 与 KLD 回归绿灯 |
+| **Phase 3：DSpark 投机解码与功能补齐** | 以 `mtp_golden.safetensors` 对齐 `dspark` 草拟、验证与回滚，接入 `weights kld` 与 Prometheus `/metrics` | 投机 greedy 序列与 AR 逐 token 一致，可采集 KLD 与服务指标 |
+| **Phase 4：5080 SOL 深度优化** | 用 `forge` 评测 FlashAttention/FlashDecoding、EXL3 `sm_120a` 融合、`weights repack`、FP8 KV 与 PDL，优化 C1 和 C2 | 按固定负载记录延迟、SOL、C2 吞吐及 canary / KLD 回归结果 |

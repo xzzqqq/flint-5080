@@ -35,6 +35,7 @@ def build_parser():
     golden.add_argument("--steps", type=int, help="Override the number of cached decode steps.")
     golden.add_argument("--skip-ops", action="store_true")
     golden.add_argument("--skip-e2e", action="store_true")
+    golden.add_argument("--skip-mtp", action="store_true")
     chat = subs.add_parser("chat-golden", help="Generate offline HF chat and tokenizer references.")
     chat.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help=json_help)
     chat.add_argument("--local", action="store_true", help="Run on this host.")
