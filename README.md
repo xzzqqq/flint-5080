@@ -2,7 +2,7 @@
 
 A focused local LLM inference engine for serving **Inkling 2 mini** (with `dspark` speculative decoding) on a single **RTX 5080 16 GB** (`sm_120a`), built from scratch for low-latency personal chat and coding agents.
 
-> **Status:** Feature-complete baseline (`AR + DSpark + VRAM Prefix Cache + forge + bench + weights kld + /metrics`) verified on RTX 5080; entering continuous RTX 5080 SOL optimization (targeting `≥75%` AR SOL, 128K context, and speculative throughput beyond the AR ceiling).
+> **Status:** Feature-complete baseline (`AR + DSpark + VRAM Prefix Cache + forge + bench + weights kld + /metrics`) verified on RTX 5080; entering continuous RTX 5080 SOL optimization (targeting `≥70%` DSpark round SOL and 128K context).
 
 ---
 
@@ -10,13 +10,13 @@ A focused local LLM inference engine for serving **Inkling 2 mini** (with `dspar
 
 Frozen on `Maxrio/Inkling-2-Mini-exl3` (`3.3bpw`, greedy C1, `remote_loopback`; see [2026-11-26-phase3-dspark-baseline.md](docs/findings/2026-11-26-phase3-dspark-baseline.md)):
 
-| Metric | AR (`--no-spec`) | DSpark (default) | Target |
+| Metric | DSpark (default) | AR (`--no-spec`, ref) | Target |
 |---|---:|---:|---|
-| `short_chat` (63 tok) | 23.75 tok/s (8.48% SOL) | 36.81 tok/s (1.55× AR) | `≥75%` AR SOL + DSpark net speedup |
-| `short_debug` (273 tok) | 21.79 tok/s (7.87% SOL) | 32.04 tok/s (1.47× AR) | `≥75%` AR SOL + DSpark net speedup |
-| `short_review` (1,091 tok) | 16.99 tok/s (6.39% SOL) | 27.95 tok/s (1.64× AR) | `≥75%` AR SOL + DSpark net speedup |
-| Auto-sized context (BF16 KV, 3 prefix slots) | 67,176 tok | 40,355 tok | 128K (`131,072` tok) with DSpark |
-| Correctness (`canary` / `weights kld`) | 6/6 / 0.0 KL (288 pos) | 6/6 / 288/288 AR parity | 100% canary + KLD gated |
+| `short_chat` (63 tok) | 36.81 tok/s (114.1 ms/rnd, 4.20 tok/rnd) | 23.75 tok/s | `≥70%` DSpark round SOL |
+| `short_debug` (273 tok) | 32.04 tok/s (131.1 ms/rnd, 4.20 tok/rnd) | 21.79 tok/s | `≥70%` DSpark round SOL |
+| `short_review` (1,091 tok) | 27.95 tok/s (187.5 ms/rnd, 5.25 tok/rnd) | 16.99 tok/s | `≥70%` DSpark round SOL |
+| Auto-sized context (BF16 KV, 3 prefix slots) | 40,355 tok | 67,176 tok | 128K (`131,072` tok) with DSpark |
+| Correctness (`canary` / `weights kld`) | 6/6 / 288/288 AR parity | 6/6 / 0.0 KL (288 pos) | 100% canary + KLD gated |
 
 ---
 

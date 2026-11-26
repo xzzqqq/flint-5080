@@ -86,20 +86,21 @@ unmatched conditions is diagnostic.
 
 - Require every canary to pass. A failed assertion or request yields a nonzero
   run exit code and a case-level diagnostic.
-- Record AR C1 decode SOL as `100 × model AR floor_ms / server_tpot_ms` at
-  matched context length (short-context floor 3.550 ms at 960 GB/s; see
-  `docs/model.md`). Report speculative decoding in `server_decode_tok_s` as
-  well as `ms/round`, `tokens/round`, and `spec_accepted`. Speculative
-  throughput relative to the AR ceiling is an AR-equivalent rate, not raw
-  measured bandwidth.
-- Optimization and regression thresholds: target at least 75% of
-  context-matched logical bandwidth SOL for AR C1 decode while improving net
-  speculative `server_decode_tok_s`. Use a 5% regression review threshold on
-  `short` and `agent` decode latency/throughput against the active frozen
-  baseline (clean-restart repeatability over `remote_loopback` is verified
-  below 0.1%). Inspect individual cases and repeat matched runs when a
-  regression crosses the threshold and the interval overlaps it. Confirm
-  sustained changes before promotion.
+- Report speculative decoding in `server_decode_tok_s`, `ms/round`
+  (`server_tpot_ms`), `tokens/round`, `spec_accepted`, and context-matched
+  DSpark round SOL (`100 × dspark_round_floor_ms / server_tpot_ms`, accounting
+  for draft + verify unique-expert weight and KV traffic at 960 GB/s; see
+  `docs/model.md`). AR (`--no-spec`) context-matched SOL (`3.550 ms`
+  short-context weight floor) may be recorded alongside as a diagnostic
+  reference.
+- Optimization and regression thresholds: target at least **70% of
+  context-matched DSpark round SOL** to maximize end-to-end
+  `server_decode_tok_s`. Use a 5% regression review threshold on `short` and
+  `agent` decode latency/throughput against the active frozen baseline
+  (clean-restart repeatability over `remote_loopback` is verified below 0.1%).
+  Inspect individual cases and repeat matched runs when a regression crosses
+  the threshold and the interval overlaps it. Confirm sustained changes before
+  promotion.
 - Whenever an optimization alters arithmetic order, precision (such as KV
   compression), or algorithms, verify numerical accuracy via `./bin/weights kld`
   (teacher-forced KLD and top-1 agreement) alongside `canary` and
