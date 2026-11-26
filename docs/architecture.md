@@ -57,7 +57,7 @@
 
 | 能力 | 归属层 | 设计要点 |
 |---|---|---|
-| **OpenAI Chat Completions** | `server/` | SSE 流式与非流式；客户端断连即触发引擎取消；支持请求超时。 |
+| **OpenAI Chat Completions** | `server/` | `http.rs` 封装 JSON/SSE；`generation.rs` 共用模板、增量解码、stop 字符串过滤与终止遥测。断连或超时由流内 guard 取消引擎请求。 |
 | **Reasoning & Tool-Call 解析** | `server/` | 独立、可插拔的流式状态机模块，不与 HTTP handler 耦合。 |
 | **Tokenizer & Chat Template** | `server/` | `tokenizers` + `minijinja`，由离线 Python 脚本生成的 HF golden fixtures 在 `dev check --local` 中强制锁死 100% 一致。 |
 | **极简服务基础** | `server/` | `/health`、`/ready`、`/v1/models`、可选 `--api-key`、结构化 `tracing` 日志、`clap` + 单配置文件。 |
@@ -194,7 +194,7 @@ char* engine_stats_json(EngineHandle* h); // 返回 JSON 快照供 /ready 与 P1
 
 | 命令 | 依赖边界 | 职责 |
 |---|---|---|
-| **`dev`** | 纯 stdlib | 工程骨架与服务运维：`status`（5080 占用/温度/显存/同步状态）、`build`（`--engine`/`--server`/`--all`）、`serve`（`start`/`stop`/`logs`）、`check`（`--local` 本地检查；`--gpu` 持锁运行 CTest、真实权重的算子和端到端 golden 检查，以及 forge-host 和 server 的 smoke 检查）、`ssh`（逃生舱）。 |
+| **`dev`** | 纯 stdlib | 工程骨架与服务运维：`status`（5080 占用/温度/显存/同步状态）、`build`（`--engine`/`--server`/`--all`）、`serve`（`start`/`stop`/`status`/`logs`，执行机通过 `/ready` 确认启动并在 `.serve/` 维护进程状态和日志）、`check`（`--local` 本地检查；`--gpu` 持锁运行 CTest、真实权重的算子和端到端 golden 检查，以及 forge-host 和 server 的 smoke 检查）、`ssh`（逃生舱）。 |
 | **`forge`** | 纯 stdlib | 驱动远端/本机 `forge-host` 的全部调优原语（`start/stop/status/run/ab/profile/dump/ls/rm`）。 |
 | **`bench`** | 轻量异步 HTTP & 统计 | 纯黑盒 HTTP 压测器（支持 `--url` 测自研或任意 OpenAI 兼容竞品）：固定 coding-agent trace、TTFT、Canary 回归、paired geometric mean + bootstrap CI 报表。以服务端计时为主、客户端校准为辅。 |
 | **`weights`** | 纯 stdlib 前端；离线生成子进程通过 `weights.python` 指向独立 PyTorch 环境 | 低频离线权重与参考对齐：`inspect`、`repack`（输出 `safetensors`）、`golden`（持单卡 lease 生成算子与 48 逻辑步 prefill/decode 黄金夹具，详见 [model.md](model.md)）、`kld`（调用常驻引擎做 teacher-forcing KLD 评测）。 |

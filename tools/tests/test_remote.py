@@ -26,7 +26,7 @@ def test_transport(cfg):
     assert "--dry-run" not in build_rsync_args(cfg)
     excludes = {v for k, v in zip(args, args[1:], strict=False) if k == "--exclude"}
     required = """.git/ .dev.toml .env .env.* build/ engine/build*/ server/target/ target/
-        .forge/ .runs/ .scratch/ models/ *.safetensors *.gguf *.nsys-rep* *.ncu-rep *.qdrep
+        .forge/ .serve/ .runs/ .scratch/ models/ *.safetensors *.gguf *.nsys-rep* *.ncu-rep *.qdrep
         __pycache__/ *.pyc .pytest_cache/ .ruff_cache/ .venv/ .claude/ .codex/ .qwen/ .DS_Store
         *.log *.log.err workloads/private/""".split()
     assert set(required) <= excludes == set(RSYNC_EXCLUDES)

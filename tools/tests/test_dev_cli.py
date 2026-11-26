@@ -302,13 +302,6 @@ def test_gpu_missing_golden_prerequisite(cfg, entry, capsys, missing):
         assert "Run weights golden" in error
 
 
-@pytest.mark.parametrize("action", ["start", "stop", "status", "logs"])
-def test_serve(entry, capsys, action):
-    assert entry(["serve", action, "--json"]) == 0
-    data = json.loads(capsys.readouterr().out)["data"]
-    assert data["action"] == action and "Phase 2" in data["message"]
-
-
 def test_ssh_argv(entry, capsys):
     assert entry(["--json", "ssh", "printf", "%s", "arg with spaces"]) == 0
     assert json.loads(capsys.readouterr().out)["data"]["stdout"] == "arg with spaces"

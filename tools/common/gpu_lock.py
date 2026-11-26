@@ -92,6 +92,14 @@ class GpuLeaseManager:
     def hold(self, mode: str, ttl_sec: int | None = None, force: bool = False):
         ttl = self.cfg.gpu.lease_ttl_sec if ttl_sec is None else ttl_sec
         record = self.acquire(mode, ttl, force, pid=0 if self.cfg.is_remote else os.getpid())
+        try:
+            with self.heartbeat(record, ttl):
+                yield record
+        finally:
+            self.release(record.token)
+
+    @contextmanager
+    def heartbeat(self, record: LeaseRecord, ttl: int):
         done = threading.Event()
         errors = []
 
@@ -111,6 +119,5 @@ class GpuLeaseManager:
             done.set()
             if worker.ident is not None:
                 worker.join()
-            self.release(record.token)
         if errors:
             raise GpuLockError(f"GPU lease heartbeat failed: {errors[0]}")

@@ -13,18 +13,14 @@ use std::{
 };
 
 #[derive(Parser)]
-#[command(version, about = "Flint-5080 server checks")]
+#[command(version, about = "Flint-5080 inference server")]
 struct Cli {
-    #[arg(
-        long,
-        required_unless_present = "check_chat_golden",
-        conflicts_with = "check_chat_golden"
-    )]
+    #[arg(long, conflicts_with = "check_chat_golden")]
     smoke: bool,
     #[arg(long, requires_all = ["model_dir", "golden"])]
     check_chat_golden: bool,
-    #[arg(long, requires = "check_chat_golden")]
-    model_dir: Option<PathBuf>,
+    #[command(flatten)]
+    options: server::config::Options,
     #[arg(long, requires = "check_chat_golden")]
     golden: Option<PathBuf>,
     #[arg(long, requires = "check_chat_golden")]
@@ -68,7 +64,7 @@ fn smoke(config: &str) -> Result<(), TokenizerError> {
     };
     let mut tokens = Vec::new();
     for chunk in chunks {
-        let Event::Tokens(ids) = chunk else {
+        let Event::Tokens(ids, _) = chunk else {
             return Err("premature done".into());
         };
         tokens.extend_from_slice(ids);
@@ -231,24 +227,57 @@ fn check_chat_golden(
     Ok(())
 }
 
+#[tokio::main]
+async fn serve(options: server::config::Options) -> Result<(), TokenizerError> {
+    use server::http::{AppState, build_router};
+    use std::sync::Arc;
+    let config = options.resolve(std::env::var("FLINT_API_KEY").ok())?;
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::try_new(&config.log_level)?)
+        .init();
+    // Reserve the address before loading weights so a readiness probe cannot
+    // mistake an existing listener for a second server still loading.
+    let listener = tokio::net::TcpListener::bind(&config.bind).await?;
+    let template = Arc::new(ChatTemplate::from_model_dir(&config.model_dir)?);
+    let tokenizer = Arc::new(Tokenizer::from_model_dir(&config.model_dir)?);
+    let engine = Arc::new(Engine::new(&config.engine_json())?);
+    let router = build_router(Arc::new(AppState {
+        config,
+        template,
+        tokenizer,
+        engine,
+    }));
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async move {
+            tokio::select! { _ = tokio::signal::ctrl_c() => (), _ = term.recv() => () }
+        })
+        .await?;
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = if cli.check_chat_golden {
         check_chat_golden(
-            cli.model_dir.as_deref().unwrap(),
+            cli.options.model_dir.as_deref().unwrap(),
             cli.golden.as_deref().unwrap(),
             cli.golden_cases.as_deref(),
         )
-    } else {
+    } else if cli.smoke {
         smoke(&cli.config_json)
+    } else {
+        serve(cli.options)
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             let mode = if cli.smoke {
                 "smoke"
-            } else {
+            } else if cli.check_chat_golden {
                 "check-chat-golden"
+            } else {
+                "serve"
             };
             eprintln!("server {mode}: {e}");
             ExitCode::FAILURE
@@ -261,8 +290,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cli_requires_smoke_and_accepts_config_and_version() {
-        assert!(Cli::try_parse_from(["server"]).is_err());
+    fn cli_accepts_serve_smoke_config_and_version() {
+        assert!(Cli::try_parse_from(["server"]).is_ok());
         let cli = Cli::try_parse_from(["server", "--smoke"]).unwrap();
         assert!(cli.smoke);
         assert_eq!(cli.config_json, "{}");

@@ -46,8 +46,24 @@ def build_parser() -> argparse.ArgumentParser:
     modes.add_argument("--gpu", action="store_true")
     ssh = sub("ssh", "Open a workspace shell or execute a command there.")
     ssh.add_argument("cmd", nargs=argparse.REMAINDER, help="Command and its arguments")
-    serve = sub("serve", "Report availability of the Phase 2 server runtime.")
-    serve.add_argument("action", choices=("start", "stop", "status", "logs"))
+    serve = sub("serve", "Manage the inference server on the execution host.")
+    actions = serve.add_subparsers(dest="action", required=True)
+    start = actions.add_parser("start", help="Launch the server and wait for readiness.")
+    stop = actions.add_parser("stop", help="Stop the server and release its GPU lease.")
+    status = actions.add_parser("status", help="Show the GPU lease and live readiness.")
+    logs = actions.add_parser("logs", help="Read recent server log lines.")
+    for action in (start, stop, status, logs):
+        action.add_argument(
+            "--json", action="store_true", default=argparse.SUPPRESS, help=json_help
+        )
+    for flag in ("bind", "model-dir", "model-name", "api-key", "binary"):
+        start.add_argument("--" + flag)
+    for flag in ("max-context", "prefill-chunk-size", "prefix-cache-slots", "request-timeout-sec"):
+        start.add_argument("--" + flag, type=int)
+    start.add_argument("--no-cuda-graph", action="store_true")
+    start.add_argument("--build", action="store_true", help="Rebuild the engine and server first.")
+    stop.add_argument("--force", action="store_true")
+    logs.add_argument("--lines", type=int, default=100)
     return parser
 
 

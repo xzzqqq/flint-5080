@@ -18,6 +18,7 @@ compile_commands.json
 
 # Forge, run records & temporary scratch
 .forge/
+.serve/
 .runs/
 .scratch/
 *.log

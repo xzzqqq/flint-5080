@@ -1,5 +1,6 @@
 use serde::Serialize;
 use std::fmt;
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 pub const FLINT_ENGINE_ABI_VERSION: u32 = 1;
 
@@ -80,7 +81,7 @@ pub struct Request<'a> {
 
 #[derive(Debug)]
 pub enum Event {
-    Tokens(Vec<i32>),
+    Tokens(Vec<i32>, Telemetry),
     Done(Telemetry),
 }
 
@@ -88,6 +89,7 @@ pub enum Event {
 pub struct EngineError {
     pub status: EngineStatus,
     pub message: String,
+    pub telemetry: Telemetry,
 }
 
 impl EngineError {
@@ -95,6 +97,7 @@ impl EngineError {
         Self {
             status,
             message: message.into(),
+            telemetry: Telemetry::default(),
         }
     }
 }
@@ -108,6 +111,26 @@ impl fmt::Display for EngineError {
 impl std::error::Error for EngineError {}
 
 pub use backend::Engine;
+pub type EventReceiver = UnboundedReceiver<Result<Event, EngineError>>;
+
+impl Engine {
+    pub fn submit(&self, req: &Request<'_>) -> Result<(u64, Vec<Event>), EngineError> {
+        let (id, mut rx) = self.submit_stream(req)?;
+        let mut events = Vec::new();
+        while let Some(message) = rx.blocking_recv() {
+            let event = message?;
+            let done = matches!(event, Event::Done(_));
+            events.push(event);
+            if done {
+                return Ok((id, events));
+            }
+        }
+        Err(EngineError::new(
+            EngineStatus::Internal,
+            "missing terminal event",
+        ))
+    }
+}
 
 fn validate_config(config: &str) -> Result<(), EngineError> {
     if config.is_empty() || config.as_bytes().contains(&0) {
@@ -122,55 +145,75 @@ fn validate_config(config: &str) -> Result<(), EngineError> {
 #[cfg(not(feature = "link-engine"))]
 mod backend {
     use super::*;
-    use std::cell::Cell;
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    };
+
+    type Handler = dyn Fn(&Request<'_>, UnboundedSender<Result<Event, EngineError>>) + Send + Sync;
 
     pub struct Engine {
-        submitted: Cell<u64>,
-        cancellations: Cell<u64>,
+        submitted: AtomicU64,
+        cancellations: Mutex<Vec<u64>>,
+        handler: Box<Handler>,
     }
     impl Engine {
         pub fn new(config: &str) -> Result<Self, EngineError> {
             validate_config(config)?;
-            Ok(Self {
-                submitted: Cell::new(0),
-                cancellations: Cell::new(0),
-            })
+            Ok(Self::with_stub(|req, tx| {
+                let emit = req.max_tokens > 0 && !req.stop_token_ids.contains(&42);
+                let t = Telemetry {
+                    prefill_tokens: req.token_ids.len() as u32,
+                    decode_tokens: emit.into(),
+                    decode_rounds: emit.into(),
+                    ..Default::default()
+                };
+                if emit {
+                    let _ = tx.send(Ok(Event::Tokens(vec![42], t)));
+                }
+                let _ = tx.send(Ok(Event::Done(t)));
+            }))
+        }
+        pub fn with_stub(
+            handler: impl Fn(&Request<'_>, UnboundedSender<Result<Event, EngineError>>)
+            + Send
+            + Sync
+            + 'static,
+        ) -> Self {
+            Self {
+                submitted: AtomicU64::new(0),
+                cancellations: Mutex::default(),
+                handler: Box::new(handler),
+            }
+        }
+        pub fn cancelled_ids(&self) -> Vec<u64> {
+            self.cancellations.lock().unwrap().clone()
         }
         pub fn stats_json(&self) -> Result<String, EngineError> {
+            let submitted = self.submitted.load(Ordering::Relaxed);
             Ok(serde_json::json!({
-                "backend": "stub", "mode": "smoke", "completed_requests": self.submitted.get(),
+                "backend": "stub", "mode": "smoke", "completed_requests": submitted,
                 "active_requests": 0, "queued_requests": 0, "abi_version": FLINT_ENGINE_ABI_VERSION,
                 "gpu_name": null, "sm_major": 0, "sm_minor": 0,
                 "vram_total_bytes": 0, "vram_free_bytes": 0,
-                "submitted_requests": self.submitted.get(), "cancelled_requests": self.cancellations.get()
+                "submitted_requests": submitted, "cancelled_requests": self.cancellations.lock().unwrap().len()
             }).to_string())
         }
-        pub fn submit(&self, req: &Request<'_>) -> Result<(u64, Vec<Event>), EngineError> {
-            let id = self.submitted.get() + 1;
-            self.submitted.set(id);
+        pub fn submit_stream(
+            &self,
+            req: &Request<'_>,
+        ) -> Result<(u64, EventReceiver), EngineError> {
             if req.token_ids.is_empty() {
                 return Err(EngineError::new(EngineStatus::InvalidInput, "empty prompt"));
             }
-            let prefill_tokens =
-                req.token_ids.len().try_into().map_err(|_| {
-                    EngineError::new(EngineStatus::ContextOverflow, "prompt too long")
-                })?;
-            let emit = req.max_tokens > 0 && !req.stop_token_ids.contains(&42);
-            let mut events = Vec::new();
-            if emit {
-                events.push(Event::Tokens(vec![42]));
-            }
-            events.push(Event::Done(Telemetry {
-                prefill_tokens,
-                decode_tokens: emit.into(),
-                decode_rounds: emit.into(),
-                ..Default::default()
-            }));
-            Ok((id, events))
+            let id = self.submitted.fetch_add(1, Ordering::Relaxed) + 1;
+            let (tx, rx) = mpsc::unbounded_channel();
+            (self.handler)(req, tx);
+            Ok((id, rx))
         }
         pub fn cancel(&self, id: u64) {
-            if id > 0 && id <= self.submitted.get() {
-                self.cancellations.set(self.cancellations.get() + 1);
+            if id > 0 && id <= self.submitted.load(Ordering::Relaxed) {
+                self.cancellations.lock().unwrap().push(id);
             }
         }
     }
@@ -184,7 +227,6 @@ mod backend {
         panic::{AssertUnwindSafe, catch_unwind},
         ptr::{self, NonNull},
         slice,
-        sync::mpsc,
     };
 
     #[repr(C)]
@@ -224,7 +266,7 @@ mod backend {
         Some(s)
     }
 
-    type CallbackState = mpsc::Sender<Result<Event, EngineError>>;
+    type CallbackState = UnboundedSender<Result<Event, EngineError>>;
 
     unsafe extern "C" fn collect(event: *const EngineEvent, data: *mut c_void) {
         let event = unsafe { &*event };
@@ -237,7 +279,7 @@ mod backend {
         let message = catch_unwind(AssertUnwindSafe(|| match event.kind {
             EngineEventKind::Tokens => {
                 let ids = unsafe { slice::from_raw_parts(event.token_ids, event.n_tokens) };
-                Ok(Event::Tokens(ids.to_vec()))
+                Ok(Event::Tokens(ids.to_vec(), event.telemetry))
             }
             EngineEventKind::Done => Ok(Event::Done(event.telemetry)),
             EngineEventKind::Error => {
@@ -246,7 +288,11 @@ mod backend {
                 } else {
                     unsafe { CStr::from_ptr(event.error_message) }.to_string_lossy()
                 };
-                Err(EngineError::new(event.status, &msg))
+                Err(EngineError {
+                    status: event.status,
+                    message: msg.into_owned(),
+                    telemetry: event.telemetry,
+                })
             }
         }))
         .unwrap_or_else(|_| {
@@ -278,6 +324,7 @@ mod backend {
                 let h = engine_create(config.as_ptr(), &mut err);
                 NonNull::new(h).map(Self).ok_or_else(|| EngineError {
                     status: EngineStatus::Internal,
+                    telemetry: Telemetry::default(),
                     message: take_string(err).unwrap_or_else(|| "engine creation failed".into()),
                 })
             }
@@ -286,7 +333,10 @@ mod backend {
             unsafe { take_string(engine_stats_json(self.0.as_ptr())) }
                 .ok_or_else(|| EngineError::new(EngineStatus::Internal, "engine stats unavailable"))
         }
-        pub fn submit(&self, req: &Request<'_>) -> Result<(u64, Vec<Event>), EngineError> {
+        pub fn submit_stream(
+            &self,
+            req: &Request<'_>,
+        ) -> Result<(u64, EventReceiver), EngineError> {
             let params = RequestParams {
                 max_tokens: req.max_tokens,
                 temperature: req.temperature,
@@ -297,7 +347,7 @@ mod backend {
                 n_stop_token_ids: req.stop_token_ids.len(),
                 ignore_eos: req.ignore_eos.into(),
             };
-            let (tx, rx) = mpsc::channel::<Result<Event, EngineError>>();
+            let (tx, rx) = mpsc::unbounded_channel::<Result<Event, EngineError>>();
             let state = Box::into_raw(Box::new(tx));
             let id = unsafe {
                 engine_submit(
@@ -318,19 +368,7 @@ mod backend {
                     "engine submission failed",
                 ));
             }
-            let mut events = Vec::new();
-            for message in rx {
-                let event = message?;
-                let done = matches!(event, Event::Done(_));
-                events.push(event);
-                if done {
-                    return Ok((id, events));
-                }
-            }
-            Err(EngineError::new(
-                EngineStatus::Internal,
-                "missing terminal event",
-            ))
+            Ok((id, rx))
         }
         pub fn cancel(&self, id: u64) {
             unsafe { engine_cancel(self.0.as_ptr(), id) }
@@ -376,7 +414,7 @@ mod tests {
             ..Default::default()
         };
         let (id, events) = engine.submit(&request).unwrap();
-        let [Event::Tokens(ids), Event::Done(t)] = events.as_slice() else {
+        let [Event::Tokens(ids, _), Event::Done(t)] = events.as_slice() else {
             panic!("unexpected events: {events:?}")
         };
         assert_eq!(ids, &[42]);

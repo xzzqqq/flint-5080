@@ -15,21 +15,11 @@ from pathlib import Path
 from uuid import uuid4
 
 from tools.common._lease import GpuLockError, release_local, renew_local
+from tools.common.daemon import alive, atomic_json, identity, wait_for
 
 STATE = Path(".forge")
 INFO = STATE / "daemon.json"
 SOCKET = STATE / "host.sock"
-
-
-def atomic_json(path, value):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as tmp:
-        try:
-            json.dump(value, tmp)
-            tmp.flush()
-            os.replace(tmp.name, path)
-        finally:
-            Path(tmp.name).unlink(missing_ok=True)
 
 
 def ipc(request, timeout=1800):
@@ -42,28 +32,6 @@ def ipc(request, timeout=1800):
     if not data.pop("ok"):
         raise RuntimeError(data["error"])
     return data
-
-
-def identity(pid):
-    try:
-        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
-        return None if fields[0] == "Z" else fields[19]
-    except FileNotFoundError:
-        return None
-
-
-def alive(info, key):
-    return identity(info[key]) == info[key + "_start"] and info[key + "_start"] is not None
-
-
-def wait_for(fn, timeout, label):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        value = fn()
-        if value:
-            return value
-        time.sleep(0.05)
-    raise RuntimeError("Timed out waiting for " + label)
 
 
 def supervise():

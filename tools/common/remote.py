@@ -42,6 +42,7 @@ RSYNC_EXCLUDES = (
     "server/target/",
     "target/",
     ".forge/",
+    ".serve/",
     ".runs/",
     ".scratch/",
     "models/",
@@ -101,11 +102,20 @@ def build_rsync_args(cfg: DevConfig, *, dry_run: bool = False) -> list[str]:
 
 
 def _capture(
-    cmd: list[str], *, stream: bool, timeout: int | None, echo_stdout: bool = True
+    cmd: list[str],
+    *,
+    stream: bool,
+    timeout: int | None,
+    echo_stdout: bool = True,
+    input_text: str | None = None,
 ) -> CommandResult:
     start = time.monotonic()
     with subprocess.Popen(
-        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True
+        cmd,
+        stdin=subprocess.PIPE if input_text is not None else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
     ) as proc:
         try:
             if stream:
@@ -132,7 +142,9 @@ def _capture(
                 remaining = None if timeout is None else max(0, start + timeout - time.monotonic())
                 proc.wait(timeout=remaining)
             else:
-                out, err = proc.communicate(timeout=timeout)
+                out, err = proc.communicate(
+                    input=input_text.encode() if input_text is not None else None, timeout=timeout
+                )
                 stdout, stderr = out.decode(errors="replace"), err.decode(errors="replace")
         except BaseException:
             try:
@@ -187,12 +199,16 @@ class Executor:
         stream_stderr: bool = False,
         timeout: int | None = None,
         echo_stdout: bool = True,
+        input_text: str | None = None,
     ) -> CommandResult:
+        if stream_stderr and input_text is not None:
+            raise ValueError("input_text requires buffered capture")
         result = _capture(
             self._args(shell_cmd, cwd),
             stream=stream_stderr,
             timeout=timeout,
             echo_stdout=echo_stdout,
+            input_text=input_text,
         )
         if check and result.returncode:
             raise RuntimeError(

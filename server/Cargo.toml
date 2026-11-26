@@ -14,3 +14,18 @@ serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 minijinja = { version = "2", features = ["builtins", "macros", "json", "loader", "preserve_order"] }
 regex = "1"
+axum = "0.8"
+async-stream = "0.3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync", "time", "net"] }
+futures-core = "0.3"
+tokio-stream = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+toml = "0.8"
+thiserror = "2"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tokio = { version = "1", features = ["io-util", "test-util"] }
+tempfile = "3"

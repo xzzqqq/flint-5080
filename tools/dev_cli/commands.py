@@ -1,10 +1,12 @@
 """Implementation of the dev subcommands."""
 
+import argparse
 import json
 import os
 import shlex
 import shutil
 import subprocess
+import sys
 from dataclasses import asdict, replace
 from pathlib import Path, PurePosixPath
 
@@ -402,9 +404,71 @@ def check(cfg, args, result):
 
 
 def serve(cfg, args, result):
-    result.data.update(
-        action=args.action, status="unavailable", message="The server runtime arrives in Phase 2."
-    )
+    executor = Executor(cfg)
+    lease = GpuLeaseManager(cfg, executor)
+    data = result.data
+    data["action"] = args.action
+
+    def call(payload):
+        python = "python3" if cfg.is_remote else sys.executable
+        command = shlex.join([python, "-m", "tools.dev_cli._serve_host", args.action])
+        reply = executor.run(command, input_text=json.dumps(payload), check=True)
+        data.update(json.loads(reply.stdout))
+
+    if args.action == "start":
+        model_dir = args.model_dir
+        if model_dir is None:
+            if not cfg.model.weights_dir:
+                raise ValueError("Set model.weights_dir or pass --model-dir")
+            model_dir = str(PurePosixPath(cfg.shared.models_dir) / cfg.model.weights_dir)
+        bind = args.bind or cfg.server.bind
+        argv = ["--bind", bind, "--model-dir", model_dir]
+        for key in (
+            "model_name",
+            "max_context",
+            "prefill_chunk_size",
+            "prefix_cache_slots",
+            "request_timeout_sec",
+        ):
+            value = getattr(args, key)
+            if value is not None:
+                argv.extend(["--" + key.replace("_", "-"), str(value)])
+        if args.no_cuda_graph:
+            argv.append("--no-cuda-graph")
+        record = lease.acquire("serve")
+        try:
+            with lease.heartbeat(record, cfg.gpu.lease_ttl_sec):
+                if args.build:
+                    build(cfg, argparse.Namespace(no_sync=False, clean=False, target="all"), result)
+                else:
+                    executor.sync()
+            if not result.ok:
+                lease.release_unbound(record.token)
+                return
+            call(
+                dict(
+                    argv=argv,
+                    bind=bind,
+                    binary=args.binary,
+                    api_key=args.api_key,
+                    token=record.token,
+                    lock=cfg.shared.lock_file,
+                    ttl=cfg.gpu.lease_ttl_sec,
+                )
+            )
+        except BaseException:
+            lease.release_unbound(record.token)
+            raise
+    elif args.action == "status":
+        snapshot = asdict(lease.inspect())
+        if snapshot["record"]:
+            del snapshot["record"]["token"]
+        data["lease"] = snapshot
+        call({})
+    elif args.action == "logs":
+        call({"lines": args.lines})
+    else:
+        call({"force": args.force})
 
 
 def _status_lines(data):
@@ -455,6 +519,21 @@ def human_format(result: RunResult) -> str:
     data = result.data
     if result.command == "dev status" and "lease" in data:
         lines.extend(_status_lines(data))
+    elif result.command == "dev serve":
+        if "running" in data:
+            lines.append(
+                f"server: {data['bind']} (PID {data['pid']})"
+                if data["running"]
+                else "server: stopped"
+            )
+            if data.get("ready") is not None:
+                lines.append("ready: " + json.dumps(data["ready"]))
+        if "lease" in data:
+            lease = data["lease"]
+            lines.append("GPU lease: " + (lease["record"]["mode"] if lease["locked"] else "free"))
+        if "stopped" in data:
+            lines.append("server stopped" if data["stopped"] else "server already stopped")
+        lines.extend(data.get("lines", []))
     elif "checks" in data:
         for name, step in data["checks"].items():
             detail = step.get("reason") or step.get("error") or ", ".join(step.get("errors", []))
