@@ -47,6 +47,13 @@ class Replay {
   static void FormatStages(const ForwardRunResult&, Object&);
   void Dump(const Json&, const Measurement&, const Recording&, const std::vector<float>&, Object&);
 
+  struct SpecRound {
+    std::vector<int> block, verified, emitted;
+    double draft_ms, verify_ms, elapsed_ms;
+  };
+  SpecRound RunSpecRound(ForwardModule&, int anchor, const uint16_t* last, unsigned position,
+                         bool profile);
+  Object MeasureSpeculative(const Json&, const std::string&, const Measurement&);
   Object Measure(const Json& request, const std::string& command);
   [[nodiscard]] std::optional<ForwardModule> Load(const std::filesystem::path& path);
   Recording Record(const std::vector<int>& ids, unsigned begin, unsigned end, unsigned step);
@@ -70,6 +77,7 @@ class Replay {
   int *ids_{}, *next_{};
   uint16_t *hidden_{}, *out_{};
   float* logits_{};
+  uint16_t* taps_{};
   std::map<std::string, Recording> cache_;
 };
 }  // namespace flint

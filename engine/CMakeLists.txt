@@ -48,7 +48,7 @@ target_link_libraries(engine_loader PUBLIC CUDA::cudart)
 
 add_library(engine_ops OBJECT
     src/ops/exl3_linear.cu src/ops/norm_embed.cu src/ops/sconv.cu
-    src/ops/attention.cu src/ops/moe.cu src/ops/loop_res.cu
+    src/ops/dspark.cu src/ops/attention.cu src/ops/moe.cu src/ops/loop_res.cu
     src/ops/gemm_cublas.cpp)
 set_target_properties(engine_ops PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(engine_ops PUBLIC src)
@@ -56,7 +56,7 @@ target_link_libraries(engine_ops PUBLIC CUDA::cudart CUDA::cublas)
 target_compile_options(engine_ops PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:-rdc=false>")
 flint_configure_cuda_target(engine_ops)
 
-add_library(engine_model OBJECT src/model/inkling2_forward.cpp src/model/submodules.cpp)
+add_library(engine_model OBJECT src/model/dspark_forward.cpp src/model/inkling2_forward.cpp src/model/submodules.cpp)
 set_target_properties(engine_model PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(engine_model PUBLIC engine_ops CUDA::cudart CUDA::cublas)
 
@@ -90,7 +90,7 @@ target_link_libraries(forge_smoke PRIVATE engine_loader CUDA::cudart ${CMAKE_DL_
 
 add_library(forge_replay STATIC
     src/forge/forward_module.cpp src/forge/replay_metrics.cpp
-    src/forge/replay.cpp src/forge/safetensors_writer.cpp)
+    src/forge/replay.cpp src/runtime/sampler.cpp src/forge/safetensors_writer.cpp)
 target_link_libraries(forge_replay PUBLIC engine_loader PRIVATE ${CMAKE_DL_LIBS})
 add_executable(forge-host src/forge/forge_host.cpp src/forge/forge_daemon.cpp)
 target_link_libraries(forge-host PRIVATE forge_smoke forge_replay)
@@ -132,3 +132,8 @@ add_executable(runtime_tests tests/test_runtime_gpu.cpp)
 target_include_directories(runtime_tests PRIVATE src)
 target_link_libraries(runtime_tests PRIVATE engine CUDA::cudart)
 add_test(NAME runtime_tests COMMAND runtime_tests)
+
+add_executable(mtp_tests tests/test_mtp_golden.cpp)
+target_include_directories(mtp_tests PRIVATE src)
+target_link_libraries(mtp_tests PRIVATE engine CUDA::cudart CUDA::cublas)
+add_test(NAME mtp_tests COMMAND mtp_tests)

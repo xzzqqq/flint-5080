@@ -201,6 +201,40 @@ ModelConfig LoadModelConfig(const std::filesystem::path& path) {
   }
   for (unsigned i = 0; i < c.num_hidden_layers; ++i)
     Check(c.is_full_layer[i] == defaults.is_full_layer[i], "unsupported local layer schedule");
+  if (root.as<Json::Object>().contains("mtp_config")) {
+    const auto& m = root.at("mtp_config");
+    auto& d = c.mtp;
+    d.hidden_size = Expected(m, "hidden_size", model::kMtpConfig.hidden_size);
+    d.num_hidden_layers = Expected(m, "num_hidden_layers", model::kMtpConfig.num_hidden_layers);
+    d.num_attention_heads =
+        Expected(m, "num_attention_heads", model::kMtpConfig.num_attention_heads);
+    d.num_key_value_heads =
+        Expected(m, "num_key_value_heads", model::kMtpConfig.num_key_value_heads);
+    d.head_dim = Expected(m, "head_dim", model::kMtpConfig.head_dim);
+    d.intermediate_size = Expected(m, "intermediate_size", model::kMtpConfig.intermediate_size);
+    d.max_position_embeddings =
+        Expected(m, "max_position_embeddings", model::kMtpConfig.max_position_embeddings);
+    d.sliding_window_size =
+        Expected(m, "sliding_window_size", model::kMtpConfig.sliding_window_size);
+    d.block_size = Expected(m, "block_size", model::kMtpConfig.block_size);
+    d.markov_rank = Expected(m, "markov_rank", model::kMtpConfig.markov_rank);
+    d.rms_norm_eps = Expected(m, "rms_norm_eps", model::kMtpConfig.rms_norm_eps);
+    d.rope_theta = Expected(m, "rope_theta", model::kMtpConfig.rope_theta);
+    for (auto& id : m.at("local_layer_ids").as<Json::Array>()) {
+      auto i = id.number<unsigned>();
+      Check(i < 3 && !d.is_local_layer[i], "invalid draft local layer");
+      d.is_local_layer[i] = 1;
+    }
+    const auto& ids = m.at("target_layer_ids").as<Json::Array>();
+    Check(ids.size() == 4, "invalid draft tap count");
+    for (unsigned i = 0; i < 4; ++i) d.target_layer_ids[i] = ids[i].number<unsigned>();
+    Check(std::equal(std::begin(d.target_layer_ids), std::end(d.target_layer_ids),
+                     model::kMtpConfig.target_layer_ids) &&
+              std::equal(std::begin(d.is_local_layer), std::end(d.is_local_layer),
+                         model::kMtpConfig.is_local_layer),
+          "unsupported draft schedule");
+    c.has_mtp = 1;
+  }
   return c;
 }
 }  // namespace flint

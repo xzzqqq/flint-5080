@@ -7,7 +7,7 @@
 extern "C" {
 #endif
 
-#define FLINT_FORWARD_ABI_VERSION 4u
+#define FLINT_FORWARD_ABI_VERSION 5u
 
 typedef struct ForwardContext ForwardContext;
 
@@ -38,6 +38,13 @@ int32_t flint_forward_run_layers_capture(ForwardContext* context, const ForwardR
 int32_t flint_forward_run_smoke(ForwardContext* context, const ForwardWorkspace* workspace,
                                 const ForwardOptions* options, int32_t n_elems, float bias,
                                 ForwardSmokeOutput* result);
+int32_t flint_forward_store_context(ForwardContext* c, const void* taps, uint32_t count,
+                                    uint32_t pos);
+int32_t flint_forward_draft(ForwardContext* c, int32_t anchor, const void* tap, uint32_t pos,
+                            int32_t* h_ids);
+int32_t flint_forward_verify(ForwardContext* c, const ForwardRunSpec* spec,
+                             const ForwardOptions* opts, ForwardRunResult* result);
+int32_t flint_forward_commit(ForwardContext* c, uint32_t pos, uint32_t len, uint32_t accepted);
 /* Optional graph diagnostics. */
 ForwardGraphStats flint_forward_graph_stats(const ForwardContext* context);
 void flint_forward_destroy(ForwardContext* context);

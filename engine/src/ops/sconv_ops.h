@@ -13,6 +13,12 @@ typedef struct {
   void* y;
   int tokens, channels;
   FlintType input, output;
+  /* Optional [channels, 3 + tokens], oldest first. With a trace the caller commits state. */
+#ifdef __cplusplus
+  float* trace = nullptr;
+#else
+  float* trace;
+#endif
 } ConvParams;
 int flint_static_sconv(ConvParams p, void* cuda_stream);
 int flint_dynamic_sconv(ConvParams p, void* cuda_stream);

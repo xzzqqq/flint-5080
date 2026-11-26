@@ -44,6 +44,10 @@ ForwardModule::ForwardModule(const fs::path& path, const fs::path& load_dir,
     destroy_ = Symbol<decltype(destroy_)>(handle_, "flint_forward_destroy");
     run_ = Symbol<decltype(run_)>(handle_, "flint_forward_run_layers");
     stats_ = reinterpret_cast<decltype(stats_)>(dlsym(handle_, "flint_forward_graph_stats"));
+    store_context_ = Symbol<decltype(store_context_)>(handle_, "flint_forward_store_context");
+    draft_ = Symbol<decltype(draft_)>(handle_, "flint_forward_draft");
+    verify_ = Symbol<decltype(verify_)>(handle_, "flint_forward_verify");
+    commit_ = Symbol<decltype(commit_)>(handle_, "flint_forward_commit");
     auto create = Symbol<decltype(&flint_forward_create)>(handle_, "flint_forward_create");
     context_ = create(weights, &kv, &scratch, stream);
     if (!context_) throw std::runtime_error("forward context creation failed");
@@ -75,6 +79,21 @@ ForwardRunResult ForwardModule::Run(const ForwardRunSpec& spec, const ForwardOpt
   return result;
 }
 
+void ForwardModule::StoreContext(const void* taps, uint32_t n, uint32_t pos) {
+  CheckCuda(store_context_(context_, taps, n, pos), "store draft context");
+}
+void ForwardModule::Draft(int anchor, const void* taps, uint32_t pos, int* ids) {
+  CheckCuda(draft_(context_, anchor, taps, pos, ids), "draft block");
+}
+ForwardRunResult ForwardModule::Verify(const ForwardRunSpec& spec) {
+  ForwardRunResult r{};
+  ForwardOptions o{};
+  CheckCuda(verify_(context_, &spec, &o, &r), "verify block");
+  return r;
+}
+void ForwardModule::Commit(uint32_t pos, uint32_t len, uint32_t accepted) {
+  CheckCuda(commit_(context_, pos, len, accepted), "commit verified prefix");
+}
 void ForwardModule::ReportGraphStats(Object& reply, const char* key) const {
   if (stats_) {
     auto stats = stats_(context_);

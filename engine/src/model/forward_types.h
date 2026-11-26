@@ -47,6 +47,8 @@ typedef struct ForwardRunSpec {
   void* d_block_out;
   float* d_logits_out;
   int32_t* d_next_token;
+  uint8_t all_token_logits;
+  void* d_taps_out; /* BF16 [seq_len,4,hidden_size] */
 } ForwardRunSpec;
 
 typedef struct ForwardRunResult {

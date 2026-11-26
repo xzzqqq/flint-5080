@@ -18,14 +18,22 @@ __device__ void Write(void* y, int i, float v, FlintType type) {
     static_cast<__nv_bfloat16*>(y)[i] = __float2bfloat16_rn(v);
 }
 
+template <bool Trace>
 __global__ void Conv(ConvParams p, bool dynamic) {
   int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= p.channels) return;
   float* history = p.state + 3 * c;
   float a = history[0], b = history[1], d = history[2];
+  float* trace = Trace ? p.trace + c * (3 + p.tokens) : nullptr;
+  if constexpr (Trace) {
+    trace[0] = a;
+    trace[1] = b;
+    trace[2] = d;
+  }
   for (int t = 0; t < p.tokens; ++t) {
     int i = t * p.channels + c;
     float x = Read(p.x, i, p.input);
+    if constexpr (Trace) trace[3 + t] = x;
     float window[4] = {a, b, d, x}, sum = 0;
     for (int j = 0; j < 4; ++j) {
       int lag = dynamic ? j : 3 - j;
@@ -39,12 +47,20 @@ __global__ void Conv(ConvParams p, bool dynamic) {
     b = d;
     d = x;
   }
+  // Verification visits each convolution once. Keep its committed state live
+  // until the caller selects a prefix of this trace.
+  if constexpr (Trace) return;
   history[0] = a;
   history[1] = b;
   history[2] = d;
 }
 int Launch(ConvParams p, void* s, bool dynamic) {
-  Conv<<<(p.channels + 255) / 256, 256, 0, static_cast<cudaStream_t>(s)>>>(p, dynamic);
+  auto stream = static_cast<cudaStream_t>(s);
+  auto blocks = (p.channels + 255) / 256;
+  if (p.trace)
+    Conv<true><<<blocks, 256, 0, stream>>>(p, dynamic);
+  else
+    Conv<false><<<blocks, 256, 0, stream>>>(p, dynamic);
   return cudaGetLastError();
 }
 }  // namespace

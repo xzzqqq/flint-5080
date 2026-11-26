@@ -2,6 +2,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <type_traits>
@@ -12,6 +13,7 @@
 #include "loader/scratch_workspace.h"
 #include "model/submodules.h"
 #include "model/visit_plan.h"
+#include "ops/dspark_ops.h"
 #include "ops/norm_ops.h"
 #include "ops/sconv_ops.h"
 
@@ -66,6 +68,10 @@ struct InklingRunner::Impl {
   const ModelWeightsView& weights;
   const KvStateArenaView& kv;
   VisitPlan plan;
+  uint16_t* backup{};
+  float *kv_trace{}, *sub_trace{};
+  uint32_t verify_pos{}, verify_len{};
+  bool recording{};
   ScratchArenaView activations{};
   std::unique_ptr<Gemm> gemm;
   int32_t *d_next_token{}, *d_decode_pos{}, *host_token{};
@@ -112,9 +118,15 @@ InklingRunner::InklingRunner(const ModelWeightsView& w, const KvStateArenaView& 
   auto workspace = ws.Take<char>(bytes);
   c.d_next_token = ws.Take<int32_t>(1);
   c.d_decode_pos = ws.Take<int32_t>(1);
+  if (kv.has_mtp_kv) {
+    c.backup = ws.Take<uint16_t>(8 * 2 * model::kNumSwaVisits * model::kKvDim);
+    c.kv_trace = ws.Take<float>(11 * 2 * model::kNumLogicalVisits * model::kKvDim);
+    c.sub_trace = ws.Take<float>(11 * 2 * model::kNumLogicalVisits * model::kHiddenSize);
+  }
   c.activations = ws.rest;
   c.gemm = std::make_unique<Gemm>(c.stream, workspace, bytes);
 }
+cudaStream_t InklingRunner::stream() const { return impl_->stream; }
 InklingRunner::~InklingRunner() = default;
 ForwardGraphStats InklingRunner::graph_stats() const { return impl_->stats; }
 void InklingRunner::Impl::RunInkling(const ForwardRunSpec& s, const ForwardOptions& o,
@@ -132,6 +144,12 @@ void InklingRunner::Impl::RunInkling(const ForwardRunSpec& s, const ForwardOptio
       CheckCuda(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, stream));
   };
   size_t plane = size_t(n) * 2;
+  auto tap = [&](int i) {
+    if (capture) copy(capture->taps[i], hidden, plane);
+    if (s.d_taps_out)
+      CheckCuda(cudaMemcpy2DAsync(static_cast<uint16_t*>(s.d_taps_out) + i * h, 4 * h * 2, hidden,
+                                  h * 2, h * 2, t, cudaMemcpyDeviceToDevice, stream));
+  };
   unsigned count = s.num_block_in;
   unsigned expected = 0;
   for (unsigned v = 0; v < s.begin_visit; ++v) {
@@ -195,7 +213,7 @@ void InklingRunner::Impl::RunInkling(const ForwardRunSpec& s, const ForwardOptio
       copy(block(0), block(5), plane);
       count = 1;
     }
-    if (capture && visit.mtp_tap_idx >= 0) copy(capture->taps[visit.mtp_tap_idx], hidden, plane);
+    if (visit.mtp_tap_idx >= 0) tap(visit.mtp_tap_idx);
     int nq = visit.is_full_attention ? 3 : 1;
     if (visit.physical_layer) aggregate(carry, count, hidden, FLINT_BF16, l.attn_query, nq, attn);
     if (visit.has_messages) {
@@ -218,15 +236,23 @@ void InklingRunner::Impl::RunInkling(const ForwardRunSpec& s, const ForwardOptio
         norm(hidden, FLINT_BF16, l.attn_norm, normalized);
     }
     int stride = (visit.has_messages || nq == 3) ? n : 0;
-    AttentionBatch batch{
-        normalized, normalized + stride, normalized + 2 * stride, tmp, t, int(s.pos_offset), visit,
-        d_pos};
+    AttentionBatch batch{normalized,
+                         normalized + stride,
+                         normalized + 2 * stride,
+                         tmp,
+                         t,
+                         int(s.pos_offset),
+                         visit,
+                         d_pos,
+                         recording ? kv_trace + 2 * v * model::kKvDim * (3 + t) : nullptr};
     (visit.is_full_attention ? RunFullAttention : RunSlidingAttention)(g, ws.rest, l, kv, batch);
-    auto conv = [&](const void* weight, float* state) {
-      CheckCuda(flint_static_sconv({tmp, weight, nullptr, state, tmp, t, h, FLINT_BF16, FLINT_BF16},
-                                   stream));
+    auto conv = [&](const void* weight, float* state, int sublayer) {
+      CheckCuda(
+          flint_static_sconv({tmp, weight, nullptr, state, tmp, t, h, FLINT_BF16, FLINT_BF16,
+                              recording ? sub_trace + (2 * v + sublayer) * h * (3 + t) : nullptr},
+                             stream));
     };
-    conv(l.attn_sconv, VisitSublayerConvState(kv, v));
+    conv(l.attn_sconv, VisitSublayerConvState(kv, v), 0);
     CheckCuda(flint_cast({tmp, partial, n, FLINT_BF16, FLINT_F32}, stream));
     if (visit.is_block_boundary)
       copy(block(count++), hidden, plane);
@@ -239,7 +265,7 @@ void InklingRunner::Impl::RunInkling(const ForwardRunSpec& s, const ForwardOptio
     const auto* experts = w.expert_table + visit.physical_layer * 2 * model::kNumExperts;
     RunSparseMoeBlock(g, ws.rest, l, normalized, tmp, t,
                       reinterpret_cast<const ExpertProjection*>(experts));
-    conv(l.mlp_sconv, VisitSublayerConvState(kv, v, 1));
+    conv(l.mlp_sconv, VisitSublayerConvState(kv, v, 1), 1);
     CheckCuda(flint_add_residual(partial, tmp, hidden, n, FLINT_BF16, stream));
     if (visit.is_prologue_end) {
       copy(block(4), hidden, plane);
@@ -255,17 +281,23 @@ void InklingRunner::Impl::RunInkling(const ForwardRunSpec& s, const ForwardOptio
   if (s.run_lm_head) {
     aggregate(carry, count, hidden, FLINT_BF16, w.output_query, 1, attn);
     norm(attn, FLINT_F32, w.final_norm_weight, hidden);
-    if (capture) copy(capture->taps[3], hidden, plane);
+    tap(3);
+    int rows = s.all_token_logits ? t : 1;
     int vocab = w.config.unpadded_vocab_size;
-    auto* raw = ws.Take<float>(vocab);
-    auto* rounded = ws.Take<uint16_t>(vocab);
-    // Match the fixture's BF16 linear output before applying softcap in FP32.
-    RunParityRowMatmul(g, ws.rest, hidden + (t - 1) * h, w.unembed_weight, raw, 1, vocab, h,
-                       FLINT_BF16, FLINT_F32, true);
-    CheckCuda(flint_cast({raw, rounded, vocab, FLINT_F32, FLINT_BF16}, stream));
-    CheckCuda(flint_logit_softcap_argmax({rounded, o.return_logits ? s.d_logits_out : raw,
-                                          s.d_next_token, 1, vocab, vocab, FLINT_BF16},
-                                         stream));
+    // The parity GEMM uses 32-row tiles. Reuse one tile even when all logits
+    // from a long prefill are requested.
+    int tile = std::min(rows, 32);
+    auto* raw = ws.Take<float>(size_t(tile) * vocab);
+    auto* rounded = ws.Take<uint16_t>(size_t(tile) * vocab);
+    for (int row = 0; row < rows; row += tile) {
+      int count = std::min(tile, rows - row);
+      RunParityRowMatmul(g, ws.rest, hidden + size_t(t - rows + row) * h, w.unembed_weight, raw,
+                         count, vocab, h, FLINT_BF16, FLINT_F32, true);
+      CheckCuda(flint_cast({raw, rounded, count * vocab, FLINT_F32, FLINT_BF16}, stream));
+      float* logits = o.return_logits ? s.d_logits_out + size_t(row) * vocab : raw;
+      CheckCuda(flint_logit_softcap_argmax(
+          {rounded, logits, s.d_next_token + row, count, vocab, vocab, FLINT_BF16}, stream));
+    }
     stage("lm_head", 2ull * h * vocab + 6ull * h);
   }
 }
@@ -326,9 +358,13 @@ ForwardRunResult InklingRunner::Run(const ForwardRunSpec& batch, const ForwardOp
       size_t(s.seq_len) * c.weights.config.hidden_size > INT32_MAX ||
       s.pos_offset > c.kv.max_full_seq_len || s.seq_len > c.kv.max_full_seq_len - s.pos_offset)
     throw std::invalid_argument("invalid forward batch");
+  if (c.verify_len && !c.recording) throw std::logic_error("commit pending verification first");
+  if (s.run_lm_head && s.all_token_logits && s.seq_len > 1 && !s.d_next_token)
+    throw std::invalid_argument("missing all-row token output");
   if (s.run_lm_head && !s.d_next_token) s.d_next_token = c.d_next_token;
   bool decode = s.is_decode && s.seq_len == 1;
-  bool graph = o.use_cuda_graph && decode && !capture && !o.enable_profiling;
+  bool graph = o.use_cuda_graph && decode && !capture && !s.d_taps_out && !c.recording &&
+               !o.enable_profiling;
   ForwardRunResult r{};
   if (graph) {
     c.PrepareGraph(s, o);
@@ -347,8 +383,9 @@ ForwardRunResult InklingRunner::Run(const ForwardRunSpec& batch, const ForwardOp
     } else
       c.RunInkling(s, o, r, capture);
     if (s.run_lm_head)
-      CheckCuda(cudaMemcpyAsync(c.host_token, s.d_next_token, sizeof(int32_t),
-                                cudaMemcpyDeviceToHost, c.stream));
+      CheckCuda(cudaMemcpyAsync(c.host_token,
+                                s.d_next_token + (s.all_token_logits ? s.seq_len - 1 : 0),
+                                sizeof(int32_t), cudaMemcpyDeviceToHost, c.stream));
     CheckCuda(cudaEventRecord(c.stop, c.stream));
     CheckCuda(cudaEventSynchronize(c.stop));
     r.next_token_id = s.run_lm_head ? *c.host_token : -1;
@@ -361,5 +398,44 @@ ForwardRunResult InklingRunner::Run(const ForwardRunSpec& batch, const ForwardOp
   }
   if (o.profiler_range) CheckCuda(cudaProfilerStop());
   return r;
+}
+ForwardRunResult InklingRunner::RunVerify(ForwardRunSpec s, const ForwardOptions& o) {
+  auto& c = *impl_;
+  if (!c.backup || c.verify_len || !s.seq_len || s.seq_len > 8 || s.reset_kv ||
+      s.pos_offset > c.kv.max_full_seq_len || s.seq_len > c.kv.max_full_seq_len - s.pos_offset)
+    throw std::invalid_argument("invalid verify block");
+  s.begin_visit = 0;
+  s.end_visit = model::kNumLogicalVisits;
+  s.run_embed = s.run_lm_head = s.all_token_logits = 1;
+  CheckCuda(flint_swa_kv_backup(c.kv.swa_kv, c.backup, s.pos_offset, s.seq_len, c.stream));
+  c.verify_pos = s.pos_offset;
+  c.verify_len = s.seq_len;
+  c.recording = true;
+  try {
+    auto result = Run(s, o);
+    c.recording = false;
+    return result;
+  } catch (...) {
+    c.recording = false;
+    CommitVerify(s.pos_offset, s.seq_len, 0);
+    throw;
+  }
+}
+void InklingRunner::CommitVerify(uint32_t pos, uint32_t len, uint32_t accepted) {
+  auto& c = *impl_;
+  if (!len || len != c.verify_len || pos != c.verify_pos || accepted > len)
+    throw std::invalid_argument("invalid verify commit");
+  if (accepted < len) {
+    CheckCuda(flint_swa_kv_restore(c.kv.swa_kv, c.backup, pos, len, accepted, c.stream));
+  }
+  if (accepted) {
+    CheckCuda(flint_sconv_commit_trace(c.kv_trace, c.kv.kv_conv_state,
+                                       2 * model::kNumLogicalVisits * model::kKvDim, len, accepted,
+                                       c.stream));
+    CheckCuda(flint_sconv_commit_trace(c.sub_trace, c.kv.sublayer_conv_state,
+                                       2 * model::kNumLogicalVisits * model::kHiddenSize, len,
+                                       accepted, c.stream));
+  }
+  c.verify_len = 0;
 }
 }  // namespace flint

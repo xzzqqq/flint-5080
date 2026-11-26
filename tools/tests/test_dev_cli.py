@@ -259,6 +259,7 @@ def test_gpu_missing_builds_and_cleanup(cfg, entry, capsys):
         "e2e-golden",
         "server",
         "forge-host",
+        "mtp-golden",
         "runtime-golden",
     }
     assert all("dev build" in check["error"] for check in checks.values())
@@ -272,6 +273,7 @@ def test_gpu_missing_builds_and_cleanup(cfg, entry, capsys):
         "model",
         "golden",
         "ops_golden.safetensors",
+        "mtp_golden.safetensors",
         "e2e_short_math.safetensors",
         "e2e_short_sky.safetensors",
         "e2e_short_code.safetensors",
@@ -282,7 +284,7 @@ def test_gpu_missing_golden_prerequisite(cfg, entry, capsys, missing):
     cfg.model.weights_dir = "tiny"
     build = cfg.repo_root / "engine/build"
     build.mkdir(parents=True)
-    for name in ("ops_tests", "e2e_tests", "runtime_tests"):
+    for name in ("ops_tests", "e2e_tests", "runtime_tests", "mtp_tests"):
         (build / name).write_text("#!/bin/sh\nexit 0\n")
         (build / name).chmod(0o755)
     if missing != "forward.so":
@@ -292,19 +294,27 @@ def test_gpu_missing_golden_prerequisite(cfg, entry, capsys, missing):
     golden = cfg.repo_root / ".forge/golden/tiny"
     if missing != "golden":
         golden.mkdir(parents=True)
-        for name in ("ops_golden", "e2e_short_math", "e2e_short_sky", "e2e_short_code"):
+        for name in (
+            "ops_golden",
+            "mtp_golden",
+            "e2e_short_math",
+            "e2e_short_sky",
+            "e2e_short_code",
+        ):
             path = golden / (name + ".safetensors")
             if path.name != missing:
                 path.touch()
     assert entry(["check", "--gpu", "--json"]) == 1
     checks = json.loads(capsys.readouterr().out)["data"]["checks"]
     if missing == "model":
-        for name in ("ops-golden", "e2e-golden", "runtime-golden"):
+        for name in ("ops-golden", "e2e-golden", "runtime-golden", "mtp-golden"):
             assert "Missing model directory" in checks[name]["error"]
     elif missing == "forward.so":
         assert "Missing engine/build/forward.so. Run dev build" in checks["e2e-golden"]["error"]
     else:
-        name = "ops-golden" if missing.startswith("ops") else "e2e-golden"
+        name = {"ops_golden.safetensors": "ops-golden", "mtp_golden.safetensors": "mtp-golden"}.get(
+            missing, "e2e-golden"
+        )
         error = checks[name]["error"]
         assert (".forge/golden/tiny" if missing == "golden" else missing) in error
         assert "Run weights golden" in error
@@ -344,11 +354,12 @@ def test_gpu_steps_run_under_lease(cfg, entry, executor, capsys, interrupted):
             "ctest",
             "ops-golden",
             "e2e-golden",
+            "mtp-golden",
             "runtime-golden",
             "forge-host",
             "server",
         }
-        assert len(runs) == 6
+        assert len(runs) == 7
         assert "ctest --test-dir" in runs[0]
         assert shlex.split(runs[1].splitlines()[-1]) == [
             "engine/build/ops_tests",
@@ -373,9 +384,10 @@ def test_gpu_steps_run_under_lease(cfg, entry, executor, capsys, interrupted):
             "--golden-dir",
             golden,
         ]
-        assert "forge-host --smoke" in runs[4]
-        assert runs[5].splitlines()[-3] == '"$server" --smoke'
-        assert shlex.split(runs[5].splitlines()[-1]) == [
+        assert shlex.split(runs[4].splitlines()[-1]) == ["engine/build/mtp_tests", model, golden]
+        assert "forge-host --smoke" in runs[5]
+        assert runs[6].splitlines()[-3] == '"$server" --smoke'
+        assert shlex.split(runs[6].splitlines()[-1]) == [
             "$server",
             "--check-chat-golden",
             "--model-dir",
@@ -385,7 +397,7 @@ def test_gpu_steps_run_under_lease(cfg, entry, executor, capsys, interrupted):
             "--golden-cases",
             "workloads/golden_cases.json",
         ]
-        server, smoke, flag, config = shlex.split(runs[5].splitlines()[-2])
+        server, smoke, flag, config = shlex.split(runs[6].splitlines()[-2])
         assert (server, smoke, flag) == ("$server", "--smoke", "--config-json")
         assert json.loads(config) == {"model_dir": model, "max_context": 2048}
 

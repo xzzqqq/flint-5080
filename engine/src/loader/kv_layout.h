@@ -9,10 +9,10 @@
 #include "loader/model_constants.h"
 namespace flint {
 struct KvArenaSizes {
-  size_t swa, per_token, kv_conv, sublayer_conv;
-  size_t Fixed() const { return swa + kv_conv + sublayer_conv; }
+  size_t swa, per_token, kv_conv, sublayer_conv, mtp_swa, mtp_per_token;
+  size_t Fixed() const { return swa + kv_conv + sublayer_conv + mtp_swa; }
 };
-inline KvArenaSizes ComputeKvArenaSizes(const ModelConfig& c) {
+inline KvArenaSizes ComputeKvArenaSizes(const ModelConfig& c, bool with_mtp = false) {
   if (c.num_key_value_heads != model::kNumKvHeads || c.head_dim != model::kHeadDim ||
       c.hidden_size != model::kHiddenSize || c.sconv_kernel_size != model::kSconvKernelSize ||
       c.sliding_window_size != model::kSlidingWindow)
@@ -20,8 +20,14 @@ inline KvArenaSizes ComputeKvArenaSizes(const ModelConfig& c) {
   size_t channels = c.num_key_value_heads * c.head_dim;
   size_t kv_pair = 2 * channels * sizeof(uint16_t);
   size_t state = model::kNumLogicalVisits * 2 * (c.sconv_kernel_size - 1) * sizeof(float);
-  return {model::kNumSwaVisits * c.sliding_window_size * kv_pair, model::kNumFullVisits * kv_pair,
-          state * channels, state * c.hidden_size};
+  if (with_mtp && !c.has_mtp) throw std::invalid_argument("missing MTP config");
+  size_t mtp_pair = with_mtp ? kv_pair : 0;
+  return {model::kNumSwaVisits * c.sliding_window_size * kv_pair,
+          model::kNumFullVisits * kv_pair + mtp_pair,
+          state * channels,
+          state * c.hidden_size,
+          2 * (c.mtp.sliding_window_size + c.mtp.block_size) * mtp_pair,
+          mtp_pair};
 }
 
 struct KvVisitPointers {
@@ -45,17 +51,19 @@ inline float* VisitSublayerConvState(const KvStateArenaView& kv, uint32_t visit_
          (size_t(visit_idx) * 2 + sublayer) * kv.hidden_size * kv.conv_state_len;
 }
 // Packed prefix snapshots contain only fixed state. Full KV remains live in the arena.
-inline std::array<std::pair<void*, size_t>, 3> FixedKvRegions(const KvStateArenaView& kv,
+inline std::array<std::pair<void*, size_t>, 4> FixedKvRegions(const KvStateArenaView& kv,
                                                               const KvArenaSizes& sizes) {
   return {{{kv.swa_kv, sizes.swa},
            {kv.kv_conv_state, sizes.kv_conv},
-           {kv.sublayer_conv_state, sizes.sublayer_conv}}};
+           {kv.sublayer_conv_state, sizes.sublayer_conv},
+           {kv.mtp_swa_kv, sizes.mtp_swa}}};
 }
 
 inline void CopyFixedKvToSnapshot(void* snapshot_base, const KvStateArenaView& kv,
                                   const KvArenaSizes& sizes, cudaStream_t stream) {
   auto* dst = static_cast<std::byte*>(snapshot_base);
   for (auto [src, bytes] : FixedKvRegions(kv, sizes)) {
+    if (!bytes) continue;
     CheckCuda(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, stream),
               "save prefix snapshot");
     dst += bytes;
@@ -66,6 +74,7 @@ inline void CopySnapshotToFixedKv(const KvStateArenaView& kv, const void* snapsh
                                   const KvArenaSizes& sizes, cudaStream_t stream) {
   auto* src = static_cast<const std::byte*>(snapshot_base);
   for (auto [dst, bytes] : FixedKvRegions(kv, sizes)) {
+    if (!bytes) continue;
     CheckCuda(cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, stream),
               "restore prefix snapshot");
     src += bytes;

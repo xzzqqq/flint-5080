@@ -109,7 +109,7 @@
 - **特征融合与掩码**：`fuse_weight` (`[4, 4]`)、`mask_embed` (`[2304]`)、`norm.weight` (`[2304]`)。
 - **Markov RNN Head**（`111,979,008` B，106.79 MiB，`block_size = 8`, `markov_rank = 256`, `markov_head_type = "rnn_hidden"`）：`dflare_norm`、`rnn_proj` (`[768, 5120]` + bias)、`hidden_out` (`[2304, 256]` + bias)、`markov_w1.weight` (`[201024, 256]`, 102.92 MB)。
 
-草拟器与 target 共用 `embed`、`embed_norm` 和 `unembed[:200058]`。块大小为 8，位置上限为 1,048,576。每个请求按草拟层维护已提交上下文的 K/V；本轮的 8 对块内 K/V 仅用于本轮计算。
+草拟器与 target 共用 `embed`、`embed_norm` 和 `unembed[:200058]`。块大小为 8，位置上限为 1,048,576。每个请求按草拟层维护已提交上下文的 K/V；局部层各使用 1032 槽环形缓存，容纳最近 1024 个已提交位置和 8 个临时块位置；全局层按绝对位置写入。每轮验证后仅将已提交的 target taps 写回草拟器缓存。
 
 ### 3.5 核心算子数学语义与前向数据流
 
@@ -155,7 +155,7 @@
    - 设 $W=$ `rnn_proj.weight`。预计算 FP32 的 $C_s=b+W_{[:,512:]}[H_s;f_{rnn}]$。初值 $z=0$（256 维 BF16）、$p=\mathrm{anchor}$；每步将 $B(C_s+W_{[:,:512]}[z;\mathrm{markov\_w1}[p]])$ 均分为 $(g,c,o)$。
    - $g'=B(\sigma(g)),\ c'=B(\tanh(c)),\ z=B(B(g'z)+B(B(1-g')c')),\ l=B(\tanh(o))$。本步的偏置 logits 来自 $l$，更新后的 $z$ 传入下一步。
    - 偏置投影依次计算 $h'=B(B(W_h l)+b_h)$、$d=B(Uh')$。令 $p=\arg\max B(30\tanh(B(B(UH_s)+d)/30))$，并列取最小 ID。独立自检用 FP64 验证折叠式 $(UW_h)l+Ub_h=U(W_hl+b_h)$，并测量它与实际 BF16 偏置 logits 的最大绝对差。
-   - Target 一次验证 `[anchor, draft[0:7]]`。连续匹配 $a$ 个草稿后，下一 anchor 为 `target_ids[a]`。拒绝时恢复验证前各逻辑步的 KV 与四份短卷积历史，再前向已提交前缀；草拟器仅追加这些位置的 target taps。
+   - Target 一次验证 `[anchor, draft[0:7]]`。连续匹配 $a$ 个草稿后，下一 anchor 为 `target_ids[a]`。PyTorch 参考实现在拒绝时恢复快照并重算前缀。CUDA 验证前备份各 SWA visit 的 8 个待写槽，提交时仅恢复被拒绝的槽。每个卷积按通道记录原有 3 帧与本轮输入，提交 $c$ 个输入后取第 $c$ 至 $c+2$ 帧作为 FP32 历史。Full KV 的有效前缀由提交位置确定。
 
 ### 3.6 Golden Reference 与 Fixture 契约（`weights golden`）
 
@@ -246,7 +246,7 @@ Inkling 2 Mini 的 48 逻辑层中仅 **8 层为 Full Attention**（`8 KV heads 
 
 | KV 精度 | 主干 SWA + SConv 固定开销 | 主干 Full 增量（8 层） | DSpark SWA / Full | 32K 上下文（AR / +DSpark） | 64K 上下文（AR / +DSpark） | KV Arena 实测/预算上限（AR `3,268 MiB` / +DSpark `~2,444 MiB`） |
 |---|---:|---:|---|---:|---:|---|
-| **BF16 (2 B/elem)** | 163.8 MiB（160 MiB SWA + 3.8 MiB SConv） | 32 KiB/tok | 8 MiB / 4 KiB/tok | 1,188 / 1,324 MiB | 2,212 / 2,476 MiB | **99,335 tokens 实测上限**（AR） / **~63K**（+DSpark） |
+| **BF16 (2 B/elem)** | 163.8 MiB（160 MiB SWA + 3.8 MiB SConv） | 32 KiB/tok | 8.0625 MiB / 4 KiB/tok | 1,188 / 1,324 MiB | 2,212 / 2,476 MiB | **99,335 tokens 实测上限**（AR） / **~63K**（+DSpark） |
 | **FP8 (1 B/elem)** | 83.8 MiB（80 MiB SWA + 3.8 MiB SConv） | 16 KiB/tok | 4 MiB / 2 KiB/tok | 596 / 664 MiB | 1,108 / 1,240 MiB | **~203K**（AR） / **~134K**（+DSpark） |
 
 > **工程结论**：

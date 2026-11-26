@@ -96,6 +96,7 @@ void AttentionChunk(const Gemm& g, ScratchArenaView scratch, const LayerWeightsV
                     model::kKvDim,
                     FLINT_BF16,
                     FLINT_BF16};
+    if (b.kv_trace) conv.trace = b.kv_trace + j * model::kKvDim * (3 + t);
     if (full) {
       RunParityRowMatmul(g, ws.rest, input, j ? l.v_weight_proj : l.k_weight_proj, delta, t,
                          model::kDynConvProjDim, model::kHiddenSize, FLINT_BF16, FLINT_BF16, true);
@@ -146,7 +147,7 @@ void Attention(const Gemm& g, ScratchArenaView scratch, const LayerWeightsView& 
         g, scratch, l, cache,
         {static_cast<const uint16_t*>(b.q) + offset, static_cast<const uint16_t*>(b.k) + offset,
          static_cast<const uint16_t*>(b.v) + offset, static_cast<uint16_t*>(b.y) + offset, count,
-         b.position + row, b.visit, b.d_pos},
+         b.position + row, b.visit, b.d_pos, b.kv_trace},
         full);
     row += count;
   }

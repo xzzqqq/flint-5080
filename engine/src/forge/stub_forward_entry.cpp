@@ -311,3 +311,18 @@ int32_t flint_forward_run_layers(ForwardContext* c, const ForwardRunSpec* s,
   }
   return r->status;
 }
+int32_t flint_forward_store_context(ForwardContext*, const void* taps, uint32_t count,
+                                    uint32_t pos) {
+  return cudaErrorNotSupported;
+}
+int32_t flint_forward_draft(ForwardContext*, int32_t anchor, const void* tap, uint32_t pos,
+                            int32_t* h_ids) {
+  return cudaErrorNotSupported;
+}
+int32_t flint_forward_verify(ForwardContext*, const ForwardRunSpec* spec,
+                             const ForwardOptions* opts, ForwardRunResult* result) {
+  return cudaErrorNotSupported;
+}
+int32_t flint_forward_commit(ForwardContext*, uint32_t pos, uint32_t len, uint32_t accepted) {
+  return cudaErrorNotSupported;
+}

@@ -19,9 +19,17 @@ class ForwardModule {
   ForwardModule& operator=(const ForwardModule&) = delete;
 
   ForwardRunResult Run(const ForwardRunSpec& spec, const ForwardOptions& opts = {});
+  void StoreContext(const void* taps, uint32_t n, uint32_t pos);
+  void Draft(int anchor, const void* taps, uint32_t pos, int* ids);
+  ForwardRunResult Verify(const ForwardRunSpec& spec);
+  void Commit(uint32_t pos, uint32_t len, uint32_t accepted);
   void ReportGraphStats(Object& reply, const char* key) const;
 
  private:
+  decltype(&flint_forward_store_context) store_context_{};
+  decltype(&flint_forward_draft) draft_{};
+  decltype(&flint_forward_verify) verify_{};
+  decltype(&flint_forward_commit) commit_{};
   void Close() noexcept;
 
   std::string copy_path_;

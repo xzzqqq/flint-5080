@@ -1,9 +1,12 @@
 #include "loader/arenas.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
+#include <cmath>
 #include <cstring>
 #include <functional>
+#include <optional>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -150,15 +153,49 @@ Schema WeightSchema(ModelWeightsView& model) {
   return schema;
 }
 
+Schema MtpSchema(MtpWeightsView& w) {
+  Schema schema;
+  Fields f(schema, "");
+  f.Add("fuse_weight", D::kBF16, {4, 4}, w.fuse_weight);
+  f.Add("mask_embed", D::kBF16, {2304}, w.mask_embed);
+  f.Add("norm.weight", D::kBF16, {2304}, w.norm);
+  f.Add("markov_head.dflare_norm.weight", D::kBF16, {2304}, w.dflare_norm);
+  f.Add("markov_head.hidden_out.weight", D::kBF16, {2304, 256}, w.hidden_out);
+  f.Add("markov_head.hidden_out.bias", D::kBF16, {2304}, w.hidden_bias);
+  f.Add("markov_head.markov_w1.weight", D::kBF16, {201024, 256}, w.markov_w1);
+  f.Add("markov_head.rnn_proj.weight", D::kBF16, {768, 5120}, w.rnn_proj);
+  f.Add("markov_head.rnn_proj.bias", D::kBF16, {768}, w.rnn_bias);
+  for (int i = 0; i < 3; ++i) {
+    Fields layer(schema, "layers." + std::to_string(i) + ".");
+    auto& l = w.layers[i];
+    layer.Add("dflare_norm.weight", D::kBF16, {2304}, l.dflare_norm);
+    layer.Add("input_layernorm.weight", D::kBF16, {2304}, l.input_layernorm);
+    layer.Add("post_attention_layernorm.weight", D::kBF16, {2304}, l.post_attention_layernorm);
+    layer.Add("self_attn.q_proj.weight", D::kBF16, {3072, 2304}, l.q_proj);
+    layer.Add("self_attn.k_proj.weight", D::kBF16, {1024, 2304}, l.k_proj);
+    layer.Add("self_attn.v_proj.weight", D::kBF16, {1024, 2304}, l.v_proj);
+    layer.Add("self_attn.o_proj.weight", D::kBF16, {2304, 3072}, l.o_proj);
+    layer.Add("self_attn.k_proj_ctx.weight", D::kBF16, {1024, 2304}, l.k_proj_ctx);
+    layer.Add("self_attn.v_proj_ctx.weight", D::kBF16, {1024, 2304}, l.v_proj_ctx);
+    layer.Add("self_attn.k_norm_ctx.weight", D::kBF16, {128}, l.k_norm_ctx);
+    layer.Add("self_attn.q_norm.weight", D::kBF16, {128}, l.q_norm);
+    layer.Add("self_attn.k_norm.weight", D::kBF16, {128}, l.k_norm);
+    layer.Add("mlp.gate_proj.weight", D::kBF16, {9216, 2304}, l.gate_proj);
+    layer.Add("mlp.up_proj.weight", D::kBF16, {9216, 2304}, l.up_proj);
+    layer.Add("mlp.down_proj.weight", D::kBF16, {2304, 9216}, l.down_proj);
+  }
+  return schema;
+}
+
 struct Copy {
   std::span<const std::byte> source;
   size_t offset;
   std::function<void(const void*)> set;
 };
-std::vector<Copy> PlanRawExl3Weights(const SafetensorsFile& file, ModelWeightsView& model) {
+void PlanWeights(const SafetensorsFile& file, ModelWeightsView& model, Schema schema,
+                 std::vector<Copy>& plan) {
   static_assert(std::endian::native == std::endian::little);
-  auto schema = WeightSchema(model);
-  std::vector<Copy> plan;
+
   for (const auto& tensor : file.tensors()) {
     auto node = schema.extract(tensor.name);
     if (node.empty()) throw std::runtime_error("unexpected tensor " + tensor.name);
@@ -179,12 +216,6 @@ std::vector<Copy> PlanRawExl3Weights(const SafetensorsFile& file, ModelWeightsVi
     }
   }
   if (!schema.empty()) throw std::runtime_error("missing tensor " + schema.begin()->first);
-  if (model.verified_mul1_count != 6264 ||
-      plan.size() + model.verified_mul1_count != file.tensors().size() ||
-      file.tensors().size() != 25582)
-    throw std::logic_error("incomplete checkpoint accounting");
-  model.mapped_tensor_count = file.tensors().size();
-  return plan;
 }
 
 constexpr size_t kExpertCount = FLINT_NUM_PHYSICAL_LAYERS * 2 * FLINT_NUM_EXPERTS;
@@ -249,7 +280,8 @@ float Upload(const std::vector<Copy>& plan, std::byte* device, cudaStream_t stre
 
 }  // namespace
 
-WeightsArena WeightsArena::Load(const std::filesystem::path& dir, cudaStream_t stream) {
+WeightsArena WeightsArena::Load(const std::filesystem::path& dir, cudaStream_t stream,
+                                bool load_mtp) {
   WeightsArena result;
   auto& view = result.view_;
   view.config = LoadModelConfig(dir / "config.json");
@@ -257,7 +289,36 @@ WeightsArena WeightsArena::Load(const std::filesystem::path& dir, cudaStream_t s
   const auto& metadata = file.metadata();
   if (auto tag = metadata.find("layout_tag"); tag != metadata.end() && tag->second != "raw_exl3")
     throw std::runtime_error("unsupported weight layout_tag: " + tag->second);
-  auto plan = PlanRawExl3Weights(file, view);
+  std::vector<Copy> plan;
+  PlanWeights(file, view, WeightSchema(view), plan);
+  view.mapped_tensor_count = file.tensors().size();
+  std::optional<SafetensorsFile> draft;
+  std::array<float, 16> alpha{};
+  if (load_mtp && std::filesystem::exists(dir / "model-mtp.safetensors")) {
+    if (!view.config.has_mtp) throw std::runtime_error("missing mtp_config");
+    draft.emplace(SafetensorsFile::Open(dir / "model-mtp.safetensors"));
+    PlanWeights(*draft, view, MtpSchema(view.mtp), plan);
+    auto src = draft->Bytes(*draft->Find("fuse_weight"));
+    for (size_t i = 0; i < 16; ++i) {
+      uint16_t bits;
+      std::memcpy(&bits, src.data() + 2 * i, 2);
+      alpha[i] = std::bit_cast<float>(uint32_t(bits) << 16);
+    }
+    for (size_t i = 0; i < 16; i += 4) {
+      auto* row = alpha.data() + i;
+      float mx = *std::max_element(row, row + 4);
+      for (float& x : std::span(row, 4)) x = std::exp(x - mx);
+      float sum = (row[0] + row[2]) + (row[1] + row[3]);
+      for (float& x : std::span(row, 4)) x /= sum;
+    }
+    size_t offset = Align(view.arena_bytes);
+    plan.push_back({std::as_bytes(std::span(alpha)), offset, [&](const void* ptr) {
+                      view.mtp.fuse_alpha = static_cast<const float*>(ptr);
+                    }});
+    view.arena_bytes = offset + sizeof(alpha);
+    view.has_mtp = 1;
+    view.mapped_tensor_count += draft->tensors().size();
+  }
   const size_t table_offset = Align(view.arena_bytes);
   view.arena_bytes = table_offset + kExpertCount * sizeof(Exl3ExpertDesc);
   result.allocation_ = AllocateDeviceBuffer(view.arena_bytes);
@@ -271,14 +332,14 @@ WeightsArena WeightsArena::Load(const std::filesystem::path& dir, cudaStream_t s
   return result;
 }
 
-uint32_t KvStateArena::MaxFullSeqLenForBudget(const ModelConfig& c, size_t budget) {
-  auto l = ComputeKvArenaSizes(c);
+uint32_t KvStateArena::MaxFullSeqLenForBudget(const ModelConfig& c, size_t budget, bool with_mtp) {
+  auto l = ComputeKvArenaSizes(c, with_mtp);
   if (budget < l.Fixed()) return 0;
   return std::min<size_t>(UINT32_MAX, (budget - l.Fixed()) / l.per_token);
 }
-KvStateArena KvStateArena::Allocate(const ModelConfig& c, uint32_t tokens) {
+KvStateArena KvStateArena::Allocate(const ModelConfig& c, uint32_t tokens, bool with_mtp) {
   if (!tokens) throw std::invalid_argument("empty full KV context");
-  auto l = ComputeKvArenaSizes(c);
+  auto l = ComputeKvArenaSizes(c, with_mtp);
   KvStateArena result;
   auto& v = result.view_;
   v.arena_bytes = l.Fixed() + tokens * l.per_token;
@@ -289,6 +350,12 @@ KvStateArena KvStateArena::Allocate(const ModelConfig& c, uint32_t tokens) {
   auto* conv = base + l.swa + tokens * l.per_token;
   v.kv_conv_state = reinterpret_cast<float*>(conv);
   v.sublayer_conv_state = reinterpret_cast<float*>(conv + l.kv_conv);
+  if (with_mtp) {
+    v.has_mtp_kv = 1;
+    v.mtp_swa_window = c.mtp.sliding_window_size + c.mtp.block_size;
+    v.mtp_full_kv = conv - tokens * l.mtp_per_token;
+    v.mtp_swa_kv = conv + l.kv_conv + l.sublayer_conv;
+  }
   v.max_full_seq_len = tokens;
   v.swa_window = c.sliding_window_size;
   v.num_swa_visits = model::kNumSwaVisits;

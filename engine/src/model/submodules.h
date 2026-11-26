@@ -19,6 +19,7 @@ struct AttentionBatch {
   int tokens, position;
   VisitPlanEntry visit;
   const int32_t* d_pos{};
+  float* kv_trace{};
 };
 void RunSlidingAttention(const Gemm&, ScratchArenaView, const LayerWeightsView&,
                          const KvStateArenaView&, AttentionBatch);

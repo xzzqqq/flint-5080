@@ -38,6 +38,28 @@ int main() {
     auto uniform = sequence(12345, INFINITY, 0, 0);
     logits = {0, 0};
     require(uniform == sequence(12345, 1, 0, 0), "infinite temperature");
+    std::vector<int32_t> proposals{1, 1}, targets{1, 0, 2};
+    auto greedy = flint::VerifySpeculative(proposals, targets, {}, {}, 3, 0, 0, 1, seed);
+    require(greedy.accepted_draft_count == 1 && greedy.bonus_token == 0, "greedy first mismatch");
+    std::vector<float> q{0, 8, 0, 8}, p{0, 8, 8, 0, 8, 0};
+    auto verify = [&]() { return flint::VerifySpeculative(proposals, {}, q, p, 2, 1, 1, 1, seed); };
+    auto rejected = verify();
+    require(rejected.accepted_draft_count == 1 && rejected.bonus_token == 0, "disjoint support");
+    p[2] = 0;
+    p[3] = 8;
+    auto accepted = verify();
+    require(accepted.accepted_draft_count == 2 && accepted.bonus_token == 0, "all accepted bonus");
+    // q=(1/2,1/2), p=(1/4,3/4). Given proposal 0, accept half and replace with 1 otherwise.
+    int accepted_zero = 0;
+    for (int i = 0; i < 4096; ++i) {
+      const int proposal = 0;
+      float uniform_logits[] = {0, 0}, target_logits[] = {0, std::log(3.f), 0, 0};
+      auto r = flint::VerifySpeculative({&proposal, 1}, {}, uniform_logits, target_logits, 2, 1, 0,
+                                        1, seed);
+      accepted_zero += r.accepted_draft_count;
+      require(r.accepted_draft_count || r.bonus_token == 1, "residual support");
+    }
+    require(accepted_zero > 1900 && accepted_zero < 2200, "acceptance probability");
     logits = {NAN, INFINITY};
     try {
       sample(1, 0, 0);

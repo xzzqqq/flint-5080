@@ -146,7 +146,8 @@ char* engine_stats_json(EngineHandle* h); // 返回 JSON 快照供 /ready 与 P1
 ```
 
 - **`forge-host` 与 `forward.so` 均为全速 Release（`-O3`、`sm_120a`、CUDA Graph 全开）构建**，绝非 Debug 构建。
-- `libengine.a` 与 `forward.so` 共用 `engine_model` 中的 `InklingRunner`。Forge ABI v4 与 runner 共用 `model/forward_types.h` 中的请求和结果类型，返回的 `num_block_out` 表示活跃残差块数。
+- `libengine.a` 与 `forward.so` 共用 `engine_model` 中的 `InklingRunner` 和 `DsparkRunner`。Forge ABI v5 与 runner 共用 `model/forward_types.h` 中的请求和结果类型，返回的 `num_block_out` 表示活跃残差块数。
+- 存在 MTP 权重时，forge 在同一权重 arena 载入草拟器，独立保留 1032 槽的局部 KV 和逐位置的全局 KV。`--e2e --step 1` 默认测量完整投机轮次，计时包含草拟、8 行验证、状态提交和已接受前缀的草拟 KV 更新。target 在验证前保存即将覆盖的 SWA 槽，并记录四个卷积的输入历史，按提交长度恢复。
 - `forge start --no-model` 和 `forge-host --smoke` 加载 `stub_forward.so`。回放使用相同的 BF16 隐状态、carry 和按 visit 定位的 KV/卷积快照。
 - 两种形态互斥使用 5080（由单卡 lease 锁强制防撞车）。
 

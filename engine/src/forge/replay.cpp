@@ -10,8 +10,11 @@
 #include <numeric>
 
 #include "common/cuda_check.h"
+#include "common/cuda_profiler.h"
 #include "forge/safetensors_writer.h"
 #include "loader/kv_layout.h"
+#include "loader/safetensors.h"
+#include "runtime/sampler.h"
 
 namespace flint {
 namespace fs = std::filesystem;
@@ -51,7 +54,7 @@ Replay::Replay(DaemonConfig cfg) : config_(std::move(cfg)) {
   model_config_ = model::MakeDefaultInklingConfig();
   if (!config_.model_dir.empty()) {
     auto start = std::chrono::steady_clock::now();
-    weights_.emplace(WeightsArena::Load(config_.model_dir));
+    weights_.emplace(WeightsArena::Load(config_.model_dir, nullptr, true));
     weights_load_ms_ =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     model_config_ = weights_->view().config;
@@ -59,20 +62,23 @@ Replay::Replay(DaemonConfig cfg) : config_(std::move(cfg)) {
   plan_ = BuildVisitPlan(model_config_);
   width_ = model_config_.hidden_size;
   vocab_ = model_config_.unpadded_vocab_size;
-  kv_.emplace(KvStateArena::Allocate(model_config_, config_.kv_seq_len));
+  bool draft = weights_ && weights_->view().has_mtp;
+  kv_.emplace(KvStateArena::Allocate(model_config_, config_.kv_seq_len, draft));
   scratch_.emplace(ScratchArena::Allocate(size_t(config_.scratch_mb) << 20));
   capacity_ = std::min<size_t>({config_.kv_seq_len, model::kSlidingWindow,
                                 scratch_->view().bytes / (width_ * sizeof(float))});
   if (!capacity_) throw std::runtime_error("scratch too small for one token");
   size_t elements = size_t(capacity_) * width_;
   auto hidden_bytes = elements * sizeof(uint16_t);
-  io_.emplace(ScratchArena::Allocate((2 + model::kCarryPlanes) * hidden_bytes +
-                                     vocab_ * sizeof(float) + (capacity_ + 1) * sizeof(int)));
+  io_.emplace(ScratchArena::Allocate((2 + model::kCarryPlanes + (draft ? 4 : 0)) * hidden_bytes +
+                                     vocab_ * sizeof(float) +
+                                     (capacity_ + (draft ? 8 : 1)) * sizeof(int)));
   hidden_ = static_cast<uint16_t*>(io_->view().device_ptr);
   out_ = hidden_ + elements;
   carry_ = out_ + elements;
   logits_ = reinterpret_cast<float*>(carry_ + model::kCarryPlanes * elements);
-  ids_ = reinterpret_cast<int*>(logits_ + vocab_);
+  taps_ = reinterpret_cast<uint16_t*>(logits_ + vocab_);
+  ids_ = reinterpret_cast<int*>(taps_ + (draft ? 4 * elements : 0));
   next_ = ids_ + capacity_;
   for (auto dir : {"candidates", "loaded"}) fs::create_directories(config_.state_dir / dir);
   auto baseline = config_.state_dir / "candidates/baseline.so";
@@ -95,6 +101,12 @@ Replay::Replay(DaemonConfig cfg) : config_(std::move(cfg)) {
         ForwardOptions opts{.use_cuda_graph = 1, .return_logits = 1};
         a->Run(spec, opts);
         b->Run(spec, opts);
+        if (draft && capacity_ >= 9) {
+          spec.d_taps_out = taps_;
+          int anchor = a->Run(spec, {}).next_token_id;
+          a->StoreContext(taps_, 1, 0);
+          RunSpecRound(*b, anchor, taps_, 1, false);
+        }
       }
       warmup_vram_bytes_ = int64_t(free_before) - int64_t(FreeBytes());
     }
@@ -376,9 +388,185 @@ void Replay::Dump(const Json& q, const Measurement& m, const Recording& r,
   auto dump = WriteDump(q.at("out").as<std::string>(), tensors);
   reply.merge(dump);
 }
+Replay::SpecRound Replay::RunSpecRound(ForwardModule& candidate, int anchor, const uint16_t* last,
+                                       unsigned pos, bool profile) {
+  using Clock = std::chrono::steady_clock;
+  SpecRound round{};
+  round.block.resize(8);
+  round.block[0] = anchor;
+  CheckCuda(cudaStreamSynchronize(stream_));
+  if (profile) CheckCuda(cudaProfilerStart());
+  try {
+    auto start = Clock::now();
+    candidate.Draft(anchor, last, pos, round.block.data() + 1);
+    auto drafted = Clock::now();
+    Upload(stream_, ids_, round.block);
+    auto s = Spec(0, model::kNumLogicalVisits, 8, pos, true, true);
+    s.d_taps_out = taps_;
+    candidate.Verify(s);
+    round.verified = Read(next_, 8);
+    uint64_t seed = 0;
+    auto result = VerifySpeculative(std::span(round.block).subspan(1), round.verified, {}, {},
+                                    vocab_, 0, 0, 0, seed);
+    auto verified = Clock::now();
+    unsigned count = 1 + result.accepted_draft_count;
+    candidate.Commit(pos, 8, count);
+    candidate.StoreContext(taps_, count, pos);
+    CheckCuda(cudaStreamSynchronize(stream_));
+    auto stop = Clock::now();
+    round.elapsed_ms = std::chrono::duration<double, std::milli>(stop - start).count();
+    round.draft_ms = std::chrono::duration<double, std::milli>(drafted - start).count();
+    round.verify_ms = std::chrono::duration<double, std::milli>(verified - drafted).count();
+    round.emitted.assign(round.block.begin() + 1, round.block.begin() + count);
+    round.emitted.push_back(result.bonus_token);
+  } catch (...) {
+    if (profile) cudaProfilerStop();
+    throw;
+  }
+  if (profile) CheckCuda(cudaProfilerStop());
+  return round;
+}
+Object Replay::MeasureSpeculative(const Json& q, const std::string& cmd, const Measurement& m) {
+  if (capacity_ < 8 || m.ids.size() + m.step - 1 + 8 > kv_->view().max_full_seq_len)
+    throw std::invalid_argument("insufficient KV capacity for eight-token verification");
+  Object reply;
+  std::vector<int> prefix;
+  unsigned pos = 0, n = m.ids.size();
+  {
+    auto baseline = Load(config_.baseline);
+    Upload(stream_, ids_, m.ids);
+    for (unsigned i = 0; i < m.step; ++i) {
+      auto spec = Spec(0, model::kNumLogicalVisits, n, pos, true, true);
+      spec.reset_kv = !i;
+      spec.d_taps_out = taps_;
+      int anchor = baseline->Run(spec).next_token_id;
+      baseline->StoreContext(taps_, n, pos);
+      pos += n;
+      prefix.push_back(anchor);
+      if (i + 1 < m.step) {
+        CheckCuda(
+            cudaMemcpyAsync(ids_, &prefix.back(), sizeof(int), cudaMemcpyHostToDevice, stream_));
+        n = 1;
+      }
+    }
+    CheckCuda(cudaStreamSynchronize(stream_));
+  }
+  // Full KV is append-only. Only mutable ring slots, convolution history and
+  // the last committed tap need restoration between candidate rounds.
+  auto last_tap = Read(taps_ + size_t(n - 1) * 4 * width_, 4 * width_);
+  const auto& kv = kv_->view();
+  auto sizes = ComputeKvArenaSizes(model_config_, true);
+  std::vector<std::pair<std::byte*, std::vector<std::byte>>> saved;
+  auto save = [&](void* ptr, size_t bytes) {
+    auto* address = static_cast<std::byte*>(ptr);
+    saved.emplace_back(address, Read(address, bytes));
+  };
+  save(kv.kv_conv_state, sizes.kv_conv);
+  save(kv.sublayer_conv_state, sizes.sublayer_conv);
+  auto save_ring = [&](void* base, unsigned window, unsigned planes) {
+    if (pos + 8 <= window) return;
+    size_t stride = model::kKvDim * sizeof(uint16_t);
+    unsigned first = pos % window, count = std::min(8u, window - first);
+    for (unsigned i = 0; i < planes; ++i) {
+      auto plane = static_cast<std::byte*>(base) + i * window * stride;
+      save(plane + first * stride, count * stride);
+      if (count < 8) save(plane, (8 - count) * stride);
+    }
+  };
+  save_ring(kv.swa_kv, kv.swa_window, 2 * kv.num_swa_visits);
+  save_ring(kv.mtp_swa_kv, kv.mtp_swa_window, 4);
+  auto a = Load(q.at(cmd == "ab" ? "so_a" : "so_path").as<std::string>());
+  auto b = cmd == "ab" ? Load(q.at("so_b").as<std::string>()) : std::nullopt;
+  SpecRound result;
+  bool profile = false;
+  auto round = [&](ForwardModule& candidate) {
+    for (auto& [ptr, bytes] : saved) Upload(stream_, ptr, bytes);
+    Upload(stream_, taps_, last_tap);
+    result = RunSpecRound(candidate, prefix.back(), taps_, pos, profile);
+    return result.elapsed_ms;
+  };
+  for (unsigned i = 0; i < m.warmup; ++i) {
+    round(*a);
+    if (b) round(*b);
+  }
+  profile = q.get("profiler_range", false);
+  std::vector<double> times, paired;
+  Array pairs;
+  for (unsigned j = 0; j < m.rounds; ++j) {
+    std::vector<double> group_a, group_b;
+    for (unsigned i = 0; i < m.iters; ++i) {
+      group_a.push_back(round(*a));
+      if (b) {
+        auto first = result.emitted;
+        group_b.push_back(round(*b));
+        reply["next_token_match"] = first == result.emitted;
+      }
+    }
+    times.insert(times.end(), group_a.begin(), group_a.end());
+    if (b) {
+      paired.insert(paired.end(), group_b.begin(), group_b.end());
+      pairs.emplace_back(Object{{"a_ms", Median(group_a)}, {"b_ms", Median(group_b)}});
+    }
+  }
+  auto median = Median(times);
+  reply["elapsed_ms"] =
+      Object{{"median", median},
+             {"min", times.front()},
+             {"max", times.back()},
+             {"mean", std::accumulate(times.begin(), times.end(), 0.) / times.size()}};
+  if (b) {
+    auto second = Median(paired);
+    reply["rounds"] = std::move(pairs);
+    reply["a_median_ms"] = median;
+    reply["b_median_ms"] = second;
+    reply["speedup"] = median / second;
+    reply["delta_ms"] = median - second;
+  }
+  auto& emitted = result.emitted;
+  reply["spec_accepted"] = emitted.size() - 1;
+  reply["tokens_emitted"] = emitted.size();
+  if (cmd == "profile" || q.get("enable_profiling", false)) {
+    reply["draft_ms"] = result.draft_ms;
+    reply["verify_ms"] = result.verify_ms;
+    reply["commit_and_store_ms"] = result.elapsed_ms - result.draft_ms - result.verify_ms;
+  }
+  Array ids;
+  for (int token : emitted) ids.emplace_back(token);
+  reply["emitted_ids"] = std::move(ids);
+  if (!config_.golden_dir.empty() &&
+      m.name.find_first_not_of(
+          "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.") ==
+          std::string::npos) {
+    auto path = config_.golden_dir / ("e2e_" + m.name + ".safetensors");
+    if (fs::exists(path)) {
+      auto file = SafetensorsFile::Open(path);
+      auto prompt = file.Find("input_ids"), expected = file.Find("generated_ids");
+      if (prompt && expected && prompt->dtype == TensorDType::kI32 &&
+          expected->dtype == TensorDType::kI32 && prompt->nbytes == m.ids.size() * sizeof(int) &&
+          !std::memcmp(file.Bytes(*prompt).data(), m.ids.data(), prompt->nbytes)) {
+        prefix.insert(prefix.end(), emitted.begin(), emitted.end());
+        auto bytes = std::min(expected->nbytes, prefix.size() * sizeof(int));
+        reply["golden"] = Object{
+            {"matched_tokens_checked", bytes / sizeof(int)},
+            {"next_token_match", !std::memcmp(file.Bytes(*expected).data(), prefix.data(), bytes)}};
+      }
+    }
+  }
+  if (cmd == "dump") {
+    auto dump =
+        WriteDump(q.at("out").as<std::string>(),
+                  {{"verify_input_ids", "I32", {8}, std::as_bytes(std::span(result.block))},
+                   {"target_ids", "I32", {8}, std::as_bytes(std::span(result.verified))},
+                   {"emitted_ids", "I32", {emitted.size()}, std::as_bytes(std::span(emitted))}});
+    reply.merge(dump);
+  }
+  return reply;
+}
 Object Replay::Measure(const Json& q, const std::string& cmd) {
   auto m = ParseMeasurement(q, cmd);
   bool e2e = m.e2e();
+  if (e2e && m.step && weights_ && weights_->view().has_mtp && q.get("use_speculative", true))
+    return MeasureSpeculative(q, cmd, m);
   Object reply;
   using Clock = std::chrono::steady_clock;
   auto elapsed_ms = [](Clock::time_point start) {

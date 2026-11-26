@@ -185,6 +185,23 @@ ModelConfig TestConfig(const fs::path& path) {
   Require(config.unpadded_vocab_size == 200058 && config.pad_token_id == 199999 &&
               config.loop_gate_rank == 64 && config.rms_norm_eps == 1e-6f,
           "config fields");
+  Require(!config.has_mtp, "AR-only config");
+  std::string draft_config = kConfig;
+  draft_config.insert(draft_config.find('{') + 1, R"("mtp_config":{
+    "hidden_size":2304,"num_hidden_layers":3,"num_attention_heads":24,"num_key_value_heads":8,
+    "head_dim":128,"intermediate_size":9216,"max_position_embeddings":1048576,"block_size":8,
+    "markov_rank":256,"rms_norm_eps":0.000001,"rope_theta":1000000,"sliding_window_size":1024,
+    "local_layer_ids":[0,2],"target_layer_ids":[5,23,41,48]},)");
+  std::ofstream(path) << draft_config;
+  auto draft = LoadModelConfig(path);
+  Require(draft.has_mtp && draft.mtp.markov_rank == 256 && draft.mtp.target_layer_ids[3] == 48 &&
+              !draft.mtp.is_local_layer[1],
+          "MTP config");
+  auto base = ComputeKvArenaSizes(draft), sizes = ComputeKvArenaSizes(draft, true);
+  Require(sizes.Fixed() == base.Fixed() + 2 * 1032 * 4096 && sizes.per_token == 9 * 4096 &&
+              KvStateArena::MaxFullSeqLenForBudget(draft, sizes.Fixed() + 32 * sizes.per_token,
+                                                   true) == 32,
+          "MTP KV budget");
   auto plan = BuildVisitPlan(config);
   unsigned swa = 0, full = 0;
   for (unsigned i = 0; i < plan.size(); ++i) {
