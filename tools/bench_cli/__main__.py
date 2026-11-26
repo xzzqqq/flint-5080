@@ -1,9 +1,9 @@
 """Black-box OpenAI HTTP benchmark entry point."""
 
 import argparse
-import asyncio
 import math
 import os
+import sys
 from pathlib import Path
 from time import perf_counter
 
@@ -59,6 +59,16 @@ def build_parser():
     run.add_argument("--bench-file", type=Path, help="Override workloads/bench_cases.json.")
     run.add_argument("--canary-file", type=Path, help="Override workloads/canary_cases.json.")
     run.add_argument(
+        "--local",
+        action="store_true",
+        help="Run on this machine instead of dispatching to the configured remote host.",
+    )
+    run.add_argument(
+        "--python",
+        help="Python interpreter with httpx on the remote host (defaults to [bench].python).",
+    )
+    run.add_argument("--api-key-stdin", action="store_true", help=argparse.SUPPRESS)
+    run.add_argument(
         "--no-archive", dest="archive", action="store_false", help="Skip .runs archive."
     )
     compare.add_argument("baseline", type=Path)
@@ -84,8 +94,11 @@ def main(argv=None):
                 parser.error("rounds must be positive, warmup must be nonnegative")
             if not math.isfinite(args.timeout) or args.timeout <= 0:
                 parser.error("timeout must be finite and positive")
-            args.api_key = args.api_key or os.getenv("FLINT_API_KEY")
-            asyncio.run(commands.run(args, root, result))
+            if args.api_key_stdin and not args.api_key:
+                args.api_key = sys.stdin.read().strip() or None
+            else:
+                args.api_key = args.api_key or os.getenv("FLINT_API_KEY")
+            commands.dispatch_run(args, root, result)
         else:
             commands.compare(args, result)
     except (

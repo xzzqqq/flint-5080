@@ -1,5 +1,7 @@
 import asyncio
+import io
 import json
+import shlex
 import shutil
 from pathlib import Path
 
@@ -7,9 +9,10 @@ import httpx
 import pytest
 
 from tools.bench_cli import __main__ as cli
-from tools.bench_cli import client
+from tools.bench_cli import client, commands
 from tools.bench_cli.stats import paired_bootstrap_ci
 from tools.bench_cli.workloads import PERF, evaluate, load_workloads
+from tools.common.remote import CommandResult, SyncResult
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -236,7 +239,9 @@ def test_suites(suite, harness, monkeypatch):
 def test_client_fallback(harness, external, off):
     endpoint, invoke, repo = harness
     endpoint.external = external
-    (repo / ".dev.toml").write_text('[server]\nbind="custom.test:1234"\n')
+    (repo / ".dev.toml").write_text(
+        '[remote]\nenabled = false\n[server]\nbind="custom.test:1234"\n'
+    )
     result = invoke(
         "run",
         "--json",
@@ -509,3 +514,81 @@ def test_zero_decode_and_empty_stream():
     assert m["cached_prefix_ratio"] == 0
     assert m["chunk_count"] == 0 and m["client_ttft_ms"] is None
     assert "server_tpot_ms" not in m and "server_decode_tok_s" not in m
+
+
+def test_remote_dispatch_and_local_overrides(harness, monkeypatch, tmp_path):
+    endpoint, invoke, repo = harness
+    (repo / ".dev.toml").write_text(
+        '[remote]\nenabled = true\nhost = "gpu-5080"\n'
+        '[server]\nbind = "0.0.0.0:9090"\n'
+        '[bench]\npython = "/remote/bench/python"\n'
+    )
+    calls = []
+
+    class FakeExecutor:
+        def __init__(self, cfg):
+            self.cfg = cfg
+
+        def sync(self):
+            calls.append(("sync", self.cfg.remote.host))
+            return SyncResult(False, 1.0, "/workspace", 1, [])
+
+        def run(self, cmd, **kwargs):
+            calls.append(("run", shlex.split(cmd), kwargs))
+            payload = {
+                "command": "bench run",
+                "ok": False if "canary" in cmd else True,
+                "data": {"metadata": {"suites": ["short"]}, "cases": {}, "suite_summary": {}},
+                "error": "Canary failed: math_reasoning" if "canary" in cmd else None,
+            }
+            return CommandResult(0 if payload["ok"] else 1, json.dumps(payload), "", 1.0, [])
+
+    monkeypatch.setattr(commands, "Executor", FakeExecutor)
+    monkeypatch.setenv("FLINT_API_KEY", "secret-token")
+    res = invoke("run", "--suite", "short", "--rounds", "2", "--warmup", "1", "--json")
+    assert res["ok"] and Path(res["run_file"]).parent == repo / ".runs"
+    assert calls[0] == ("sync", "gpu-5080")
+    _, argv, kwargs = calls[1]
+    assert argv[:9] == [
+        "/remote/bench/python",
+        "-m",
+        "tools.bench_cli",
+        "--json",
+        "run",
+        "--local",
+        "--no-archive",
+        "--url",
+        "http://127.0.0.1:9090",
+    ]
+    assert "--api-key-stdin" in argv and "secret-token" not in argv
+    assert kwargs["input_text"] == "secret-token\n"
+
+    # Canary failure propagates remote exit code and diagnostics cleanly.
+    failed = invoke("run", "--suite", "canary", "--json", code=1)
+    assert not failed["ok"] and "math_reasoning" in failed["error"]
+
+    # Explicit --local or --url bypasses remote dispatch; --api-key-stdin reads stdin.
+    calls.clear()
+    monkeypatch.delenv("FLINT_API_KEY")
+    monkeypatch.setattr(cli.sys, "stdin", io.StringIO("stdin-secret\n"))
+    invoke(
+        "run",
+        "--suite",
+        "short",
+        "--local",
+        "--api-key-stdin",
+        "--rounds",
+        "1",
+        "--warmup",
+        "0",
+        "--no-archive",
+        "--json",
+    )
+    assert calls == []
+    assert endpoint.requests[0].headers["authorization"] == "Bearer stdin-secret"
+
+    # External workload file is rejected in remote mode.
+    outside = tmp_path / "outside.json"
+    outside.write_text("{}")
+    err = invoke("run", "--suite", "short", "--bench-file", str(outside), "--json", code=1)
+    assert "inside the repository" in err["error"]

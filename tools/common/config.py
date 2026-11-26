@@ -57,6 +57,11 @@ class WeightsConfig:
 
 
 @dataclass
+class BenchConfig:
+    python: str = ""
+
+
+@dataclass
 class ServerConfig:
     bind: str = "127.0.0.1:8080"
 
@@ -85,6 +90,7 @@ class DevConfig:
     server: ServerConfig = field(default_factory=ServerConfig)
     workload: WorkloadConfig = field(default_factory=WorkloadConfig)
     weights: WeightsConfig = field(default_factory=WeightsConfig)
+    bench: BenchConfig = field(default_factory=BenchConfig)
 
     @property
     def is_remote(self) -> bool:

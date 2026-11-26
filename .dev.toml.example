@@ -56,3 +56,7 @@ default_case = ""
 # Interpreter on the execution host and parent directory for generated goldens.
 python = ""
 golden_dir = ""
+
+[bench]
+# Interpreter with httpx on the execution host for remote `bench run`.
+python = ""

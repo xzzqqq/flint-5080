@@ -104,7 +104,7 @@ def test_missing_manifest(entry, capsys, target, manifest):
 def test_status(cfg, entry, capsys, monkeypatch):
     def query(args):
         if "--query-gpu=" in " ".join(args):
-            return "0, GPU-1, RTX 5080, 40, 15, 100, 16384", None
+            return "0, GPU-1, RTX 5080, 580.105.08, 40, 15, 100, 16384, 3090, 15001, 360.00", None
         if args[0] == "nvidia-smi":
             return "GPU-1, 123, server, 50", None
         return None, "missing tool"
@@ -113,13 +113,21 @@ def test_status(cfg, entry, capsys, monkeypatch):
     assert entry(["--json", "status"]) == 0
     data = json.loads(capsys.readouterr().out)["data"]
     assert data["mode"] == "local" and data["remote_workspace"] == cfg.remote_workspace_dir
-    assert data["gpu"]["rows"][0]["name"] == "RTX 5080"
+    gpu_row = data["gpu"]["rows"][0]
+    assert gpu_row["name"] == "RTX 5080"
+    assert gpu_row["driver_version"] == "580.105.08"
+    assert gpu_row["clocks.max.graphics"] == "3090"
+    assert gpu_row["clocks.max.memory"] == "15001"
+    assert gpu_row["power.limit"] == "360.00"
     assert data["compute_processes"]["rows"][0]["pid"] == "123"
     assert set(data["toolchain"]) == set("nvcc cmake ninja ccache cargo rustc mold ld.lld".split())
     assert data["toolchain"]["nvcc"]["error"] == "missing tool" and not data["lease"]["locked"]
     assert entry(["status"]) == 0
     output = capsys.readouterr().out
     assert "mode: local" in output and "RTX 5080" in output
+    assert (
+        "driver 580.105.08" in output and "3090/15001 MHz" in output and "360.00 W limit" in output
+    )
 
 
 def test_status_unreachable(cfg, entry, monkeypatch, capsys):

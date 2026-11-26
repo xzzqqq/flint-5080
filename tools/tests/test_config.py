@@ -11,16 +11,20 @@ def test_example(repo):
     assert cfg.is_remote and cfg.remote.host == "gpu-dev"
     assert cfg.build.cuda_arch == "120a" and cfg.build.use_ccache
     assert cfg.shared.models_dir and cfg.gpu.lease_ttl_sec == 600
-    assert cfg.weights.python == cfg.weights.golden_dir == ""
+    assert cfg.weights.python == cfg.weights.golden_dir == cfg.bench.python == ""
     assert cfg.server.bind == "127.0.0.1:8080"
     assert cfg.model.weights_dir == cfg.workload.default_case == ""
     assert cfg.remote_workspace_dir == cfg.remote.workspaces_root + "/my-worktree"
 
 
-def test_weights_section(repo):
-    (repo / ".dev.toml").write_text('[weights]\npython = "/venv/python"\ngolden_dir = "/golden"\n')
+def test_weights_and_bench_sections(repo):
+    (repo / ".dev.toml").write_text(
+        '[weights]\npython = "/venv/python"\ngolden_dir = "/golden"\n'
+        '[bench]\npython = "/bench/python"\n'
+    )
     cfg = load_config(repo_root=repo)
     assert (cfg.weights.python, cfg.weights.golden_dir) == ("/venv/python", "/golden")
+    assert cfg.bench.python == "/bench/python"
 
 
 def test_root(repo):
@@ -56,6 +60,7 @@ def test_overrides(repo, monkeypatch):
         '[remote]\nenabled = "yes"',
         "[build]\njobs = true",
         "[weights]\npython = 3",
+        "[bench]\npython = 3",
         '[remote.env]\n"bad-key" = "x"',
         "[gpu]\nlease_ttl_sec = 0",
     ],

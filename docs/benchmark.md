@@ -3,6 +3,9 @@
 Run `./bin/bench run --suite canary --no-archive` for a quick check of a running
 endpoint. Run `./bin/bench run --suite all --json` for the full protocol.
 `--url` takes the base URL before `/v1` and defaults to the local server bind.
+When `.dev.toml` enables `[remote]` and `--url`/`--local` are omitted, `bench run`
+syncs the workspace, runs on the execution host over loopback using `[bench].python`,
+and archives the run record locally under `.runs/`.
 Set `FLINT_API_KEY` for authenticated endpoints. The harness discovers the first
 model in `/v1/models` unless given `--model`. It samples static engine metadata
 from Flint's `/ready`. All generation goes through OpenAI Chat Completions.

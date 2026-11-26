@@ -488,9 +488,17 @@ def _status_lines(data):
     if not gpu.get("rows"):
         lines.append("GPU: " + gpu.get("error", "none reported"))
     for row in gpu.get("rows", []):
+        extras = []
+        if row.get("driver_version"):
+            extras.append(f"driver {row['driver_version']}")
+        if row.get("clocks.max.graphics") and row.get("clocks.max.memory"):
+            extras.append(f"max {row['clocks.max.graphics']}/{row['clocks.max.memory']} MHz")
+        if row.get("power.limit"):
+            extras.append(f"{row['power.limit']} W limit")
+        suffix = f" ({', '.join(extras)})" if extras else ""
         lines.append(
             f"GPU {row['index']}: {row['name']}, {row['memory.used']}/{row['memory.total']} MiB, "
-            f"{row['utilization.gpu']}% utilization, {row['temperature.gpu']} °C"
+            f"{row['utilization.gpu']}% utilization, {row['temperature.gpu']} °C{suffix}"
         )
     processes = data["compute_processes"]
     if not processes.get("rows"):

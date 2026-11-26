@@ -1,11 +1,15 @@
 """Execute suites, archive their measured samples and compare matched cases."""
 
+import asyncio
 import hashlib
 import json
+import shlex
+from urllib.parse import urlsplit
 
 import httpx
 
 from tools.common.config import load_config
+from tools.common.remote import Executor
 
 from . import client
 from .stats import paired_bootstrap_ci, summarize
@@ -56,7 +60,85 @@ async def canary(send, case):
     )
 
 
-async def run(args, root, result):
+def _default_url(bind):
+    parts = urlsplit("//" + bind)
+    if parts.hostname in {"0.0.0.0", "::"} and parts.port:
+        return f"http://127.0.0.1:{parts.port}"
+    return "http://" + bind
+
+
+def _remote_workload_path(path, root, flag):
+    if path is None:
+        return None
+    try:
+        return path.resolve().relative_to(root.resolve()).as_posix()
+    except ValueError as exc:
+        raise ValueError(
+            f"Remote bench run requires {flag} inside the repository (or pass --local)"
+        ) from exc
+
+
+def run_remote(cfg, args, root, result):
+    bench_rel = _remote_workload_path(args.bench_file, root, "--bench-file")
+    canary_rel = _remote_workload_path(args.canary_file, root, "--canary-file")
+    python = args.python or cfg.bench.python or "python3"
+    cmd = [
+        python,
+        "-m",
+        "tools.bench_cli",
+        "--json",
+        "run",
+        "--local",
+        "--no-archive",
+        "--url",
+        _default_url(cfg.server.bind),
+        "--suite",
+        args.suite,
+        "--rounds",
+        str(args.rounds),
+        "--warmup",
+        str(args.warmup),
+        "--telemetry",
+        args.telemetry,
+        "--timeout",
+        str(args.timeout),
+    ]
+    if args.model:
+        cmd.extend(["--model", args.model])
+    if bench_rel:
+        cmd.extend(["--bench-file", bench_rel])
+    if canary_rel:
+        cmd.extend(["--canary-file", canary_rel])
+    input_text = None
+    if args.api_key:
+        cmd.append("--api-key-stdin")
+        input_text = args.api_key + "\n"
+    executor = Executor(cfg)
+    executor.sync()
+    reply = executor.run(
+        shlex.join(cmd), input_text=input_text, stream_stderr=True, echo_stdout=False
+    )
+    try:
+        remote = json.loads(reply.stdout)
+    except json.JSONDecodeError as exc:
+        detail = reply.stderr.strip() or f"Remote bench failed (exit {reply.returncode})"
+        raise RuntimeError(detail) from exc
+    if not isinstance(remote, dict) or not {"ok", "data"} <= remote.keys():
+        raise RuntimeError("Unexpected remote bench output")
+    result.ok = bool(remote["ok"])
+    result.error = remote.get("error")
+    result.data.update(remote["data"])
+
+
+def dispatch_run(args, root, result):
+    cfg = load_config(repo_root=root, allow_missing=True)
+    if cfg.is_remote and not args.local and not args.url:
+        run_remote(cfg, args, root, result)
+    else:
+        asyncio.run(run(args, root, result, cfg=cfg))
+
+
+async def run(args, root, result, *, cfg=None):
     suites = (*PERF, "canary") if args.suite == "all" else (args.suite,)
     workloads = {}
     for filename, selected in [
@@ -68,8 +150,8 @@ async def run(args, root, result):
     ]:
         if selected:
             workloads.update(load_workloads(filename, selected))
-    url = args.url or "http://" + load_config(repo_root=root, allow_missing=True).server.bind
-    url = url.rstrip("/")
+    cfg = cfg or load_config(repo_root=root, allow_missing=True)
+    url = (args.url or _default_url(cfg.server.bind)).rstrip("/")
     model = args.model or await client.discover_model(url, args.api_key, args.timeout)
     server = await client.probe_ready(url, args.timeout)
     hashes = {
