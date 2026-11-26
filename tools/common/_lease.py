@@ -1,5 +1,7 @@
 """Single-host lease operations. Also sent verbatim to Python on the GPU host."""
 
+from __future__ import annotations
+
 import fcntl
 import getpass
 import json
@@ -33,6 +35,12 @@ class LockStatus:
     stale_reason: str | None
     record: LeaseRecord | None
     lock_file: str
+
+    def to_public_dict(self) -> dict:
+        snapshot = asdict(self)
+        if snapshot["record"] is not None:
+            del snapshot["record"]["token"]
+        return snapshot
 
 
 class GpuLockError(RuntimeError):

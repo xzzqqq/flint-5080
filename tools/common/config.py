@@ -1,11 +1,14 @@
 """Local configuration and shell environment shared by the tooling CLIs."""
 
+from __future__ import annotations
+
 import os
 import re
 import shlex
 import tomllib
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
+from typing import get_type_hints
 
 
 class ConfigError(RuntimeError):
@@ -105,6 +108,21 @@ class DevConfig:
     def remote_workspace_dir(self) -> str:
         return str(PurePosixPath(self.remote.workspaces_root) / self.effective_workspace_name)
 
+    def resolve_model_dir(
+        self, override: str | Path | None = None, *, error_message: str | None = None
+    ) -> PurePosixPath:
+        if override:
+            return PurePosixPath(override)
+        if self.model.weights_dir:
+            return PurePosixPath(self.shared.models_dir) / self.model.weights_dir
+        raise ConfigError(error_message or "Set model.weights_dir in .dev.toml or pass --path.")
+
+    def resolve_golden_dir(self, model_dir: str | PurePosixPath) -> PurePosixPath:
+        return (
+            PurePosixPath(self.weights.golden_dir or ".forge/golden")
+            / PurePosixPath(model_dir).name
+        )
+
     def remote_env_prefix(self) -> str:
         exports = []
         paths = [_shell_path(p) for p in self.remote.path_prepend]
@@ -133,7 +151,7 @@ def find_repo_root(start: Path | None = None) -> Path:
 def _section(name, cls, raw):
     if not isinstance(raw, dict):
         raise ConfigError(f"[{name}] must be a table")
-    schema = {f.name: f.type for f in fields(cls)}
+    schema = get_type_hints(cls)
     for key, value in raw.items():
         expected = schema.get(key)
         if expected == list[str]:
@@ -172,9 +190,9 @@ def load_config(
         raise ConfigError(f"Cannot read {path}: {exc}") from exc
 
     cfg = DevConfig(root, path)
-    sections = {f.name: f.type for f in fields(cfg) if f.name not in {"repo_root", "config_path"}}
+    sections = get_type_hints(DevConfig)
     for name, value in raw.items():
-        if name not in sections:
+        if name not in sections or name in {"repo_root", "config_path"}:
             raise ConfigError(f"Unknown config section {name}")
         setattr(cfg, name, _section(name, sections[name], value))
     if path is None or os.environ.get("FLINT_LOCAL") == "1":

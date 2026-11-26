@@ -5,6 +5,7 @@ import io
 import json
 import os
 import shlex
+import sys
 import tempfile
 import unittest
 from contextlib import chdir, redirect_stderr, redirect_stdout
@@ -14,10 +15,40 @@ from unittest.mock import MagicMock, patch
 
 from tools.common._lease import inspect_local, renew_local
 from tools.common.config import DevConfig
+from tools.common.daemon import alive, atomic_json
 from tools.common.gpu_lock import GpuLeaseManager
 from tools.common.output import RunResult
+from tools.common.remote import Executor
 from tools.forge_cli import __main__ as cli
 from tools.forge_cli import commands, host
+
+HOST_STUB = """
+import json, os, signal, socket, sys
+from pathlib import Path
+
+if "--stubborn" in sys.argv:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+
+with socket.socket(socket.AF_UNIX) as server:
+    server.bind(".forge/host.sock")
+    server.listen()
+    while True:
+        conn, _ = server.accept()
+        with conn, conn.makefile("rb") as reader:
+            request = json.loads(reader.readline())
+            cmd = request["command"]
+            reply = {"ok": True, "pid": os.getpid(), "launcher": os.getppid()}
+            if cmd == "run":
+                reply["count"] = len(request["input_ids"])
+                reply["sum"] = sum(request["input_ids"])
+            if cmd == "shutdown":
+                Path("shutdown").touch()
+                if "--stubborn" in sys.argv:
+                    continue
+            conn.sendall(json.dumps(reply).encode() + b"\\n")
+            if cmd == "shutdown":
+                break
+"""
 
 
 class ForgeCLI(unittest.TestCase):
@@ -78,12 +109,14 @@ class ForgeCLI(unittest.TestCase):
 
                 execute(["run", "--no-graph", "--layers", "0..4"])
                 ex.sync.assert_called_once_with()
-                build, request = [c.args[0] for c in ex.run.call_args_list]
+                build_call, request = ex.run.call_args_list
+                build = build_call.args[0]
                 self.assertIn("if ! test -f engine/build/build.ninja", build)
                 self.assertIn("cmake --build engine/build --target forward --parallel 4", build)
-                argv = shlex.split(request)
+                argv = shlex.split(request.args[0])
                 self.assertEqual(argv[0], "python3" if remote else commands.sys.executable)
-                q = json.loads(argv[-1])
+                self.assertEqual(argv[1:], ["-m", "tools.forge_cli.host", "run"])
+                q = json.loads(request.kwargs["input_text"])
                 self.assertEqual(q["input_ids"], [4, 5])
                 self.assertFalse(q["use_cuda_graph"])
                 self.assertEqual((q["begin_visit"], q["end_visit"]), (0, 4))
@@ -175,7 +208,9 @@ class ForgeCLI(unittest.TestCase):
             record = inspect_local(lock).record
             self.assertEqual((record.mode, record.token), ("forge", q["token"]))
             renew_local(lock, record.token, 600, os.getpid())
-            host.atomic_json(host.INFO, dict(token=record.token, lock=lock))
+            atomic_json(
+                host.INFO, dict(token=record.token, lock=lock, pid=os.getpid(), pid_start="old")
+            )
             return {"pid": os.getpid(), "heartbeat": 1}
 
         with chdir(self.cfg.repo_root), patch.object(commands, "host_call", launch):
@@ -184,14 +219,57 @@ class ForgeCLI(unittest.TestCase):
             self.assertEqual(rec.pid, os.getpid())
             manager.release_unbound(rec.token)
             self.assertTrue(manager.inspect().locked)
-            with patch.object(host, "alive", return_value=False):
-                self.assertTrue(host.stop(False)["stopped"])
+            self.assertTrue(host.stop(False)["stopped"])
             self.assertIsNone(manager.inspect().record)
             self.assertFalse(host.INFO.exists())
         with patch.object(commands, "host_call", side_effect=RuntimeError("launch failed")):
             with self.assertRaisesRegex(RuntimeError, "launch failed"):
                 commands.execute(self.cfg, args, result)
         self.assertFalse(manager.inspect().locked)
+
+    def test_supervised_host_rpc_and_shutdown(self):
+        # A local profiler stand-in keeps the launcher PID distinct from the IPC target.
+        root = self.cfg.repo_root
+        nsys = root / "nsys"
+        nsys.write_text(
+            f"#!{sys.executable}\nimport subprocess, sys\n"
+            "sys.exit(subprocess.call(sys.argv[sys.argv.index('-o') + 2:]))\n"
+        )
+        nsys.chmod(0o755)
+        stub = root / "host.py"
+        stub.write_text(HOST_STUB)
+        ex = Executor(self.cfg)
+        lease = GpuLeaseManager(self.cfg, ex)
+        env = dict(
+            PATH=str(root) + os.pathsep + os.environ["PATH"],
+            PYTHONPATH=str(Path(__file__).resolve().parents[2]),
+        )
+        with patch.dict(os.environ, env):
+            for force in (False, True):
+                with self.subTest(force=force):
+                    args = [sys.executable, str(stub), "--no-model"]
+                    if force:
+                        args.append("--stubborn")
+                    record = lease.acquire("forge")
+                    cfg = dict(argv=args, lock=self.cfg.shared.lock_file, token=record.token, ttl=2)
+                    info_path = root / host.INFO
+                    started = commands.host_call(ex, "start", cfg)
+                    try:
+                        info = json.loads(info_path.read_text())
+                        self.assertTrue(info["session"] and info["no_model"])
+                        self.assertEqual(lease.inspect().record.pid, started["pid"])
+                        self.assertNotEqual(started["pid"], started["launcher"])
+                        ids = list(range(80_000))
+                        reply = commands.host_call(ex, "run", {"command": "run", "input_ids": ids})
+                        self.assertEqual((reply["count"], reply["sum"]), (len(ids), sum(ids)))
+                        self.assertTrue(commands.host_call(ex, "stop", {"force": force})["stopped"])
+                    finally:
+                        if info_path.exists():
+                            commands.host_call(ex, "stop", {"force": True})
+                    self.assertFalse(alive(info, "pid") or alive(info, "heartbeat"))
+                    self.assertFalse(info_path.exists() or (root / host.SOCKET).exists())
+                    self.assertIsNone(lease.inspect().record)
+                    (root / "shutdown").unlink()  # Both stop paths attempted IPC first.
 
     def test_json_archive_human_output_and_errors(self):
         self.cfg.remote.enabled = True

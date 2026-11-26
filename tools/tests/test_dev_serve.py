@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from tools.common.daemon import alive, atomic_json, lifecycle_lock, wait_for
 from tools.common.gpu_lock import GpuLeaseManager, GpuLockBusyError
 from tools.common.remote import Executor
 from tools.dev_cli import __main__ as cli
@@ -184,3 +185,29 @@ def test_server_exit_releases_lease_and_cleans_state(local):
         time.sleep(0.05)
     assert not info.exists()
     assert not run("status")["lease"]["locked"]
+
+
+def test_supervisor_signal_preserves_replacement_state(local):
+    cfg, run, binary = local
+    install(binary)
+    run("start")
+    state = cfg.repo_root / ".serve"
+    path = state / "daemon.json"
+    info = json.loads(path.read_text())
+    manager = GpuLeaseManager(cfg, Executor(cfg))
+
+    # Hold the lock until the old supervisor has released its lease, then publish a new owner.
+    with lifecycle_lock(state):
+        os.kill(info["heartbeat"], signal.SIGTERM)
+        wait_for(lambda: manager.inspect().record is None, 5, "old lease release")
+        replacement = manager.acquire("replacement")
+        new_info = dict(info, token=replacement.token)
+        atomic_json(path, new_info)
+    try:
+        wait_for(lambda: not alive(info, "heartbeat"), 5, "old supervisor exit")
+        assert not alive(info, "pid")
+        assert json.loads(path.read_text()) == new_info
+        assert manager.inspect().record == replacement
+    finally:
+        path.unlink(missing_ok=True)
+        manager.release(replacement.token)

@@ -1,11 +1,11 @@
 """Execution-host operations. Also runs on the GPU host's system Python 3.10."""
 
-import contextlib
+from __future__ import annotations
+
 import fcntl
 import json
 import os
 import shutil
-import signal
 import socket
 import subprocess
 import sys
@@ -14,15 +14,20 @@ import time
 from pathlib import Path
 from uuid import uuid4
 
-from tools.common._lease import GpuLockError, release_local, renew_local
-from tools.common.daemon import alive, atomic_json, identity, wait_for
+from tools.common.daemon import (
+    ReadyProcess,
+    spawn_supervisor,
+    stop_supervised_process,
+    supervise_leased_process,
+    wait_for,
+)
 
 STATE = Path(".forge")
 INFO = STATE / "daemon.json"
 SOCKET = STATE / "host.sock"
 
 
-def ipc(request, timeout=1800):
+def ipc(request: dict, timeout: float = 1800) -> dict:
     with socket.socket(socket.AF_UNIX) as client:
         client.settimeout(timeout)
         client.connect(str(SOCKET))
@@ -34,9 +39,7 @@ def ipc(request, timeout=1800):
     return data
 
 
-def supervise():
-    cfg = json.loads(sys.stdin.readline())
-    token, lock, ttl = cfg["token"], cfg["lock"], cfg["ttl"]
+def supervise(cfg: dict) -> None:
     session = "flint-" + uuid4().hex if shutil.which("nsys") else ""
     command = cfg["argv"]
     if session:
@@ -56,112 +59,62 @@ def supervise():
             str(profiles / session),
             *command,
         ]
-    proc = None
-    info = None
-    try:
-        renew_local(lock, token, ttl, pid=os.getpid())
-        proc = subprocess.Popen(command, stdin=subprocess.DEVNULL)
-        started = time.monotonic()
-        while True:
-            if proc.poll() is not None:
-                raise RuntimeError(f"forge-host launcher exited ({proc.returncode})")
-            try:
-                status = ipc({"command": "status"})
-                break
-            except (FileNotFoundError, ConnectionRefusedError):
-                if time.monotonic() - started > 90:
-                    raise RuntimeError("forge-host failed to become ready") from None
-                renew_local(lock, token, ttl)
-                time.sleep(min(0.2, ttl / 4))
-        pid = status["pid"]
-        renew_local(lock, token, ttl, pid=pid)
-        info = dict(
-            pid=pid,
-            pid_start=identity(pid),
-            heartbeat=os.getpid(),
-            heartbeat_start=identity(os.getpid()),
-            token=token,
-            lock=lock,
-            session=session,
-            no_model="--no-model" in cfg["argv"],
-            load_ms=(time.monotonic() - started) * 1000,
-        )
-        atomic_json(INFO, info)
-        renewed = time.monotonic()
-        while alive(info, "pid"):
-            proc.poll()
-            if time.monotonic() - renewed >= ttl / 3:
-                renew_local(lock, token, ttl)
-                renewed = time.monotonic()
-            time.sleep(min(0.2, ttl / 4))
-    finally:
-        if info and alive(info, "pid"):
-            os.kill(info["pid"], signal.SIGTERM)
-        if proc and proc.poll() is None:
-            if not info:
-                proc.terminate()
-            try:
-                proc.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-        with contextlib.suppress(GpuLockError):
-            release_local(lock, token)
+    started = time.monotonic()
 
-
-def start(cfg):
-    STATE.mkdir(mode=0o700, exist_ok=True)
-    if INFO.exists():
-        existing = json.loads(INFO.read_text())
-        if "remote" not in existing and alive(existing, "pid"):
-            raise RuntimeError("forge-host is already running")
-    INFO.unlink(missing_ok=True)
-    SOCKET.unlink(missing_ok=True)
-    log_path = STATE / "host.log"
-    with log_path.open("w") as log:
-        supervisor = subprocess.Popen(
-            [sys.executable, "-m", "tools.forge_cli.host", "supervise"],
-            stdin=subprocess.PIPE,
-            stdout=log,
-            stderr=log,
-            start_new_session=True,
-        )
-    supervisor.stdin.write(json.dumps(cfg).encode() + b"\n")
-    supervisor.stdin.close()
-
-    def ready():
-        if supervisor.poll() is not None:
-            raise RuntimeError(log_path.read_text()[-2000:] or "forge-host startup failed")
-        return INFO.is_file()
-
-    wait_for(ready, 130, "forge-host startup")
-    info = json.loads(INFO.read_text())
-    return dict(**ipc({"command": "status"}), load_ms=info["load_ms"], heartbeat=info["heartbeat"])
-
-
-def stop(force):
-    if not INFO.exists():
-        return {"stopped": False}
-    info = json.loads(INFO.read_text())
-    if "remote" in info:
-        return {"stopped": False}
-    if alive(info, "pid"):
+    def check_ready(proc: subprocess.Popen) -> ReadyProcess | None:
         try:
-            ipc({"command": "shutdown"}, timeout=5 if force else 180)
-            wait_for(lambda: not alive(info, "pid"), 20, "forge-host exit")
-        except (OSError, ValueError, RuntimeError):
-            if not force:
-                raise
-            if alive(info, "pid"):
-                os.kill(info["pid"], signal.SIGTERM)
-        wait_for(lambda: not alive(info, "pid"), 20, "forge-host exit")
-    wait_for(lambda: not alive(info, "heartbeat"), 45, "lease heartbeat exit")
-    # Covers unexpected heartbeat termination. A replacement lease owns a different token.
-    with contextlib.suppress(GpuLockError):
-        release_local(info["lock"], info["token"])
-    INFO.unlink(missing_ok=True)
-    SOCKET.unlink(missing_ok=True)
-    return {"stopped": True}
+            status = ipc({"command": "status"}, timeout=min(1, cfg["ttl"] / 4))
+        except (FileNotFoundError, ConnectionRefusedError, TimeoutError):
+            return None
+        return ReadyProcess(
+            status["pid"],
+            dict(
+                session=session,
+                no_model="--no-model" in cfg["argv"],
+                load_ms=(time.monotonic() - started) * 1000,
+            ),
+        )
+
+    supervise_leased_process(
+        STATE,
+        command,
+        check_ready,
+        lock=cfg["lock"],
+        token=cfg["token"],
+        ttl=cfg["ttl"],
+        name="forge-host",
+        startup_timeout=90,
+        cleanup_paths=(SOCKET,),
+    )
+
+
+def start(cfg: dict) -> dict:
+    def started(info: dict) -> dict:
+        return dict(
+            **ipc({"command": "status"}, timeout=5),
+            load_ms=info["load_ms"],
+            heartbeat=info["heartbeat"],
+        )
+
+    return spawn_supervisor(
+        STATE,
+        "tools.forge_cli.host",
+        cfg,
+        name="forge-host",
+        log_path=STATE / "host.log",
+        startup_timeout=130,
+        prepare=lambda: SOCKET.unlink(missing_ok=True),
+        started=started,
+    )
+
+
+def stop(force: bool) -> dict:
+    def shutdown() -> None:
+        ipc({"command": "shutdown"}, timeout=5 if force else 180)
+
+    return stop_supervised_process(
+        STATE, force=force, graceful_stop=shutdown, cleanup_paths=(SOCKET,)
+    )
 
 
 def candidates():
@@ -198,12 +151,13 @@ def capture(q):
     return data
 
 
-def dispatch(op, q):
-    if op in {"start", "stop"}:
-        STATE.mkdir(mode=0o700, exist_ok=True)
-        with (STATE / "lifecycle.lock").open("a") as guard:
-            fcntl.flock(guard, fcntl.LOCK_EX)
-            return start(q) if op == "start" else stop(q["force"])
+def dispatch(op: str, q: dict) -> dict | None:
+    if op == "supervise":
+        return supervise(q)
+    if op == "start":
+        return start(q)
+    if op == "stop":
+        return stop(q["force"])
     if op == "ls":
         return {"candidates": candidates()}
     if op == "rm":
@@ -224,10 +178,9 @@ def dispatch(op, q):
 
 
 if __name__ == "__main__":
-    if sys.argv[1] == "supervise":
-        supervise()
-    else:
-        try:
-            print(json.dumps(dispatch(sys.argv[1], json.loads(sys.argv[2]))))
-        except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
-            sys.exit(str(exc))
+    try:
+        result = dispatch(sys.argv[1], json.load(sys.stdin))
+        if result is not None:
+            print(json.dumps(result))
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+        sys.exit(str(exc))

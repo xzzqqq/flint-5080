@@ -1,5 +1,7 @@
 """Offline weight inspection and reference fixture commands."""
 
+from __future__ import annotations
+
 import json
 import shlex
 import sys
@@ -7,7 +9,6 @@ from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 
-from tools.common.config import ConfigError
 from tools.common.gpu_lock import GpuLeaseManager
 from tools.common.remote import Executor
 
@@ -15,11 +16,7 @@ from . import _inspect
 
 
 def inspect(cfg, args, result):
-    path = args.path
-    if not path:
-        if not cfg.model.weights_dir:
-            raise ConfigError("Set model.weights_dir in .dev.toml or pass --path.")
-        path = Path(cfg.shared.models_dir) / cfg.model.weights_dir
+    path = cfg.resolve_model_dir(args.path)
     if args.local or not cfg.is_remote:
         result.data.update(_inspect.inspect_directory(path, include_tensors=args.tensors))
     else:
@@ -34,14 +31,12 @@ def inspect(cfg, args, result):
 def golden(cfg, args, result):
     if args.local:
         cfg = replace(cfg, remote=replace(cfg.remote, enabled=False))
-    if not args.path and not cfg.model.weights_dir:
-        raise ConfigError("Set model.weights_dir in .dev.toml or pass --path.")
+    path = cfg.resolve_model_dir(args.path)
     if args.steps is not None and args.steps < 1:
         raise ValueError("--steps must be positive")
     if args.skip_e2e and args.skip_ops:
         raise ValueError("Select at least one fixture tier.")
-    path = Path(args.path or Path(cfg.shared.models_dir) / cfg.model.weights_dir)
-    out = args.out or str(Path(cfg.weights.golden_dir or ".forge/golden") / path.name)
+    out = args.out or str(cfg.resolve_golden_dir(path))
     python = args.python or cfg.weights.python or ("python3" if cfg.is_remote else sys.executable)
     command = [
         python,
@@ -80,14 +75,12 @@ def golden(cfg, args, result):
 def chat_golden(cfg, args, result):
     if args.local:
         cfg = replace(cfg, remote=replace(cfg.remote, enabled=False))
-    if not args.path and not cfg.model.weights_dir:
-        raise ConfigError("Set model.weights_dir in .dev.toml or pass --path.")
-    path = args.path or str(Path(cfg.shared.models_dir) / cfg.model.weights_dir)
+    path = cfg.resolve_model_dir(args.path)
     python = args.python or cfg.weights.python or ("python3" if cfg.is_remote else sys.executable)
     executor = Executor(cfg)
     if cfg.is_remote:
         executor.sync()
-    command = shlex.join([python, "-m", "tools.weights_cli._chat_golden", path])
+    command = shlex.join([python, "-m", "tools.weights_cli._chat_golden", str(path)])
     reply = executor.run(command, check=True, stream_stderr=True, echo_stdout=False)
     data = json.loads(reply.stdout)
     counts = {

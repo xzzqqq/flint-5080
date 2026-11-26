@@ -2,6 +2,7 @@ import os
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict
 from pathlib import Path
 
 import pytest
@@ -137,3 +138,17 @@ def test_remote_before_sync(cfg, tmp_path, monkeypatch):
     manager.release(rec.token)
     assert not manager.inspect().locked
     assert not Path(cfg.remote_workspace_dir).exists()
+
+
+def test_inspect_public(manager, monkeypatch):
+    assert manager.inspect_public() == asdict(manager.inspect())
+    record = manager.acquire("forge")
+    for now in (record.heartbeat_at, record.expires_at):
+        monkeypatch.setattr(_lease.time, "time", lambda now=now: now)
+        status = manager.inspect()
+        snapshot = status.to_public_dict()
+        assert snapshot == manager.inspect_public()
+        assert "token" not in snapshot["record"]
+        assert dict(snapshot["record"], token=record.token) == asdict(record)
+        assert snapshot["locked"] == (now < record.expires_at)
+        assert status.record.token == record.token

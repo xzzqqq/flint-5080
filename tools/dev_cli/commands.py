@@ -1,5 +1,7 @@
 """Implementation of the dev subcommands."""
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -7,9 +9,10 @@ import shlex
 import shutil
 import subprocess
 import sys
-from dataclasses import asdict, replace
-from pathlib import Path, PurePosixPath
+from dataclasses import replace
+from pathlib import Path
 
+from tools.common.build import engine_build_script
 from tools.common.config import ConfigError, load_config
 from tools.common.gpu_lock import GpuLeaseManager, GpuLockError
 from tools.common.output import RunResult, log
@@ -60,62 +63,13 @@ def status(cfg, args, result):
     else:
         data.update(_probe.inventory(cfg.repo_root))
     try:
-        lease = asdict(GpuLeaseManager(cfg, executor).inspect())
-        if lease["record"]:
-            del lease["record"]["token"]
-        data["lease"] = lease
+        data["lease"] = GpuLeaseManager(cfg, executor).inspect_public()
     except (GpuLockError, OSError, subprocess.TimeoutExpired) as exc:
         error = (
             "Lease inspection timed out" if isinstance(exc, subprocess.TimeoutExpired) else str(exc)
         )
         data["lease"] = {"error": error}
         result.ok, result.error = False, result.error or error
-
-
-def _engine_script(cfg, clean, targets=(), incremental=False):
-    build = cfg.build
-    flags = [
-        "cmake",
-        "-S",
-        "engine",
-        "-B",
-        "engine/build",
-        "-G",
-        "Ninja",
-        f"-DCMAKE_BUILD_TYPE={build.build_type}",
-        f"-DCMAKE_CUDA_ARCHITECTURES={build.cuda_arch}",
-    ]
-    configure = shlex.join(flags)
-    for lang in ("C", "CXX", "CUDA"):
-        configure += f' "-DCMAKE_{lang}_COMPILER_LAUNCHER=$launcher"'
-    for kind in ("EXE", "SHARED", "MODULE"):
-        configure += f' "-DCMAKE_{kind}_LINKER_FLAGS=$link_flags"'
-    compile_args = ["cmake", "--build", "engine/build"]
-    if targets:
-        compile_args.extend(["--target", *targets])
-    compile_args.append("--parallel")
-    if build.jobs:
-        compile_args.append(str(build.jobs))
-    lines = [
-        f"use_ccache={1 if build.use_ccache else 0}",
-        'launcher=""',
-        'if [ "$use_ccache" = 1 ] && command -v ccache >/dev/null; then launcher=ccache; fi',
-        f"linker={shlex.quote(build.linker)}",
-        'if [ "$linker" = auto ]; then',
-        "    if command -v mold >/dev/null; then linker=mold",
-        "    elif command -v ld.lld >/dev/null; then linker=lld",
-        "    else linker=system",
-        "    fi",
-        "fi",
-        'link_flags=""',
-        'if [ "$linker" != system ] && [ -n "$linker" ]; then link_flags="-fuse-ld=$linker"; fi',
-    ]
-    if clean:
-        lines.append("rm -rf engine/build")
-    if incremental:
-        configure = f"if ! test -f engine/build/build.ninja; then {configure}; fi"
-    lines.extend([configure, shlex.join(compile_args)])
-    return "\n".join(lines)
 
 
 def _server_script(cfg, clean):
@@ -161,7 +115,7 @@ def build(cfg, args, result):
         }
     targets = result.data["targets"] = {}
     for target, manifest, script in (
-        ("engine", "engine/CMakeLists.txt", _engine_script),
+        ("engine", "engine/CMakeLists.txt", engine_build_script),
         ("server", "server/Cargo.toml", _server_script),
     ):
         if args.target not in ("all", target):
@@ -170,7 +124,9 @@ def build(cfg, args, result):
             f"test -f {manifest} || "
             f'{{ echo "Missing {manifest}. Add the {target} build manifest first." >&2; exit 1; }}'
         )
-        out = executor.run("set -e\n" + check + "\n" + script(cfg, args.clean), stream_stderr=True)
+        out = executor.run(
+            "set -e\n" + check + "\n" + script(cfg, clean=args.clean), stream_stderr=True
+        )
         targets[target] = {"duration_ms": out.duration_ms, "returncode": out.returncode}
         if out.returncode:
             result.ok = False
@@ -389,10 +345,10 @@ def check(cfg, args, result):
     if args.local:
         _check_local(cfg, checks)
     else:
-        if not cfg.model.weights_dir:
-            raise ValueError("Set model.weights_dir in .dev.toml for GPU acceptance checks")
-        model_dir = PurePosixPath(cfg.shared.models_dir) / cfg.model.weights_dir
-        golden_dir = PurePosixPath(cfg.weights.golden_dir or ".forge/golden") / model_dir.name
+        model_dir = cfg.resolve_model_dir(
+            error_message="Set model.weights_dir in .dev.toml for GPU acceptance checks"
+        )
+        golden_dir = cfg.resolve_golden_dir(model_dir)
         executor = Executor(cfg)
         executor.sync()
         with GpuLeaseManager(cfg, executor).hold("dev-check"):
@@ -416,13 +372,11 @@ def serve(cfg, args, result):
         data.update(json.loads(reply.stdout))
 
     if args.action == "start":
-        model_dir = args.model_dir
-        if model_dir is None:
-            if not cfg.model.weights_dir:
-                raise ValueError("Set model.weights_dir or pass --model-dir")
-            model_dir = str(PurePosixPath(cfg.shared.models_dir) / cfg.model.weights_dir)
+        model_dir = cfg.resolve_model_dir(
+            args.model_dir, error_message="Set model.weights_dir or pass --model-dir"
+        )
         bind = args.bind or cfg.server.bind
-        argv = ["--bind", bind, "--model-dir", model_dir]
+        argv = ["--bind", bind, "--model-dir", str(model_dir)]
         for key in (
             "model_name",
             "max_context",
@@ -460,10 +414,7 @@ def serve(cfg, args, result):
             lease.release_unbound(record.token)
             raise
     elif args.action == "status":
-        snapshot = asdict(lease.inspect())
-        if snapshot["record"]:
-            del snapshot["record"]["token"]
-        data["lease"] = snapshot
+        data["lease"] = lease.inspect_public()
         call({})
     elif args.action == "logs":
         call({"lines": args.lines})

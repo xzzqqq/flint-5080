@@ -1,5 +1,6 @@
 import os
 import subprocess
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -91,3 +92,25 @@ def test_remote_env_is_shell_safe(cfg):
     cfg.remote.cuda_home = cfg.shared.ccache_dir = ""
     assert "CUDA_HOME" not in cfg.remote_env_prefix()
     assert "CCACHE_DIR" not in cfg.remote_env_prefix()
+
+
+def test_resolve_model_dir(cfg):
+    with pytest.raises(ConfigError, match="model.weights_dir"):
+        cfg.resolve_model_dir()
+    with pytest.raises(ConfigError, match="Use --model-dir"):
+        cfg.resolve_model_dir(error_message="Use --model-dir")
+    assert cfg.resolve_model_dir(Path("custom/model")) == PurePosixPath("custom/model")
+    cfg.shared.models_dir = "/shared models"
+    cfg.model.weights_dir = "weights/mini"
+    assert cfg.resolve_model_dir() == PurePosixPath("/shared models/weights/mini")
+    assert cfg.resolve_model_dir("/override") == PurePosixPath("/override")
+    cfg.model.weights_dir = "/absolute/mini"
+    assert cfg.resolve_model_dir() == PurePosixPath("/absolute/mini")
+
+
+def test_resolve_golden_dir(cfg):
+    assert cfg.resolve_golden_dir("/models/mini/") == PurePosixPath(".forge/golden/mini")
+    cfg.weights.golden_dir = "/reference fixtures"
+    assert cfg.resolve_golden_dir(PurePosixPath("mini")) == PurePosixPath(
+        "/reference fixtures/mini"
+    )

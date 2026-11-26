@@ -126,7 +126,7 @@ char* engine_stats_json(EngineHandle* h); // 返回 JSON 快照供 /ready 与 P1
 
 **接口契约要点**：
 - **Rust 侧对底层完全无知**：不感知层数、KV 格式/页表、投机解码细节或 Host KV-RAM。
-- **回调事件**：每次产出 token 或结束时回调极小结构体，完成事件附带**服务端精确遥测**（`prefill_tokens`、`cached_prefix_tokens`、`decode_tokens`、`prefill_ms`、`decode_ms`、`decode_rounds`、`spec_accepted`）及**结构化错误码**（`ContextOverflow` / `InvalidInput` / `Cancelled` / `InternalError`）。
+- **回调事件**：Request ABI v2 的 `DONE` 携带最终遥测（`prefill_tokens`、`cached_prefix_tokens`、`decode_tokens`、`prefill_ms`、`decode_ms`、`decode_rounds`、`spec_accepted`）和 `EngineStopReason`。引擎区分模型 EOS、调用方停止 token、输出 token 上限和上下文上限，Rust 结合停止字符串与工具调用生成 HTTP `finish_reason`。`TOKENS` 和 `ERROR` 的 `stop_reason` 均为 `ENGINE_STOP_NONE`，错误码（`ContextOverflow` / `InvalidInput` / `Cancelled` / `Internal`）由 `ERROR.status` 返回。
 - **零热路径开销**：每轮 decode（10–20 ms）仅回调一次推送本轮产出的 1~K 个 token IDs，Rust 侧转发至 `tokio::sync::mpsc` 驱动 SSE。
 
 ---
@@ -146,7 +146,7 @@ char* engine_stats_json(EngineHandle* h); // 返回 JSON 快照供 /ready 与 P1
 ```
 
 - **`forge-host` 与 `forward.so` 均为全速 Release（`-O3`、`sm_120a`、CUDA Graph 全开）构建**，绝非 Debug 构建。
-- `libengine.a` 与 `forward.so` 共用 `engine_model` 中的 `InklingRunner`。Forge 的 ABI v3 适配层负责转换请求与结果，返回的 `num_block_out` 表示活跃残差块数。
+- `libengine.a` 与 `forward.so` 共用 `engine_model` 中的 `InklingRunner`。Forge ABI v4 与 runner 共用 `model/forward_types.h` 中的请求和结果类型，返回的 `num_block_out` 表示活跃残差块数。
 - `forge start --no-model` 和 `forge-host --smoke` 加载 `stub_forward.so`。回放使用相同的 BF16 隐状态、carry 和按 visit 定位的 KV/卷积快照。
 - 两种形态互斥使用 5080（由单卡 lease 锁强制防撞车）。
 
@@ -161,7 +161,7 @@ char* engine_stats_json(EngineHandle* h); // 返回 JSON 快照供 /ready 与 P1
   - **兼容跨层融合**：区间内部（如 `0..4` 内的相邻层衔接）允许任意跨层融合（fused residual+norm、跨层 PDL 等），仅在区间首尾对齐标准残差流。
   - **自动懒录制**：首次对 `(case, layers)` 执行局部回放时，宿主自动用基准 `baseline.so` 跑一遍真实请求，在 `begin` 层入口自动截获真实 `hidden_state`、位置信息及该区间 KV/状态并缓存，同时存下 `end` 层参考输出；后续所有迭代直接命中缓存复用，**零注册宏、零手工前置**。
 - **显存安全与调试对照开关**：
-  - **静态 Arena + 热重载泄漏检查**：热路径严禁动态 `cudaMalloc`；`forward.so` 只能使用宿主提供的 Workspace Arena，所有 Graph/stream/event 挂在统一 `ForwardContext` 析构。宿主在 `dlopen` 前与 `dlclose` 后调用 `cudaMemGetInfo` 比对剩余显存，超阈值（如 >4 MB）直接打印 `WARN`。
+  - **静态 Arena + 热重载泄漏检查**：热路径严禁动态 `cudaMalloc`；A/B 模块在同一条流上轮流使用宿主的 Scratch Arena，调用间可覆盖其中的全部内容。专家描述符常驻 Weights Arena，Graph/stream/event 随各自的 `ForwardContext` 析构。宿主在 `dlopen` 前与 `dlclose` 后调用 `cudaMemGetInfo` 比对剩余显存，超阈值（如 >4 MB）直接打印 `WARN`。
   - **内置零开销对照选项（`ForwardOptions`）**：支持 `use_cuda_graph`（`--no-graph` 退回 eager）、`use_speculative`（`--no-spec` 退回 AR-only）与 `return_logits`（供 teacher-forcing KLD 与 `dspark` 数学一致性验证）。
 
 ### 6.3 `forge` 核心原语（5 组正交命令 + 候选管理）
@@ -184,10 +184,10 @@ char* engine_stats_json(EngineHandle* h); // 返回 JSON 快照供 /ready 与 P1
 彻底取消 `Makefile` 与散装脚本，底层只留标准 `engine/CMakeLists.txt`（Ninja）与 `server/Cargo.toml`。所有开发/评测能力收归 `tools/`，由**纯 Python stdlib 底座（`tools/common/`）+ 4 个职责清晰、依赖隔离的顶层命令**组成：
 
 ### 7.1 共享底座（`tools/common/`，零第三方依赖）
-- **单一配置源**：本地 `.dev.toml`（不进 git，仓库提供 `.dev.toml.example`）管理远程 5080 SSH、工作目录、模型权重路径与默认 workload。
+- **单一配置源**：本地 `.dev.toml`（不进 git，仓库提供 `.dev.toml.example`）管理远程 5080 SSH、工作目录、模型权重路径与默认 workload。各 CLI 通过 `DevConfig` 解析模型与 golden 目录，`dev` 和 `forge` 共用 `common/build.py` 生成引擎构建命令。
 - **本地/远程透明一体**：在 Laptop 执行需 GPU/CUDA 的命令时自动增量同步源码 → 校验单卡锁 → 远程执行 → 回传摘要；在 Linux 5080 本机执行完全相同的命令时自动走本机路径。
 - **工作区隔离 + 大资产共享**：远程源码与 `build/` 按本地 worktree/workspace 名隔离（支持多分支/多 Agent 并行编辑不互踩）；模型权重目录与 `ccache` 缓存全局共享。
-- **带 Lease 的单卡锁**：`forge start` / `serve start` 共用轻量的 5080 占用锁（记录 owner、PID、heartbeat/lease），防止进程崩掉后死锁，也防止 `forge` 与 `server` 撞爆 16 GB 显存。
+- **单卡 lease 与进程监管**：`dev serve` 和 `forge` 通过标准输入向执行机发送 JSON 请求。`common/daemon.py` 在 HTTP 或 Unix socket 就绪后将 lease 从监管进程移交给目标 PID，定期续租，并在退出时持生命周期锁按 token 清理状态文件。
 - **Agent 原生输出契约**：终端默认输出简洁摘要；加 `--json` 时 **`stdout` 仅输出稳定 Schema 的纯净 JSON**（编译与同步日志走 `stderr`），每次运行自动归档至 `.runs/<id>.json`。
 
 ### 7.2 四个顶层入口（严格克制，禁止新增散装脚本）
@@ -215,17 +215,17 @@ flint-5080/
 │   ├── include/
 │   │   └── engine_api.h # 唯一对外 Request 级 C ABI
 │   ├── src/
-│   │   ├── common/      # 零第三方依赖的轻量内部公共头（如 JSON 解析）
-│   │   ├── loader/      # safetensors mmap loader + 静态 Arena 显存规划
-│   │   ├── runtime/     # VRAM Prefix Cache, 轻量调度循环, CUDA Graph, P1 KV-RAM 扩展位
-│   │   ├── model/       # 前向编排 run_layers(begin, end), AR + dspark verify
+│   │   ├── common/      # JSON 解析、CUDA 错误与 profiler 接口
+│   │   ├── loader/      # safetensors 加载、Arena 分配与 KV 快照布局
+│   │   ├── runtime/     # Request ABI、EngineRuntime 请求队列、前缀缓存与 prefill/decode
+│   │   ├── model/       # InklingRunner 前向编排与 CUDA Graph、注意力和 MoE 子模块
 │   │   ├── ops/         # sm_120a 无状态 CUDA 算子（严格单文件头文件隔离）
-│   │   └── forge/       # forge-host 常驻宿主、dlopen 热重载、懒录制缓存、显存泄漏检测
+│   │   └── forge/       # ForwardModule 热重载 DSO，Replay 管理懒录制、测量与显存泄漏检测，replay_metrics 对比数值与 golden
 │   ├── third_party/     # 版本锁定的外部 CUDA 库（如 CUTLASS/CuTe 等）
 │   └── tests/           # 引擎与算子 C++ 测试
 ├── server/              # 极薄单 Crate Rust HTTP 服务
 │   ├── Cargo.toml
-│   └── src/             # http(chat / P1 responses), tokenizer, template, parser(reasoning/toolcall), engine_ffi
+│   └── src/             # http、generation、tokenizer、template、parser、engine_ffi，checks.rs 运行 smoke 与 chat golden
 ├── tools/               # Python CLI 包（严禁进入生产运行路径）
 │   ├── common/          # 纯 stdlib 底座（config, remote sync, gpu lease lock, json output）
 │   ├── dev_cli/         # dev 命令实现

@@ -1,18 +1,19 @@
 """Controller-side orchestration, build and workload selection."""
 
+from __future__ import annotations
+
 import json
 import shlex
 import sys
 import time
-from dataclasses import asdict
-from pathlib import Path
 from uuid import uuid4
 
+from tools.common.build import engine_build_script
+from tools.common.daemon import atomic_json
 from tools.common.gpu_lock import GpuLeaseManager
 from tools.common.remote import Executor
-from tools.dev_cli.commands import _engine_script
 
-from .host import INFO, atomic_json
+from .host import INFO
 
 CURRENT = "engine/build/forward.so"
 
@@ -21,17 +22,17 @@ def candidate_path(name, current=CURRENT):
     return current if name == "current" else f".forge/candidates/{name}.so"
 
 
-def host_call(executor, cmd, payload):
+def host_call(executor: Executor, cmd: str, payload: dict) -> dict:
     python = "python3" if executor.cfg.is_remote else sys.executable
-    command = shlex.join([python, "-m", "tools.forge_cli.host", cmd, json.dumps(payload)])
-    reply = executor.run(command, check=True)
+    command = shlex.join([python, "-m", "tools.forge_cli.host", cmd])
+    reply = executor.run(command, input_text=json.dumps(payload), check=True)
     return json.loads(reply.stdout)
 
 
 def build(cfg, executor, data, targets):
     sync = executor.sync()
     data["sync_ms"] = sync.duration_ms
-    script = _engine_script(cfg, False, targets=targets, incremental=True)
+    script = engine_build_script(cfg, targets=targets, incremental=True)
     out = executor.run("set -e\n" + script, check=True, stream_stderr=True)
     data["build_ms"] = out.duration_ms
 
@@ -54,10 +55,10 @@ def start(cfg, args, ex, lease, data):
     if args.no_model:
         argv.append("--no-model")
     else:
-        if not args.path and not cfg.model.weights_dir:
-            raise ValueError("Set model.weights_dir or pass --path / --no-model")
-        path = Path(args.path or Path(cfg.shared.models_dir) / cfg.model.weights_dir)
-        golden = Path(cfg.weights.golden_dir or ".forge/golden") / path.name
+        path = cfg.resolve_model_dir(
+            args.path, error_message="Set model.weights_dir or pass --path / --no-model"
+        )
+        golden = cfg.resolve_golden_dir(path)
         argv.extend(["--model-dir", str(path), "--golden-dir", str(golden)])
     for key in ("kv_seq_len", "scratch_mb"):
         value = getattr(args, key)
@@ -77,7 +78,7 @@ def start(cfg, args, ex, lease, data):
                 ),
             )
         )
-    except Exception:
+    except BaseException:
         lease.release_unbound(record.token)
         raise
     if cfg.is_remote:
@@ -103,10 +104,7 @@ def execute(cfg, args, result):
         if cfg.is_remote:
             (cfg.repo_root / ".forge/daemon.json").unlink(missing_ok=True)
     elif cmd == "status":
-        status = asdict(lease.inspect())
-        if status["record"]:
-            del status["record"]["token"]
-        data.update(lease=status, **host_call(ex, cmd, {}))
+        data.update(lease=lease.inspect_public(), **host_call(ex, cmd, {}))
     elif cmd == "ls":
         data.update(host_call(ex, cmd, {}))
     elif cmd == "rm":

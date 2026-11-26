@@ -1,5 +1,7 @@
 """Shared GPU ownership, using the same atomic operations locally and over SSH."""
 
+from __future__ import annotations
+
 import getpass
 import json
 import os
@@ -62,6 +64,9 @@ class GpuLeaseManager:
 
     def inspect(self) -> LockStatus:
         return self._call("inspect")
+
+    def inspect_public(self) -> dict:
+        return self.inspect().to_public_dict()
 
     def acquire(
         self, mode: str, ttl_sec: int | None = None, force: bool = False, pid: int = 0
