@@ -188,48 +188,36 @@ def test_suites(suite, harness, monkeypatch):
         gpu_name="mock", max_context=4096, prefix_cache_slots=3, use_cuda_graph=True
     )
     assert data["metadata"]["canary_passed"] == (True if "canary" in suites else None)
-    if "c1" in suites:
-        c1 = [
+    if "short" in suites:
+        short = [
             b["messages"][0]["content"]
             for b in endpoint.chat
-            if b["messages"][0]["content"].startswith("[bench-c1")
+            if b["messages"][0]["content"].startswith("[bench-short")
         ]
-        assert [s.split()[0] for s in c1] == [
-            "[bench-c1-w00]",
-            "[bench-c1-r01]",
-            "[bench-c1-r02]",
+        assert [s.split()[0] for s in short] == [
+            "[bench-short-w00]",
+            "[bench-short-r01]",
+            "[bench-short-r02]",
         ] * 3
-        for case in data["cases"]["c1"].values():
+        for case in data["cases"]["short"].values():
             assert [r["round"] for r in case["samples"]] == [1, 2]
             assert case["summary"]["prefill_ms"] == {"median": 20, "mean": 20, "n": 2}
-        assert data["suite_summary"]["c1"]["prefill_ms"]["n"] == 6
+        assert data["suite_summary"]["short"]["prefill_ms"]["n"] == 6
     if "agent" in suites:
-        sessions = [b for b in endpoint.chat if b["messages"][0]["content"].startswith("[agent-")]
-        assert len(sessions) == 12
-        for i, tag in enumerate(["[agent-w00]", "[agent-s01]", "[agent-s02]"]):
-            session = sessions[4 * i : 4 * i + 4]
-            for b in session:
-                assert b["messages"][0]["content"].startswith(tag)
-                assert b["tools"][0]["function"]["description"].startswith(tag)
-            for previous, later in zip(session, session[1:], strict=False):
-                old, new = previous["messages"], later["messages"]
-                assert new[: len(old)] == old and len(new) > len(old)
-        report = data["cases"]["agent"]["coding_agent_4turn"]
-        assert all(report["turns"][str(i)]["prefill_ms"]["n"] == 2 for i in range(4))
-    if "c2" in suites:
-        assert endpoint.peak == 2
-        c2 = [
-            b["messages"][0]["content"].split()[0]
-            for b in endpoint.chat
-            if b["messages"][0]["content"].startswith("[c2-")
+        agent_reqs = [
+            b for b in endpoint.chat if b["messages"][0]["content"].startswith("[bench-agent")
         ]
-        assert len(c2) == len(set(c2)) == 6
-        report = data["cases"]["c2"]["c2_pair"]
-        assert [r["slot"] for r in report["samples"]] == [0, 1, 0, 1]
-        assert len(report["batches"]) == 2
-        for batch in report["batches"]:
-            m = batch["metrics"]
-            assert m["aggregate_decode_tok_s"] == pytest.approx(16_000 / m["wall_ms"])
+        assert len(agent_reqs) == 12
+        for i, tag in enumerate(
+            ["[bench-agent-w00]", "[bench-agent-r01]", "[bench-agent-r02]"] * 4
+        ):
+            b = agent_reqs[i]
+            assert b["messages"][0]["content"].startswith(tag)
+            assert b["tools"][0]["function"]["description"].startswith(tag)
+        for case in data["cases"]["agent"].values():
+            assert [r["round"] for r in case["samples"]] == [1, 2]
+            assert case["summary"]["prefill_ms"] == {"median": 20, "mean": 20, "n": 2}
+        assert data["suite_summary"]["agent"]["prefill_ms"]["n"] == 8
     if "canary" in suites:
         cases = data["cases"]["canary"]
         assert len(cases) == 6 and all(case["passed"] for case in cases.values())
@@ -253,11 +241,9 @@ def test_client_fallback(harness, external, off):
         "run",
         "--json",
         "--suite",
-        "c2",
+        "short",
         "--model",
         "explicit",
-        "--concurrency",
-        "4",
         "--telemetry",
         "off" if off else "auto",
         "--rounds",
@@ -267,12 +253,12 @@ def test_client_fallback(harness, external, off):
         "--no-archive",
     )
     assert not (repo / ".runs").exists()
-    assert endpoint.peak == 4
+    assert endpoint.peak == 1
     assert all(
         req.url.host == "custom.test" and req.url.path != "/v1/models" for req in endpoint.requests
     )
     assert (result["data"]["metadata"]["server"] is None) == external
-    report = result["data"]["cases"]["c2"]["c2_pair"]
+    report = result["data"]["cases"]["short"]["short_chat"]
     for row in report["samples"]:
         m = row["metrics"]
         assert m["telemetry_source"] == "client" and "server_tpot_ms" not in m
@@ -280,7 +266,6 @@ def test_client_fallback(harness, external, off):
         assert m["client_itl_p95_ms"] >= m["client_itl_p50_ms"] >= 0
         if not off:
             assert (m["prompt_tokens"], m["completion_tokens"], m["cached_tokens"]) == (80, 8, 24)
-    assert ("aggregate_decode_tok_s" in report["batch_summary"]) != off
     for b in endpoint.chat:
         assert ("stream_options" in b) != off
     for req in endpoint.requests:
@@ -313,10 +298,10 @@ def test_canary_gate(harness, fault, case, error):
 
 def test_compare(harness):
     endpoint, invoke, repo = harness
-    base = invoke("run", "--json", "--suite", "c1", "--rounds", "2")
-    candidate = invoke("run", "--json", "--suite", "c1", "--rounds", "1", "--model", "other")
+    base = invoke("run", "--json", "--suite", "short", "--rounds", "2")
+    candidate = invoke("run", "--json", "--suite", "short", "--rounds", "1", "--model", "other")
     # JSON stdout is also a supported input. Give each case a different ratio.
-    for i, case in enumerate(candidate["data"]["cases"]["c1"].values()):
+    for i, case in enumerate(candidate["data"]["cases"]["short"].values()):
         case["summary"]["prefill_ms"]["median"] = 20 * (2**i)
     path = repo / "candidate.json"
     path.write_text(json.dumps(candidate))
@@ -392,12 +377,22 @@ def test_timing_and_fragmented_tools(monkeypatch):
 
 def test_real_workloads_and_invalid_schema(tmp_path):
     perf = load_workloads(ROOT / "workloads/bench_cases.json", PERF)
-    assert [c["id"] for c in perf["c1"]] == ["c1_short", "c1_medium", "c1_long"]
-    assert all(c["cold_nonce"] and c["max_tokens"] == 64 for c in perf["c1"])
-    (session,) = perf["agent"]
-    assert len(session["turns"]) == 4 and session["max_tokens"] == 48
-    assert [f["function"]["name"] for f in session["tools"]] == ["read_file", "run_tests"]
-    assert len(perf["c2"][0]["requests"]) == 2
+    assert [c["id"] for c in perf["short"]] == ["short_chat", "short_debug", "short_review"]
+    assert all(c["cold_nonce"] and c["max_tokens"] == 64 for c in perf["short"])
+    assert [c["id"] for c in perf["agent"]] == [
+        "django__django-11099",
+        "pydata__xarray-4687",
+        "pallets__flask-5014",
+        "psf__requests-1142",
+    ]
+    assert all(
+        c["cold_nonce"] and c["max_tokens"] == 8192 and c["reasoning_effort"] == "max"
+        for c in perf["agent"]
+    )
+    assert all(
+        [f["function"]["name"] for f in c["tools"]] == ["bash", "str_replace_editor", "submit"]
+        for c in perf["agent"]
+    )
     data = load_workloads(ROOT / "workloads/canary_cases.json", ["canary"])
     case = data["canary"][0]
     path = tmp_path / "cases.json"
@@ -432,7 +427,7 @@ def test_compare_handles_zero_missing_and_unmatched_conditions(harness):
     _, invoke, repo = harness
     base = invoke("run", "--suite", "all", "--json", "--rounds", "1", "--warmup", "0")
     original = base["run_file"]
-    case = base["data"]["cases"]["agent"]["coding_agent_4turn"]
+    case = base["data"]["cases"]["agent"]["django__django-11099"]
     case["summary"]["cached_prefix_ratio"]["median"] = 0
     del case["summary"]["server_tpot_ms"]
     base["data"]["metadata"]["server"]["gpu_name"] = "different"
@@ -444,23 +439,22 @@ def test_compare_handles_zero_missing_and_unmatched_conditions(harness):
     assert any("canary_passed" in w for w in data["warnings"])
     for metric, value in [("cached_prefix_ratio", 0), ("server_tpot_ms", None)]:
         comparison = data["metrics"][metric]
-        assert comparison["candidate_over_baseline"]["n"] == 4
+        assert comparison["candidate_over_baseline"]["n"] == 6
         (excluded,) = comparison["excluded"]
         assert excluded["candidate"] == value and excluded["suite"] == "agent"
 
 
-def test_cli_overrides_and_shared_slots(harness):
+def test_cli_overrides_and_custom_bench(harness):
     endpoint, invoke, repo = harness
     source = json.loads((repo / "workloads/bench_cases.json").read_text())
-    pair = source["c2"][0]
-    pair["shared_prefix"] = True
-    pair["requests"] = pair["requests"][:1]
+    case = source["short"][0]
+    case["cold_nonce"] = False
     path = repo / "custom.json"
-    path.write_text(json.dumps({"c2": [pair]}))
+    path.write_text(json.dumps({"short": [case]}))
     output = invoke(
         "run",
         "--suite",
-        "c2",
+        "short",
         "--bench-file",
         str(path),
         "--url",
@@ -474,8 +468,8 @@ def test_cli_overrides_and_shared_slots(harness):
         "--no-archive",
         human=True,
     )
-    assert "batch throughput" in output and "slot 1" in output
-    assert endpoint.chat[0] == endpoint.chat[1]
+    assert "short_chat" in output
+    assert endpoint.chat[0]["messages"] == case["messages"]
     assert endpoint.requests[0].url.host == "external.test"
     assert endpoint.requests[0].headers["authorization"] == "Bearer explicit"
 

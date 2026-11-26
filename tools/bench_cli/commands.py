@@ -1,10 +1,7 @@
 """Execute suites, archive their measured samples and compare matched cases."""
 
-import asyncio
 import hashlib
 import json
-from collections import defaultdict
-from time import perf_counter
 
 import httpx
 
@@ -16,55 +13,22 @@ from .workloads import PERF, evaluate, load_workloads, requests_for
 
 
 async def performance(send, suite, case, args):
-    rows, batches = [], []
+    rows = []
     width = max(2, len(str(max(args.warmup, args.rounds))))
     for i in range(-args.warmup, args.rounds):
         warmup = i < 0
         number = i + args.warmup if warmup else i + 1
-        bodies = requests_for(suite, case, number, warmup, args.concurrency, width)
-        if suite == "c2":
-            start = perf_counter()
-            responses = await asyncio.gather(
-                *(send(body) for body in bodies), return_exceptions=True
-            )
-            for slot, response in enumerate(responses):
-                if isinstance(response, Exception):
-                    raise RuntimeError(f"{case['id']} slot {slot}: {response}") from response
-            elapsed = (perf_counter() - start) * 1000
-            if not warmup:
-                tokens = [
-                    r.metrics.get("decode_tokens", r.metrics.get("completion_tokens"))
-                    for r in responses
-                ]
-                batch = {"wall_ms": elapsed}
-                if all(n is not None for n in tokens):
-                    batch["aggregate_decode_tok_s"] = sum(tokens) / (elapsed / 1000)
-                batches.append(dict(round=number, metrics=batch))
-        else:
-            responses = [await send(body) for body in bodies]
+        bodies = requests_for(suite, case, number, warmup, width)
+        responses = [await send(body) for body in bodies]
         if not warmup:
-            for index, response in enumerate(responses):
-                row = dict(round=number, metrics=response.metrics)
-                if suite == "agent":
-                    row["turn"] = index
-                if suite == "c2":
-                    row["slot"] = index
-                rows.append(row)
-    output = dict(samples=rows, summary=summarize(r["metrics"] for r in rows))
-    for dim in ("turn", "slot"):
-        if dim in rows[0]:
-            groups = defaultdict(list)
-            for row in rows:
-                groups[row[dim]].append(row["metrics"])
-            output[dim + "s"] = {str(k): summarize(v) for k, v in groups.items()}
-    if batches:
-        output.update(batches=batches, batch_summary=summarize(b["metrics"] for b in batches))
-    return output
+            for response in responses:
+                rows.append(dict(round=number, metrics=response.metrics))
+    return dict(samples=rows, summary=summarize(r["metrics"] for r in rows))
 
 
 async def canary(send, case):
     checks = case["checks"]
-    (body,) = requests_for("canary", case, 1, False, 1)
+    (body,) = requests_for("canary", case, 1, False)
     samples, failures = [], []
     outputs = []
     for stream in [True, False] if checks.get("check_stream_parity") else [True]:
@@ -117,7 +81,6 @@ async def run(args, root, result):
         suites=list(suites),
         rounds=args.rounds,
         warmup=args.warmup,
-        concurrency=args.concurrency,
         telemetry=args.telemetry,
         server=server,
         workload_sha256=hashes,
@@ -191,7 +154,6 @@ def compare(args, result):
         "suites",
         "rounds",
         "warmup",
-        "concurrency",
         "telemetry",
         "canary_passed",
         "workload_sha256",
@@ -264,20 +226,13 @@ def human_format(result):
             "cached_prefix_ratio",
         )
         lines.append(
-            "suite   case / turn              prefill ms   TTFT ms    E2E ms   TPOT ms  "
+            "suite   case                     prefill ms   TTFT ms    E2E ms   TPOT ms  "
             "    tok/s    cached"
         )
         for suite, cases in result.data.get("cases", {}).items():
             for name, case in cases.items():
-                summaries = {name: case["summary"]}
-                summaries.update({f"  turn {k}": v for k, v in case.get("turns", {}).items()})
-                summaries.update({f"  slot {k}": v for k, v in case.get("slots", {}).items()})
-                for label, summary in summaries.items():
-                    fields = " ".join(f"{show_median(summary, k):>9}" for k in columns)
-                    lines.append(f"{suite:7} {label:23} {fields}")
-                if "batch_summary" in case:
-                    rate = show_median(case["batch_summary"], "aggregate_decode_tok_s")
-                    lines.append(f"        batch throughput {rate} tok/s")
+                fields = " ".join(f"{show_median(case['summary'], k):>9}" for k in columns)
+                lines.append(f"{suite:7} {name:24} {fields}")
                 if "passed" in case:
                     lines.append(
                         "        PASS"

@@ -4,7 +4,7 @@ import json
 import re
 from copy import deepcopy
 
-PERF = ("c1", "agent", "c2")
+PERF = ("short", "agent")
 OPTIONS = {"temperature", "max_tokens", "tools", "reasoning_effort", "stop"}
 
 
@@ -25,7 +25,7 @@ def validate_messages(messages):
             "invalid message role",
         )
         require(
-            isinstance(m.get("content"), str)
+            isinstance(m.get("content"), (str, list))
             or (
                 m["role"] == "assistant"
                 and isinstance(m.get("tool_calls"), list)
@@ -82,9 +82,8 @@ def load_workloads(path, suites):
             ids.add(name)
             try:
                 fields = {
-                    "c1": {"messages", "cold_nonce"},
-                    "agent": {"turns"},
-                    "c2": {"requests", "shared_prefix"},
+                    "short": {"messages", "cold_nonce"},
+                    "agent": {"messages", "cold_nonce"},
                     "canary": {"messages", "checks"},
                 }
                 unknown = case.keys() - OPTIONS - fields[suite] - {"id"}
@@ -107,51 +106,35 @@ def load_workloads(path, suites):
                         and isinstance(tool["function"]["parameters"], dict),
                         "invalid tool",
                     )
-                field = {"agent": "turns", "c2": "requests"}.get(suite)
-                groups = case[field] if field else [case["messages"]]
-                require(isinstance(groups, list) and groups, "missing messages")
-                for group in groups:
-                    validate_messages(group)
-                for group in groups if suite == "c2" else groups[:1]:
-                    require(isinstance(group[0]["content"], str), "missing first message text")
+                validate_messages(case["messages"])
+                require(
+                    isinstance(case["messages"][0]["content"], str), "missing first message text"
+                )
                 if suite == "canary":
                     validate_checks(case.get("checks"))
-                if suite == "c1":
+                if suite in PERF:
                     require(type(case.get("cold_nonce")) is bool, "expected cold_nonce boolean")
-                if suite == "c2":
-                    require(type(case.get("shared_prefix", False)) is bool, "invalid shared_prefix")
             except (KeyError, ValueError, TypeError) as exc:
                 raise ValueError(f"{path}: {suite}/{name}: {exc}") from exc
         selected[suite] = cases
     return selected
 
 
-def requests_for(suite, case, number, warmup, concurrency, width=2):
-    """Yield request bodies in turn/slot order. Agent turns replay fixed client history."""
+def requests_for(suite, case, number, warmup, width=2):
+    """Yield request bodies for a single round, isolating cold runs with a prefix nonce."""
     options = {k: case[k] for k in OPTIONS if k in case}
     phase = "w" if warmup else "r"
     index = f"{number:0{width}d}"
-    if suite == "agent":
-        tag = f"[agent-{'w' if warmup else 's'}{index}] "
+    if suite in PERF and case.get("cold_nonce"):
+        tag = f"[bench-{suite}-{phase}{index}] "
         # Inkling renders tool declarations before the system message. Isolate those too.
         if options.get("tools"):
             options["tools"] = deepcopy(options["tools"])
             fn = options["tools"][0]["function"]
             fn["description"] = tag + fn.get("description", "")
-        history = []
-        for turn in case["turns"]:
-            history.extend(turn)
-            yield dict(options, messages=tagged(history, tag))
-    elif suite == "c2":
-        slot_width = max(2, len(str(concurrency - 1)))
-        for slot in range(concurrency):
-            slot_tag = "" if case.get("shared_prefix") else f"-s{slot:0{slot_width}d}"
-            tag = f"[c2-{phase}{index}{slot_tag}] "
-            messages = case["requests"][slot % len(case["requests"])]
-            yield dict(options, messages=tagged(messages, tag))
-    else:
-        tag = f"[bench-c1-{phase}{index}] " if case.get("cold_nonce") else ""
         yield dict(options, messages=tagged(case["messages"], tag))
+    else:
+        yield dict(options, messages=case["messages"])
 
 
 def tagged(messages, tag):

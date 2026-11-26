@@ -11,36 +11,31 @@ from Flint's `/ready`. All generation goes through OpenAI Chat Completions.
 
 | Suite | Request schedule | Readout |
 | --- | --- | --- |
-| c1 | Serial short chat, medium debugging, long code review. Nominal input sizes ~40/256/1024 tokens, maximum 64 output tokens. | Cold prefill, TTFT, steady decode |
-| agent | Four requests per session with two tools, source code, synthetic assistant calls, tool results and follow-ups. Maximum 48 output tokens per turn. | Compare turn 0 to turns 1–3 using per-turn prefill and cached-prefix ratio |
-| c2 | Launch the coding and chat prompts together. Maximum 64 output tokens per slot. Higher concurrency cycles through both prompts. | Per-slot queue-inclusive TTFT/E2E and batch output tokens per wall second |
+| short | Serial short chat, medium debugging, long code review. Nominal input sizes ~40/256/1024 tokens, maximum 64 output tokens. | Short-context steady C1 decode and SOL |
+| agent | Four frozen SWE-bench Verified coding-agent snapshots spanning Q1–Q4 context lengths (8.5K / 15.1K / 22.4K / 47.1K tokens) across edit, explore and debug stages. `reasoning_effort: "max"`, maximum 8,192 output tokens, natural EOS. | Realistic long-context C1 decode under Full-Attention KV load and DSpark acceptance |
 | canary | One greedy pass over arithmetic, code, single/multiple tool calls, stop strings and bilingual UTF-8. The parity case also sends one non-streaming request. | All assertions pass, including exact reconstructed content, reasoning and tool calls for parity |
 
 Inputs and checks live in `workloads/{bench,canary}_cases.json`. All cases use
-temperature zero. The agent replays fixed conversation history so every server
-receives the same input, including when earlier generations differ. Its
-synthetic assistant history omits reasoning. The multi-city canary validates
-every call and records the actual count, accepting one or more valid calls.
+temperature zero. The `agent` cases are a 4-request stratified subset extracted
+from `coding_agent_48` (`django__django-11099`, `pydata__xarray-4687`,
+`pallets__flask-5014`, `psf__requests-1142`) with `cache_control` hints stripped.
+The multi-city canary validates every call and records the actual count,
+accepting one or more valid calls.
 
-Cold C1 requests prefix the first message with `[bench-c1-w00] ` during warmup
-and `[bench-c1-r01] ` in the first measured round. The agent uses one tag per
-session (`[agent-w00] ` or `[agent-s01] `) throughout the growing history. The
-first tool description carries that tag too because Inkling serializes tools
-before messages. C2 distinguishes warmup/measured round and slot in the tag,
-unless a custom case explicitly sets `shared_prefix`. Tags repeat across
-invocations. For official comparisons start from equivalent, empty server
-caches. Inspect actual cached token counts on cold requests and warmed turns:
-templates may contribute a common prefix. Record the returned prompt lengths.
+Cold requests prefix the first message with `[bench-<suite>-w00] ` during warmup
+and `[bench-<suite>-r01] ` in the first measured round. For `agent` cases with
+tools, the first tool description carries that tag too because Inkling
+serializes tools before messages. Tags repeat across invocations. For official
+comparisons start from equivalent, empty server caches. Inspect actual cached
+token counts on cold requests: templates may contribute a common prefix. Record
+the returned prompt lengths.
 
 ## Timing and comparisons
 
 Use one warmup and three measured rounds per performance case by default.
 Exclude all warmups from samples, counts and statistics. For each available
 numeric metric report median, arithmetic mean and sample count by case and
-suite. Agent and C2 additionally retain turn/slot medians and raw requests.
-A suite summary pools its measured requests. C2 batch throughput divides the
-sum of decode tokens (or standard completion tokens) by wall time from dispatch
-until the last response completes, including queueing and prefill.
+suite. A suite summary pools its measured requests.
 
 Request `X-Flint-Telemetry: 1` and streaming `stream_options.include_usage`.
 Use the returned `x_flint_telemetry` as the primary engine measurement.
@@ -71,10 +66,10 @@ a point interval. Zero or missing values have no log ratio and appear with
 their original values in the metric's exclusions.
 
 Check warnings for model, selected suites, workload hashes, round and warmup
-counts, concurrency, telemetry mode, canary status and available GPU/engine
-configuration. Also match weights, precision, client location, cache state,
-driver, GPU clocks/power and background load. Record deliberate changes.
-A comparison with unmatched conditions is diagnostic.
+counts, telemetry mode, canary status and available GPU/engine configuration.
+Also match weights, precision, client location, cache state, driver, GPU
+clocks/power and background load. Record deliberate changes. A comparison with
+unmatched conditions is diagnostic.
 
 ## Acceptance and evidence
 
@@ -87,9 +82,8 @@ A comparison with unmatched conditions is diagnostic.
   relative to the AR ceiling is an AR-equivalent rate, not measured bandwidth.
 - Proposed Phase 3 review thresholds, pending M2.6 repeatability measurements:
   target at least 75% of the context-matched logical bandwidth SOL for optimized
-  AR C1 decode. For regression review use 5% on C1/agent latency and C2 aggregate
-  throughput against frozen Phase 2. Inspect individual cases and cold/warm
-  turns. Repeat a matched run when a regression crosses the threshold and the
+  AR C1 decode. For regression review use 5% on `short` and `agent` decode
+  latency against frozen Phase 2. Inspect individual cases. Repeat a matched run when a regression crosses the threshold and the
   interval overlaps it. Confirm sustained changes before promotion. Verify
   numerical accuracy and model quality separately for precision or algorithm changes.
 - Keep raw run records under `.runs/`. Add `--archive` to save a comparison as well.

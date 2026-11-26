@@ -39,9 +39,6 @@ def build_parser():
         help="Suite to run (default all).",
     )
     run.add_argument(
-        "--concurrency", type=int, default=2, help="Simultaneous C2 slots (default 2)."
-    )
-    run.add_argument(
         "--rounds", type=int, default=3, help="Measured performance rounds (default 3)."
     )
     run.add_argument(
@@ -80,8 +77,8 @@ def main(argv=None):
     start = perf_counter()
     try:
         if args.command == "run":
-            if args.rounds < 1 or args.concurrency < 1 or args.warmup < 0:
-                parser.error("rounds and concurrency must be positive, warmup must be nonnegative")
+            if args.rounds < 1 or args.warmup < 0:
+                parser.error("rounds must be positive, warmup must be nonnegative")
             if not math.isfinite(args.timeout) or args.timeout <= 0:
                 parser.error("timeout must be finite and positive")
             args.api_key = args.api_key or os.getenv("FLINT_API_KEY")
