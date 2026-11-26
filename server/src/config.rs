@@ -87,7 +87,7 @@ impl Options {
         let seconds = self
             .request_timeout_sec
             .or(file.request_timeout_sec)
-            .unwrap_or(300);
+            .unwrap_or(1800);
         Ok(Config {
             bind: self
                 .bind

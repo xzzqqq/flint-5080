@@ -51,7 +51,10 @@ def build_parser():
         help="Request Flint telemetry (default auto).",
     )
     run.add_argument(
-        "--timeout", type=float, default=300, help="Per-request deadline in seconds (default 300)."
+        "--timeout",
+        type=float,
+        default=1800,
+        help="Per-request deadline in seconds (default 1800).",
     )
     run.add_argument("--bench-file", type=Path, help="Override workloads/bench_cases.json.")
     run.add_argument("--canary-file", type=Path, help="Override workloads/canary_cases.json.")
