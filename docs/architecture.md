@@ -230,7 +230,7 @@ flint-5080/
 │   ├── common/          # 纯 stdlib 底座（config, remote sync, gpu lease lock, json output）
 │   ├── dev_cli/         # dev 命令实现
 │   ├── forge_cli/       # forge 命令实现
-│   ├── bench_cli/       # bench 命令实现
+│   ├── bench_cli/       # bench run（httpx 异步 HTTP / canary）、compare（配对统计）
 │   ├── weights_cli/     # weights 命令实现
 │   └── tests/           # pytest 自测（纳入 dev check --local）
 ├── workloads/           # 固定 coding-agent 压测 trace、canary 与 forge 标准用例
@@ -238,7 +238,7 @@ flint-5080/
 └── docs/
     ├── architecture.md  # 活蓝图（边界/工具链变更时原地更新，无 ADR）
     ├── model.md         # (后续) 活文档：模型结构、权重布局与 5080 SOL 账本
-    ├── benchmark.md     # (后续) 固定评测口径、workload 与验收门禁
+    ├── benchmark.md     # 固定评测口径、workload 与验收门禁
     └── findings/        # 按日期追加的 GPU 实测证据库（含正/负实验与死胡同记录）
 ```
 

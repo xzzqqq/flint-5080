@@ -1,0 +1,174 @@
+{
+  "canary": [
+    {
+      "id": "math_reasoning",
+      "max_tokens": 256,
+      "temperature": 0.0,
+      "messages": [
+        {
+          "role": "user",
+          "content": "What is 17 * 23? Reply with the final integer."
+        }
+      ],
+      "checks": {
+        "must_contain": [
+          "391"
+        ],
+        "expected_finish_reason": "stop"
+      },
+      "reasoning_effort": "none"
+    },
+    {
+      "id": "code_bugfix",
+      "max_tokens": 256,
+      "temperature": 0.0,
+      "messages": [
+        {
+          "role": "user",
+          "content": "Fix this Python loop so it visits every index of items, including the last one: for i in range(len(items) - 1): print(items[i]). Reply with the corrected loop."
+        }
+      ],
+      "checks": {
+        "must_contain": [
+          "range("
+        ],
+        "forbid_replacement_char": true
+      },
+      "reasoning_effort": "none"
+    },
+    {
+      "id": "tool_call_single",
+      "max_tokens": 256,
+      "temperature": 0.0,
+      "messages": [
+        {
+          "role": "user",
+          "content": "Call get_weather for Tokyo."
+        }
+      ],
+      "checks": {
+        "expected_finish_reason": "tool_calls",
+        "expected_tool_calls": {
+          "names": [
+            "get_weather"
+          ],
+          "min_calls": 1,
+          "required_keys": [
+            "city"
+          ],
+          "arguments_contain": [
+            "Tokyo"
+          ]
+        }
+      },
+      "reasoning_effort": "none",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Return the current weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "tool_call_multi",
+      "max_tokens": 256,
+      "temperature": 0.0,
+      "messages": [
+        {
+          "role": "user",
+          "content": "Make two get_weather calls, one for Tokyo and one for Paris. Use the tool for both cities."
+        }
+      ],
+      "checks": {
+        "expected_finish_reason": "tool_calls",
+        "expected_tool_calls": {
+          "names": [
+            "get_weather"
+          ],
+          "min_calls": 1,
+          "required_keys": [
+            "city"
+          ]
+        }
+      },
+      "reasoning_effort": "none",
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Return the current weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "city": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "city"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "stop_sequence",
+      "max_tokens": 256,
+      "temperature": 0.0,
+      "messages": [
+        {
+          "role": "user",
+          "content": "Reply with exactly these numbers in order: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10"
+        }
+      ],
+      "checks": {
+        "must_contain": [
+          "4"
+        ],
+        "must_not_contain": [
+          "5"
+        ],
+        "expected_finish_reason": "stop"
+      },
+      "reasoning_effort": "none",
+      "stop": [
+        "5"
+      ]
+    },
+    {
+      "id": "utf8_stream_parity",
+      "max_tokens": 256,
+      "temperature": 0.0,
+      "messages": [
+        {
+          "role": "user",
+          "content": "请逐字重复这句话，包括英文和表情：哈希表 Hash Table 🧩。"
+        }
+      ],
+      "checks": {
+        "must_contain": [
+          "Hash Table"
+        ],
+        "forbid_replacement_char": true,
+        "check_stream_parity": true
+      },
+      "reasoning_effort": "none"
+    }
+  ]
+}

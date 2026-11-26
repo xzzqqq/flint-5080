@@ -1,0 +1,198 @@
+{
+  "c1": [
+    {
+      "id": "c1_short",
+      "max_tokens": 64,
+      "temperature": 0.0,
+      "cold_nonce": true,
+      "messages": [
+        {
+          "role": "system",
+          "content": "Answer briefly."
+        },
+        {
+          "role": "user",
+          "content": "A Python worker drains a list of pending jobs from the front. Which standard container would make removal constant time? Show the import and one removal."
+        }
+      ]
+    },
+    {
+      "id": "c1_medium",
+      "max_tokens": 64,
+      "temperature": 0.0,
+      "cold_nonce": true,
+      "messages": [
+        {
+          "role": "system",
+          "content": "Debug the following client."
+        },
+        {
+          "role": "user",
+          "content": "A Rust service exports offsets as UTF-8 byte positions. A Python client uses them to highlight a missing field. The test passes for ASCII and fails when the line contains an emoji.\n\n    fn locate(line: &str, needle: &str) -> Option<(usize, usize)> {\n        let start = line.find(needle)?;\n        Some((start, start + needle.len()))\n    }\n\n    def highlight(line, start, end):\n        return line[:start] + '[' + line[start:end] + ']' + line[end:]\n\nFor 'item 🍋 missing', the service reports (10, 17) for 'missing'. The UI highlights a suffix instead. Existing clients store offsets on disk and use them to seek into UTF-8 logs, so the wire format has to remain compatible. Explain where the coordinate systems diverge. Give the smallest change in Python and one assertion that covers a multi-byte character before the highlight and another inside it. Assume offsets always fall on character boundaries."
+        }
+      ]
+    },
+    {
+      "id": "c1_long",
+      "max_tokens": 64,
+      "temperature": 0.0,
+      "cold_nonce": true,
+      "messages": [
+        {
+          "role": "system",
+          "content": "Review for crash consistency."
+        },
+        {
+          "role": "user",
+          "content": "Review this synthetic Python ingestion worker. Two threads can import overlapping pages from a cursor-based event feed. Events have a stable integer sequence, an account name, and a signed amount in cents. A page cursor can be reused after a timeout. The output must equal one application of every sequence even if the process exits between any two SQL statements. Most pages are new. About one page per hundred overlaps the previous page by a handful of events.\n\n    import sqlite3\n    from dataclasses import dataclass\n\n    @dataclass(frozen=True)\n    class Event:\n        seq: int\n        account: str\n        cents: int\n\n    def initialize(db):\n        db.executescript('''\n            CREATE TABLE IF NOT EXISTS seen (\n                seq INTEGER PRIMARY KEY\n            );\n            CREATE TABLE IF NOT EXISTS balance (\n                account TEXT PRIMARY KEY,\n                cents INTEGER NOT NULL\n            );\n            CREATE TABLE IF NOT EXISTS checkpoint (\n                feed TEXT PRIMARY KEY,\n                cursor TEXT NOT NULL\n            );\n        ''')\n\n    def decode_page(raw):\n        events = []\n        for item in raw[\"items\"]:\n            account = item[\"account\"].strip()\n            if not account:\n                raise ValueError(\"missing account\")\n            events.append(Event(int(item[\"seq\"]), account, int(item[\"cents\"])))\n        return events, raw[\"next_cursor\"]\n\n    def apply_event(db, event):\n        known = db.execute(\"SELECT 1 FROM seen WHERE seq = ?\", (event.seq,))\n        if known.fetchone() is not None:\n            return False\n        db.execute(\"INSERT INTO balance(account, cents) VALUES (?, ?) \"\n                   \"ON CONFLICT(account) DO UPDATE SET cents = cents + excluded.cents\",\n                   (event.account, event.cents))\n        db.commit()\n        db.execute(\"INSERT OR IGNORE INTO seen VALUES (?)\", (event.seq,))\n        return True\n\n    def import_page(db, feed, cursor, fetch):\n        items, next_cursor = decode_page(fetch(feed, cursor))\n        inserted = 0\n        for event in items:\n            if apply_event(db, event):\n                inserted += 1\n        db.execute(\"INSERT OR REPLACE INTO checkpoint(feed, cursor) VALUES (?, ?)\",\n                   (feed, next_cursor))\n        db.commit()\n        return inserted, next_cursor\n\n    def worker(path, feed, fetch):\n        db = sqlite3.connect(path, timeout=3)\n        try:\n            row = db.execute(\"SELECT cursor FROM checkpoint WHERE feed=?\", (feed,)).fetchone()\n            cursor = row[0] if row else \"\"\n            while cursor is not None:\n                count, cursor = import_page(db, feed, cursor, fetch)\n                if count == 0:\n                    break\n        finally:\n            db.close()\n\nHere is a production-like fixture. Start the database with account maple at 700 cents and sequence 40 already seen. The first page contains (41, maple, -200) and (42, maple, +100). The next page repeats 42 and adds (43, pine, +90). The final page is empty. All rows and amounts are synthetic. Both workers can open independent connections before either fetch returns. The fetch function occasionally redelivers a page with a later cursor and no new events. Callers retry the last durable cursor after any database error. They also retry when the process exits with an unknown status. A regression test must work without a network service or random thread sleeps.\n\nReview the boundary between deduplication and committing the account update. Give one explicit failure schedule with balances before and after recovery. Propose an atomic SQL write sequence and explain where checkpoint advancement belongs. Address delayed pages that could move a checkpoint backwards, an all-duplicate page with a valid next cursor, and a terminal page represented by a null cursor. Keep network waits outside a write transaction. Explain how a test can inject a crash after updating an account, reopen the database on a second connection, and replay the same input. Include one invariant the test should check for both accounts and one case that would still pass a test checking only the sum across accounts."
+        }
+      ]
+    }
+  ],
+  "agent": [
+    {
+      "id": "coding_agent_4turn",
+      "max_tokens": 48,
+      "temperature": 0.0,
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "read_file",
+            "description": "Read a repository file by relative path.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "path"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "run_tests",
+            "description": "Run the named unit test.",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "test": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "test"
+              ]
+            }
+          }
+        }
+      ],
+      "turns": [
+        [
+          {
+            "role": "system",
+            "content": "You maintain a Python worker. Inspect the relevant source before proposing an edit. Keep replies short and name the affected function."
+          },
+          {
+            "role": "user",
+            "content": "The last row disappears when a page has exactly three entries. Inspect src/pages.py and identify the failure."
+          }
+        ],
+        [
+          {
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [
+              {
+                "id": "read1",
+                "type": "function",
+                "function": {
+                  "name": "read_file",
+                  "arguments": "{\"path\": \"src/pages.py\"}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "content": "def page(rows, offset, size):\n    end = offset + size - 1\n    return rows[offset:end]\n",
+            "tool_call_id": "read1"
+          },
+          {
+            "role": "user",
+            "content": "Give the corrected return expression and explain the boundary."
+          }
+        ],
+        [
+          {
+            "role": "assistant",
+            "content": "Use rows[offset:offset + size]. The stop index is exclusive."
+          },
+          {
+            "role": "user",
+            "content": "Exercise test_pages_exact to confirm the boundary. Use the test tool."
+          }
+        ],
+        [
+          {
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [
+              {
+                "id": "test1",
+                "type": "function",
+                "function": {
+                  "name": "run_tests",
+                  "arguments": "{\"test\": \"test_pages_exact\"}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "content": "1 passed. Empty input and trailing partial pages are not covered.",
+            "tool_call_id": "test1"
+          },
+          {
+            "role": "user",
+            "content": "Suggest one assertion for each uncovered case and summarize the fix."
+          }
+        ]
+      ]
+    }
+  ],
+  "c2": [
+    {
+      "id": "c2_pair",
+      "max_tokens": 64,
+      "temperature": 0.0,
+      "requests": [
+        [
+          {
+            "role": "system",
+            "content": "Review a small Rust change."
+          },
+          {
+            "role": "user",
+            "content": "A batch iterator advances the cursor by the requested size even when the last read returns fewer entries. A caller persists the cursor after each page and resumes after restart. Explain how this can skip later arrivals and propose a regression test that appends entries between two reads."
+          }
+        ],
+        [
+          {
+            "role": "system",
+            "content": "Answer a teammate in plain English."
+          },
+          {
+            "role": "user",
+            "content": "We need a short handoff explaining why the weekly totals in two reports differ. One report groups events by their arrival date and the other uses the date the work was completed. Give an example around midnight on Sunday and suggest a field both reports could group by consistently."
+          }
+        ]
+      ]
+    }
+  ]
+}

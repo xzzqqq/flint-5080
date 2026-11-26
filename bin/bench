@@ -3,4 +3,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+if [[ -x "${REPO_ROOT}/.venv/bin/python" ]]; then
+    exec "${REPO_ROOT}/.venv/bin/python" -m tools.bench_cli "$@"
+fi
 exec python3 -m tools.bench_cli "$@"
