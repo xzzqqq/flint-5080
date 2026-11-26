@@ -588,7 +588,7 @@ Object Replay::MeasureSpeculative(const Json& q, const std::string& cmd, const M
       if (b) {
         auto first = result.emitted;
         group_b.push_back(round(*b));
-        reply["next_token_match"] = first == result.emitted;
+        RecordSpeculativePair(reply, j, i, first, result.emitted);
       }
     }
     times.insert(times.end(), group_a.begin(), group_a.end());
@@ -633,11 +633,7 @@ Object Replay::MeasureSpeculative(const Json& q, const std::string& cmd, const M
       if (prompt && expected && prompt->dtype == TensorDType::kI32 &&
           expected->dtype == TensorDType::kI32 && prompt->nbytes == m.ids.size() * sizeof(int) &&
           !std::memcmp(file.Bytes(*prompt).data(), m.ids.data(), prompt->nbytes)) {
-        prefix.insert(prefix.end(), emitted.begin(), emitted.end());
-        auto bytes = std::min(expected->nbytes, prefix.size() * sizeof(int));
-        reply["golden"] = Object{
-            {"matched_tokens_checked", bytes / sizeof(int)},
-            {"next_token_match", !std::memcmp(file.Bytes(*expected).data(), prefix.data(), bytes)}};
+        reply["golden"] = CompareSpeculativeGolden(file.Bytes(*expected), prefix, emitted);
       }
     }
   }

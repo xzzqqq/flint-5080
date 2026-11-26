@@ -28,6 +28,11 @@ struct KldAccumulator {
 void AccumulateKld(std::span<const float> ref_logits, std::span<const float> cand_logits,
                    size_t vocab, KldAccumulator& accumulator);
 
+void RecordSpeculativePair(Object& reply, unsigned round, unsigned iteration,
+                           std::span<const int> a, std::span<const int> b);
+Object CompareSpeculativeGolden(std::span<const std::byte> expected, std::span<const int> prefix,
+                                std::span<const int> emitted);
+
 struct StateSlice {
   size_t offset;
   KvSliceKind kind;

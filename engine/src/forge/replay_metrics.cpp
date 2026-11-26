@@ -111,6 +111,34 @@ void AccumulateKld(std::span<const float> ref_logits, std::span<const float> can
   }
 }
 
+void RecordSpeculativePair(Object& reply, unsigned round, unsigned iteration,
+                           std::span<const int> a, std::span<const int> b) {
+  if (reply.contains("first_token_mismatch")) return;
+  auto [left, right] = std::mismatch(a.begin(), a.end(), b.begin(), b.end());
+  bool match = left == a.end() && right == b.end();
+  reply["next_token_match"] = match;
+  if (!match)
+    reply["first_token_mismatch"] =
+        Object{{"round", round}, {"iteration", iteration}, {"token_index", left - a.begin()}};
+}
+
+Object CompareSpeculativeGolden(std::span<const std::byte> expected, std::span<const int> prefix,
+                                std::span<const int> emitted) {
+  Object golden{{"matched_tokens_checked", 0u}};
+  // The fixture can evaluate this round only if it covers the same history.
+  if (expected.size() <= prefix.size_bytes() ||
+      !std::ranges::equal(expected.first(prefix.size_bytes()), std::as_bytes(prefix)))
+    return golden;
+  auto tail = expected.subspan(prefix.size_bytes());
+  size_t count = std::min(emitted.size(), tail.size() / sizeof(int));
+  if (count) {
+    auto actual = std::as_bytes(emitted.first(count));
+    golden["matched_tokens_checked"] = count;
+    golden["next_token_match"] = std::ranges::equal(tail.first(actual.size()), actual);
+  }
+  return golden;
+}
+
 Object ComputeDiff(std::span<const float> a, std::span<const float> b) {
   if (a.empty() || a.size() != b.size()) throw std::runtime_error("incompatible comparison shapes");
   double mx = 0, sum = 0, sq = 0, aa = 0, bb = 0, ab = 0;

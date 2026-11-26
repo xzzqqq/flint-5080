@@ -122,6 +122,40 @@ void TestKld() {
   Require(metrics.Summary().max_kl == 2.0 * extreme, "extreme finite KLD");
 }
 
+void TestSpeculativeComparisons() {
+  const std::array tokens{10, 20, 30, 40};
+  const auto expected = std::as_bytes(std::span(tokens));
+  const auto prefix = std::span(tokens).first(2);
+  const auto emitted = std::span(tokens).last(2);
+  auto check = [](std::span<const std::byte> reference, std::span<const int> history,
+                  std::span<const int> output, size_t count, bool match) {
+    auto report = CompareSpeculativeGolden(reference, history, output);
+    Require(report.at("matched_tokens_checked").as<uint64_t>() == count, "golden coverage");
+    Require(report.contains("next_token_match") == (count != 0), "golden verdict availability");
+    if (count) Require(report.at("next_token_match").as<bool>() == match, "golden token match");
+  };
+  check(expected, prefix, emitted, 2, true);
+  check(expected.first(3 * sizeof(int)), prefix, emitted, 1, true);
+  check(expected, prefix, std::array{30, 99}, 2, false);
+  check(expected.first(prefix.size_bytes()), prefix, emitted, 0, false);
+  check(expected.first(sizeof(int)), prefix, emitted, 0, false);
+  check(expected, std::array{10, 99}, emitted, 0, false);
+
+  Object ab;
+  RecordSpeculativePair(ab, 0, 0, emitted, emitted);
+  Require(ab.at("next_token_match").as<bool>(), "matching A/B pair");
+  RecordSpeculativePair(ab, 0, 1, emitted, std::array{30, 99});
+  RecordSpeculativePair(ab, 1, 0, emitted, emitted);
+  Require(!ab.at("next_token_match").as<bool>(), "early A/B mismatch survives a matching round");
+  auto& first = ab.at("first_token_mismatch");
+  Require(first.at("round").as<uint64_t>() == 0 && first.at("iteration").as<uint64_t>() == 1 &&
+              first.at("token_index").as<int64_t>() == 1,
+          "first A/B mismatch position");
+  Object shorter;
+  RecordSpeculativePair(shorter, 0, 0, emitted.first(1), emitted);
+  Require(!shorter.at("next_token_match").as<bool>(), "different A/B output lengths");
+}
+
 void TestStateError() {
   PostState ref{2, {0x3f80}, {}};
   ref.state = {{0, KvSliceKind::kKvConv, KvSliceDType::kF32, std::vector<std::byte>(4)},
@@ -301,6 +335,7 @@ int main(int argc, char** argv) {
     Require(argc == 3, "expected host and forward paths");
     TestKld();
     TestStateError();
+    TestSpeculativeComparisons();
     Test(argv[1], argv[2]);
     return 0;
   } catch (const std::exception& e) {
