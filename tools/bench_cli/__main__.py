@@ -31,6 +31,8 @@ def build_parser():
         )
     run.add_argument("--url", help="Base URL (defaults to http://<server.bind> or 127.0.0.1:8080).")
     run.add_argument("--api-key", help="Bearer token (defaults to FLINT_API_KEY).")
+    run.add_argument("--case", action="append", help="Run only this case ID (repeatable).")
+    run.add_argument("--tag", help="Name this archived run for bench compare.")
     run.add_argument("--model", help="Model ID (defaults to first /v1/models entry).")
     run.add_argument(
         "--suite",
@@ -90,6 +92,8 @@ def main(argv=None):
     start = perf_counter()
     try:
         if args.command == "run":
+            if args.tag is not None:
+                commands.validate_tag(args.tag)
             if args.rounds < 1 or args.warmup < 0:
                 parser.error("rounds must be positive, warmup must be nonnegative")
             if not math.isfinite(args.timeout) or args.timeout <= 0:
@@ -100,7 +104,7 @@ def main(argv=None):
                 args.api_key = args.api_key or os.getenv("FLINT_API_KEY")
             commands.dispatch_run(args, root, result)
         else:
-            commands.compare(args, result)
+            commands.compare(args, result, root)
     except (
         OSError,
         RuntimeError,
@@ -118,6 +122,9 @@ def main(argv=None):
         human_formatter=commands.human_format,
         repo_root=root,
         archive=args.archive,
+        after_archive=(lambda path: commands.write_tag(path, result.data["metadata"]))
+        if result.data.get("metadata", {}).get("tag")
+        else None,
     )
 
 

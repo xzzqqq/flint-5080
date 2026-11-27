@@ -3,12 +3,16 @@
 import asyncio
 import hashlib
 import json
+import re
 import shlex
+from pathlib import Path
 from urllib.parse import urlsplit
 
 import httpx
 
 from tools.common.config import load_config
+from tools.common.daemon import atomic_json
+from tools.common.output import utc_now
 from tools.common.remote import Executor
 
 from . import client
@@ -108,6 +112,10 @@ def run_remote(cfg, args, root, result):
         "--timeout",
         str(args.timeout),
     ]
+    for case in args.case or []:
+        cmd.extend(["--case", case])
+    if args.tag:
+        cmd.extend(["--tag", args.tag])
     if args.model:
         cmd.extend(["--model", args.model])
     if bench_rel:
@@ -157,6 +165,19 @@ async def run(args, root, result, *, cfg=None):
     ]:
         if selected:
             workloads.update(load_workloads(filename, selected))
+    cases_filter = sorted(set(args.case or [])) or None
+    if cases_filter:
+        missing = set(cases_filter) - {case["id"] for cases in workloads.values() for case in cases}
+        if missing:
+            raise ValueError(
+                f"Unknown case IDs in selected suites {', '.join(suites)}: "
+                + ", ".join(sorted(missing))
+            )
+        workloads = {
+            s: subset
+            for s, cases in workloads.items()
+            if (subset := [case for case in cases if case["id"] in cases_filter])
+        }
     cfg = cfg or load_config(repo_root=root, allow_missing=True)
     url = (args.url or _default_url(cfg.server.bind)).rstrip("/")
     model = args.model or await client.discover_model(url, args.api_key, args.timeout)
@@ -173,7 +194,9 @@ async def run(args, root, result, *, cfg=None):
         metrics_version=2,
         client_location="local",
         model=model,
-        suites=list(suites),
+        suites=list(workloads),
+        cases_filter=cases_filter,
+        tag=args.tag,
         rounds=args.rounds,
         warmup=args.warmup,
         telemetry=args.telemetry,
@@ -226,6 +249,7 @@ METRICS = (
     "server_decode_tok_s",
     "client_e2e_ms",
     "cached_prefix_ratio",
+    "tokens_per_round",
 )
 
 
@@ -236,8 +260,58 @@ def read_run(path):
     return record
 
 
-def compare(args, result):
-    baseline, candidate = read_run(args.baseline), read_run(args.candidate)
+def validate_tag(tag):
+    if not re.fullmatch(r"[a-zA-Z0-9._-]+", tag) or tag in {"latest", "prev"}:
+        raise ValueError(
+            f"Invalid bench tag {tag!r}. Use [a-zA-Z0-9._-]+ (latest and prev are reserved)."
+        )
+
+
+def write_tag(path, metadata):
+    tag = metadata["tag"]
+    atomic_json(
+        path.parent / "tags" / f"{tag}.json",
+        dict(run_file=path.name, tag=tag, suites=metadata["suites"], created_at=utc_now()),
+    )
+
+
+def resolve_run(spec, root):
+    path = Path(spec)
+    if path.exists():
+        return path
+    name = str(spec)
+    archive = root / ".runs"
+    if name.startswith("@"):
+        tag = name[1:]
+        validate_tag(tag)
+        pointer = archive / "tags" / f"{tag}.json"
+        if not pointer.is_file():
+            raise ValueError(f"Unknown bench tag {name}")
+        target = archive / json.loads(pointer.read_text())["run_file"]
+        if not target.is_file():
+            raise ValueError(f"Missing archived run for {name}: {target}")
+        return target
+    alias, sep, suite = name.partition(":")
+    if alias in {"latest", "prev"}:
+        if sep and suite not in (*PERF, "canary"):
+            raise ValueError(f"Unknown suite in {name!r}")
+        skip = int(alias == "prev")
+        for record in sorted(archive.glob("*-bench-run-*.json"), reverse=True):
+            if sep and suite not in json.loads(record.read_text())["data"].get("metadata", {}).get(
+                "suites", []
+            ):
+                continue
+            if not skip:
+                return record
+            skip -= 1
+        raise ValueError(f"No archived bench run available for {name!r}")
+    raise ValueError(f"Bench run path does not exist: {path}")
+
+
+def compare(args, result, root):
+    baseline, candidate = (
+        read_run(resolve_run(spec, root)) for spec in (args.baseline, args.candidate)
+    )
     warnings = []
     for label, record in (("baseline", baseline), ("candidate", candidate)):
         if not record["ok"]:
@@ -249,6 +323,7 @@ def compare(args, result):
         "client_location",
         "model",
         "suites",
+        "cases_filter",
         "rounds",
         "warmup",
         "telemetry",
@@ -321,10 +396,12 @@ def human_format(result):
             "server_tpot_ms",
             "server_decode_tok_s",
             "cached_prefix_ratio",
+            "tokens_per_round",
+            "spec_accepted_per_round",
         )
         lines.append(
             "suite   case                     prefill ms   TTFT ms    E2E ms   TPOT ms  "
-            "    tok/s    cached"
+            "    tok/s    cached   tok/rnd       acc"
         )
         for suite, cases in result.data.get("cases", {}).items():
             for name, case in cases.items():

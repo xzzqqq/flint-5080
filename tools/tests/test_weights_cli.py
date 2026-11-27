@@ -414,6 +414,7 @@ def test_kld_lifecycle(cfg, resident, flags, build, failure):
         assert start.called is not resident
         if not resident:
             options = start.call_args.args[1]
+            assert not options.reset_baseline
             assert options.kv_seq_len == 3 and options.no_build == args.no_build
 
 
@@ -434,6 +435,9 @@ def test_kld_human_format():
         metrics,
         ref="baseline",
         cand="current",
+        ref_sha256="a" * 64,
+        cand_sha256="a" * 64,
+        same_binary=True,
         elapsed_ms=42,
         unload_loss_bytes=0,
         cases=[dict(metrics, name="math")],
@@ -441,6 +445,8 @@ def test_kld_human_format():
     out = commands.human_format(RunResult("weights kld", True, data))
     for field in (
         "baseline → current",
+        "ref aaaaaaaaaaaa  cand aaaaaaaaaaaa",
+        "WARNING: ref and cand are identical binaries (aaaaaaaaaaaa)",
         "math: 3 positions",
         "total: 3 positions",
         "top-1 100.00%",

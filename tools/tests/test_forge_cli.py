@@ -1,6 +1,7 @@
 """CPU coverage for the workbench, runnable with python -m unittest."""
 
 import argparse
+import hashlib
 import io
 import json
 import os
@@ -64,6 +65,8 @@ class ForgeCLI(unittest.TestCase):
         for args in [
             ["start", "--no-model", "--kv-seq-len", "256", "--scratch-mb", "16"],
             ["stop", "--force"],
+            ["freeze-baseline", "trial", "--no-build"],
+            ["profile", "--compare", "a.json", "b.json"],
             ["status"],
             ["ls"],
             ["rm", "trial"],
@@ -107,7 +110,7 @@ class ForgeCLI(unittest.TestCase):
                 def execute(args):
                     commands.execute(self.cfg, self.parser.parse_args(args), result)
 
-                execute(["run", "--no-graph", "--layers", "0..4"])
+                execute(["run", "--no-graph", "--layers", "0..4", "--context-len", "1024"])
                 ex.sync.assert_called_once_with()
                 build_call, request = ex.run.call_args_list
                 build = build_call.args[0]
@@ -119,6 +122,7 @@ class ForgeCLI(unittest.TestCase):
                 q = json.loads(request.kwargs["input_text"])
                 self.assertEqual(q["input_ids"], [4, 5])
                 self.assertFalse(q["use_cuda_graph"])
+                self.assertEqual(q["context_len"], 1024)
                 self.assertEqual((q["begin_visit"], q["end_visit"]), (0, 4))
                 for args in [
                     ["ab", "baseline", "trial"],
@@ -141,11 +145,20 @@ class ForgeCLI(unittest.TestCase):
         with (
             patch.object(commands, "build") as build,
             patch.object(commands, "GpuLeaseManager"),
-            patch.object(commands, "host_call", return_value={"pid": 1, "heartbeat": 2}) as call,
+            patch.object(
+                commands,
+                "host_call",
+                return_value={"pid": 1, "heartbeat": 2, "host_started_epoch": 3},
+            ) as call,
         ):
-            commands.execute(self.cfg, self.parser.parse_args(["start", "--no-model"]), result)
+            commands.execute(
+                self.cfg,
+                self.parser.parse_args(["start", "--no-model", "--reset-baseline"]),
+                result,
+            )
             self.assertEqual(build.call_args.args[-1], ["forge-host", "stub_forward"])
             argv = call.call_args.args[-1]["argv"]
+            self.assertIn("--reset-baseline", argv)
             stub = "engine/build/stub_forward.so"
             self.assertEqual(argv[argv.index("--baseline") + 1], stub)
             commands.execute(self.cfg, self.parser.parse_args(["run", "--save", "trial"]), result)
@@ -177,6 +190,48 @@ class ForgeCLI(unittest.TestCase):
             self.assertEqual(host.dispatch("ls", {})["candidates"], ["baseline", "trial"])
             host.dispatch("rm", {"name": "trial"})
             self.assertEqual(host.candidates(), ["baseline"])
+
+    def test_freeze_and_kld_snapshots(self):
+        with chdir(self.cfg.repo_root):
+            src = Path("trial.so")
+            src.write_bytes(b"candidate")
+            dst = Path(".forge/candidates/baseline.so")
+            dst.parent.mkdir(parents=True)
+            dst.write_bytes(b"old")
+            with dst.open("rb") as old, patch.object(host, "ipc") as ipc:
+                host.dispatch("freeze-baseline", {"so_path": str(src)})
+                self.assertEqual(old.read(), b"old")
+                self.assertEqual(dst.read_bytes(), b"candidate")
+                ipc.assert_called_once_with({"command": "clear_cache"})
+
+            def measure(q):
+                src.write_bytes(b"rebuilt")
+                self.assertEqual(Path(q["so_cand"]).read_bytes(), b"candidate")
+                return {}
+
+            q = {"command": "kld", "so_ref": str(dst), "so_cand": str(src)}
+            with patch.object(host, "ipc", measure):
+                result = host.dispatch("kld", q)
+            self.assertTrue(result["same_binary"])
+            self.assertEqual(result["ref_sha256"], hashlib.sha256(b"candidate").hexdigest())
+            with patch.object(host, "ipc", return_value={}):
+                self.assertFalse(host.dispatch("kld", q)["same_binary"])
+
+    def test_freeze_build_selection(self):
+        with (
+            patch.object(commands, "build") as build,
+            patch.object(commands, "host_call", return_value={}) as call,
+        ):
+            for argv, rebuilt, source in [
+                ([], True, commands.CURRENT),
+                (["--no-build"], False, commands.CURRENT),
+                (["trial"], False, ".forge/candidates/trial.so"),
+            ]:
+                build.reset_mock()
+                args = self.parser.parse_args(["freeze-baseline", *argv])
+                commands.execute(self.cfg, args, RunResult("forge freeze-baseline", True, {}))
+                self.assertEqual(build.called, rebuilt)
+                self.assertEqual(call.call_args.args[1:], ("freeze-baseline", {"so_path": source}))
 
     def test_save_named_candidate_measures_snapshot(self):
         with chdir(self.cfg.repo_root):
@@ -256,6 +311,7 @@ class ForgeCLI(unittest.TestCase):
                     started = commands.host_call(ex, "start", cfg)
                     try:
                         info = json.loads(info_path.read_text())
+                        self.assertGreater(info["host_started_epoch"], 0)
                         self.assertTrue(info["session"] and info["no_model"])
                         self.assertEqual(lease.inspect().record.pid, started["pid"])
                         self.assertNotEqual(started["pid"], started["launcher"])
@@ -309,3 +365,76 @@ class ForgeCLI(unittest.TestCase):
         with patch.object(host.shutil, "which", return_value=None):
             with self.assertRaisesRegex(RuntimeError, "nsys is missing"):
                 host.capture({})
+
+    def test_stale_host_inputs_and_dispatch(self):
+        with chdir(self.cfg.repo_root), patch.object(host, "ipc", return_value={}):
+            atomic_json(host.INFO, {"host_started_epoch": 100})
+            stale_paths = [
+                "engine/CMakeLists.txt",
+                "engine/src/forge/replay.cpp",
+                "engine/src/forge/sub/header.h",
+                "engine/src/common/numeric.h",
+                "engine/src/loader/weights.cpp",
+                "engine/src/runtime/sampler.cu",
+            ]
+            other = [
+                "forge/forward_entry.cpp",
+                "forge/stub_forward_entry.cpp",
+                "ops/kernel.cu",
+                "model/forward.cpp",
+                "runtime/other.cpp",
+            ]
+            for name in [*stale_paths, *("engine/src/" + p for p in other)]:
+                path = Path(name)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+                epoch = 100 if name in stale_paths else 200
+                os.utime(path, (epoch, epoch))
+            self.assertEqual(host.host_staleness(), {"host_stale": False, "stale_files": []})
+            for name in stale_paths:
+                os.utime(name, (101, 101))
+                self.assertIn(name, host.host_staleness()["stale_files"])
+                os.utime(name, (100, 100))
+            for name in stale_paths:
+                os.utime(name, (101, 101))
+            for command in ["status", "run", "ab", "profile", "dump"]:
+                with patch.object(host, "ipc", return_value={"path": stale_paths[0]}):
+                    data = host.dispatch(command, {"command": command})
+                self.assertTrue(data["host_stale"])
+                self.assertEqual(data["stale_files"], sorted(stale_paths)[:5])
+                human = commands.human_format(RunResult("forge " + command, True, data))
+                self.assertIn("WARNING " + data["host_stale_warning"], human)
+            atomic_json(host.INFO, {"pid": 1})
+            self.assertFalse(host.host_staleness()["host_stale"])
+            os.utime(host.INFO, (100, 100))
+            self.assertTrue(host.host_staleness()["host_stale"])
+
+    def test_ptxas_controller(self):
+        self.cfg.remote.enabled = True
+        with (
+            patch.object(commands, "Executor") as ctor,
+            patch.object(commands, "modified_cuda_files") as modified,
+        ):
+            ex = ctor.return_value
+            ex.run.return_value.stdout = "[]"
+            result = RunResult("forge ptxas", True, {})
+            for flags, modified_paths, expected in [
+                ([], ["engine/test space.cu"], ["--", "engine/test space.cu"]),
+                ([], [], ["--"]),
+                (["--all"], [], ["--all", "--"]),
+                (["--no-sync", "explicit.cu"], [], ["--", "explicit.cu"]),
+            ]:
+                ex.reset_mock()
+                modified.reset_mock()
+                modified.return_value = modified_paths
+                commands.execute(self.cfg, self.parser.parse_args(["ptxas", *flags]), result)
+                self.assertEqual(ex.sync.call_count, int("--no-sync" not in flags))
+                self.assertEqual(modified.call_count, int(not flags))
+                configure, inspect = ex.run.call_args_list
+                self.assertIn("if ! test -f engine/build/compile_commands.json", configure.args[0])
+                self.assertNotIn("cmake --build", configure.args[0])
+                self.assertEqual(
+                    shlex.split(inspect.args[0]),
+                    ["python3", "-m", "tools.forge_cli._ptxas", *expected],
+                )
+                self.assertEqual(result.data["kernels"], [])

@@ -131,6 +131,7 @@ def kld(cfg, args, result):
         start_args = Namespace(
             path=str(path),
             no_model=False,
+            reset_baseline=False,
             no_build=args.no_build,
             kv_seq_len=max(len(case["token_ids"]) for case in cases),
             scratch_mb=None,
@@ -150,6 +151,10 @@ def human_format(result):
     data = result.data
     if result.command == "weights kld":
         lines = [f"weights kld OK  {data['ref']} → {data['cand']}"]
+        ref, cand = data["ref_sha256"][:12], data["cand_sha256"][:12]
+        lines.append(f"  SHA-256  ref {ref}  cand {cand}")
+        if data["same_binary"]:
+            lines.append(f"WARNING: ref and cand are identical binaries ({ref})")
         for row in [*data["cases"], dict(data, name="total")]:
             lines.append(
                 f"  {row['name']}: {row['num_positions']} positions, KL mean/p95/max "

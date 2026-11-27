@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import shutil
@@ -21,6 +22,8 @@ from tools.common.daemon import (
     supervise_leased_process,
     wait_for,
 )
+
+from ._nsys import analyze_report
 
 STATE = Path(".forge")
 INFO = STATE / "daemon.json"
@@ -70,6 +73,7 @@ def supervise(cfg: dict) -> None:
             status["pid"],
             dict(
                 session=session,
+                host_started_epoch=time.time(),
                 no_model="--no-model" in cfg["argv"],
                 load_ms=(time.monotonic() - started) * 1000,
             ),
@@ -94,6 +98,7 @@ def start(cfg: dict) -> dict:
             **ipc({"command": "status"}, timeout=5),
             load_ms=info["load_ms"],
             heartbeat=info["heartbeat"],
+            host_started_epoch=info["host_started_epoch"],
         )
 
     return spawn_supervisor(
@@ -132,6 +137,42 @@ def run_and_save(q, name):
     return dict(data, saved=name)
 
 
+def freeze_baseline(src: Path) -> dict:
+    dst = STATE / "candidates/baseline.so"
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=dst.parent) as directory:
+        tmp = Path(directory) / dst.name
+        shutil.copyfile(src, tmp)
+        tmp.replace(dst)
+    try:
+        ipc({"command": "clear_cache"})
+    except (FileNotFoundError, ConnectionRefusedError):
+        pass
+    return {"baseline": str(dst), "source": str(src)}
+
+
+def kld(q: dict) -> dict:
+    # Pin the exact bytes measured even if current is rebuilt during a long KLD run.
+    with tempfile.TemporaryDirectory() as directory:
+        request = q.copy()
+        hashes = {}
+        for role in ("ref", "cand"):
+            key = "so_" + role
+            path = Path(directory) / (role + ".so")
+            shutil.copyfile(q[key], path)
+            hashes[role] = hashlib.sha256(path.read_bytes()).hexdigest()
+            request[key] = str(path)
+        data = ipc(request)
+    return dict(
+        data,
+        ref=q["so_ref"],
+        cand=q["so_cand"],
+        ref_sha256=hashes["ref"],
+        cand_sha256=hashes["cand"],
+        same_binary=hashes["ref"] == hashes["cand"],
+    )
+
+
 def capture(q):
     if not shutil.which("nsys"):
         raise RuntimeError("nsys is missing on the execution host")
@@ -147,7 +188,38 @@ def capture(q):
         path = wait_for(
             lambda: next(iter(set(directory.glob(pattern)) - previous), None), 30, "Nsight report"
         )
+    data["nsys_summary"] = analyze_report(path, data.get("elapsed_ms", {}).get("median"))
     data.update(report=str(path), report_bytes=path.stat().st_size)
+    return data
+
+
+def host_staleness():
+    try:
+        with INFO.open() as state:
+            # Older supervisors published this file once, when the host became ready.
+            epoch = json.load(state).get("host_started_epoch", os.fstat(state.fileno()).st_mtime)
+    except FileNotFoundError:
+        epoch = None
+    stale = []
+    if epoch is not None:
+        src = Path("engine/src")
+        paths = [Path("engine/CMakeLists.txt"), *(src / "runtime").glob("sampler.*")]
+        for directory in ("forge", "loader", "common"):
+            paths.extend((src / directory).rglob("*"))
+        excluded = {
+            src / "forge" / name for name in ("forward_entry.cpp", "stub_forward_entry.cpp")
+        }
+        stale = [
+            str(p)
+            for p in sorted(paths)
+            if p not in excluded and p.is_file() and p.stat().st_mtime > epoch
+        ][:5]
+    data = dict(host_stale=bool(stale), stale_files=stale)
+    if stale:
+        data["host_stale_warning"] = (
+            "forge-host sources changed since startup. Rebuild and restart forge: "
+            + ", ".join(stale)
+        )
     return data
 
 
@@ -158,6 +230,10 @@ def dispatch(op: str, q: dict) -> dict | None:
         return start(q)
     if op == "stop":
         return stop(q["force"])
+    if op == "freeze-baseline":
+        return freeze_baseline(Path(q["so_path"]))
+    if op == "kld":
+        return kld(q)
     if op == "ls":
         return {"candidates": candidates()}
     if op == "rm":
@@ -165,16 +241,18 @@ def dispatch(op: str, q: dict) -> dict | None:
         return {"removed": q["name"]}
     if op == "status":
         try:
-            return dict(running=True, candidates=candidates(), **ipc({"command": "status"}))
+            status = ipc({"command": "status"})
         except (FileNotFoundError, ConnectionRefusedError):
             return dict(running=False, candidates=candidates())
+        return dict(running=True, candidates=candidates(), **status, **host_staleness())
     saved = q.pop("save", None)
     if saved:
-        return run_and_save(q, saved)
-    data = capture(q) if q.pop("nsys", False) else ipc(q)
+        data = run_and_save(q, saved)
+    else:
+        data = capture(q) if q.pop("nsys", False) else ipc(q)
     if op == "dump" and not Path(data["path"]).is_file():
         raise RuntimeError("Missing dump on execution host")
-    return data
+    return dict(data, **host_staleness())
 
 
 if __name__ == "__main__":

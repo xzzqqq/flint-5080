@@ -9,7 +9,8 @@ and archives the run record locally under `.runs/`.
 Set `FLINT_API_KEY` for authenticated endpoints. The harness discovers the first
 model in `/v1/models` unless given `--model`. It checks an explicit model against
 the name reported by Flint's `/ready` and samples static engine metadata there.
-All generation goes through OpenAI Chat Completions.
+All generation goes through OpenAI Chat Completions. Repeat `--case ID` to run
+specific cases from the selected suites. Use `--tag NAME` to name an archived run.
 
 ## Fixed synthetic inputs
 
@@ -48,8 +49,8 @@ TPOT is decode ms per decode **round**. With `metrics_version=2`,
 `server_decode_tok_s` is
 `(decode_tokens - 1) / (decode_ms / 1000)`. It counts tokens emitted during
 decode rounds, excluding the first token generated during prefill. The rate is
-unavailable when no such tokens were emitted or decode time is zero. Tokens per
-round can vary under speculative decoding. Report cached tokens over
+unavailable when no such tokens were emitted or decode time is zero. For positive decode rounds, `tok/rnd` reports decode-generated tokens per round
+and `acc` reports accepted speculative tokens per round. Report cached tokens over
 total prefill tokens and the nonnegative residual of client E2E minus server
 prefill and decode time. That residual includes queueing, transport and server
 overhead. Exact queue wait requires an explicit server timer.
@@ -64,7 +65,9 @@ E2E. Retain standard usage when supplied. With external endpoints or
 Server-only metrics and token rates with unknown counts remain unavailable.
 
 Use `./bin/bench compare BASELINE.json CANDIDATE.json` on archived runs or JSON
-stdout. Pair **performance case medians** by suite and case ID. Each matched
+stdout. Either argument also accepts `@tag`, `latest` or `prev`. Append a suite
+to a recency alias (for example, `prev:short`) to count only runs containing it.
+Pair **performance case medians** by suite and case ID. Each matched
 case contributes one ratio, independent of rounds, slots or session length.
 Report the geometric mean of candidate/baseline and its inverse orientation.
 For latencies, baseline/candidate is speedup. For throughput,
@@ -74,7 +77,7 @@ This interval reflects variation across the fixed cases. A single pair gives
 a point interval. Zero or missing values have no log ratio and appear with
 their original values in the metric's exclusions.
 
-Check warnings for model, selected suites, workload hashes, round and warmup
+Check warnings for model, selected suites, case filters, workload hashes, round and warmup
 counts, telemetry mode, canary status and available GPU/engine configuration.
 `bench compare` also warns on mismatched `metrics_version` or `client_location`
 (`local` or `remote_loopback`), including fields missing from older archives.

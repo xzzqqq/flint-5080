@@ -52,13 +52,32 @@ def build_parser():
     parser = argparse.ArgumentParser(prog="forge", description=__doc__)
     parser.add_argument("--json", action="store_true")
     subs = parser.add_subparsers(dest="command", required=True)
-    for name in ("start", "stop", "status", "run", "ab", "profile", "dump", "ls", "rm"):
+    for name in (
+        "start",
+        "stop",
+        "status",
+        "run",
+        "ab",
+        "profile",
+        "dump",
+        "ls",
+        "rm",
+        "freeze-baseline",
+        "ptxas",
+    ):
         p = subs.add_parser(name)
         p.add_argument("--local", action="store_true")
         p.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
-        if name in {"start", "run", "ab", "profile", "dump"}:
+        if name in {"start", "run", "ab", "profile", "dump", "freeze-baseline"}:
             p.add_argument("--no-build", action="store_true")
+        if name == "freeze-baseline":
+            p.add_argument("candidate", nargs="?", type=candidate, default="current")
+        if name == "ptxas":
+            p.add_argument("files", nargs="*")
+            p.add_argument("--all", action="store_true")
+            p.add_argument("--no-sync", action="store_true")
         if name == "start":
+            p.add_argument("--reset-baseline", action="store_true")
             model = p.add_mutually_exclusive_group()
             model.add_argument("--path")
             model.add_argument("--no-model", action="store_true")
@@ -74,6 +93,12 @@ def build_parser():
             if name != "dump":
                 span.add_argument("--e2e", action="store_true")
                 p.add_argument("--no-graph", action="store_true")
+                p.add_argument(
+                    "--context-len",
+                    type=positive,
+                    help="Tile the prompt to N tokens. Steps 0 and 1 decode immediately. "
+                    "Later steps advance step - 1 tokens first.",
+                )
                 p.add_argument("--no-spec", action="store_true")
             p.add_argument("--step", type=natural, default=0, help="0=prefill, 1=first decode")
             p.add_argument("--case")
@@ -90,7 +115,9 @@ def build_parser():
         if name == "run":
             p.add_argument("--save", type=savable)
         if name == "profile":
-            p.add_argument("--nsys", action="store_true")
+            mode = p.add_mutually_exclusive_group()
+            mode.add_argument("--nsys", action="store_true")
+            mode.add_argument("--compare", nargs=2, type=Path, metavar=("BASE.json", "CAND.json"))
         if name == "dump":
             p.add_argument("--with-state", action="store_true")
             p.add_argument("--out")
@@ -103,7 +130,9 @@ def main(argv=None):
     start = time.monotonic()
     result = RunResult(f"forge {args.command}", True, {})
     try:
-        cfg = load_config(repo_root=root, allow_missing=args.local)
+        cfg = load_config(
+            repo_root=root, allow_missing=args.local or bool(getattr(args, "compare", None))
+        )
         if args.local:
             cfg = replace(cfg, remote=replace(cfg.remote, enabled=False))
         commands.execute(cfg, args, result)

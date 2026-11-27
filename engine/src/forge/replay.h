@@ -31,7 +31,7 @@ class Replay {
 
  private:
   struct Measurement {
-    unsigned begin, end, step, warmup, iters, rounds;
+    unsigned begin, end, step, warmup, iters, rounds, context_len;
     std::string name;
     std::vector<int> ids;
     bool e2e() const { return begin == 0 && end == model::kNumLogicalVisits; }
@@ -49,10 +49,11 @@ class Replay {
 
   struct SpecRound {
     std::vector<int> block, verified, emitted;
+    ForwardRunResult verify_result{};
     double draft_ms, verify_ms, elapsed_ms;
   };
   SpecRound RunSpecRound(ForwardModule&, int anchor, const uint16_t* last, unsigned position,
-                         bool profile);
+                         bool profiler_range, bool enable_profiling = false);
   Object MeasureSpeculative(const Json&, const std::string&, const Measurement&);
   Object Kld(const Json& request);
   Object Measure(const Json& request, const std::string& command);
@@ -64,6 +65,20 @@ class Replay {
   void UploadHidden(const std::vector<float>& data);
   PostState ReadPostState(const Recording& recording, unsigned blocks) const;
   void Restore(const Recording& recording);
+  struct Prefix {
+    std::string key;
+    unsigned position{};
+    std::vector<int> generated;
+    std::vector<uint16_t> last_tap;
+    std::vector<std::pair<std::byte*, std::vector<std::byte>>> mutable_state;
+    Recording recording;
+  };
+  void ResetKv();
+  void PreparePrefix(const Measurement&, bool speculative, Object&);
+  void SaveSpecState(Prefix&);
+  void RecordTail(Recording&, ForwardModule&, unsigned begin, unsigned end, bool resident_prefix);
+  std::optional<Prefix> prefix_;
+  bool baseline_preserved_{};
   DaemonConfig config_;
   std::optional<WeightsArena> weights_;
   std::optional<KvStateArena> kv_;

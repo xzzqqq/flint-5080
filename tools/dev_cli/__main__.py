@@ -41,6 +41,12 @@ def build_parser() -> argparse.ArgumentParser:
         "check",
         "Run local tests or the GPU acceptance checks with model weights and golden fixtures.",
     )
+    check.add_argument(
+        "--only", action="append", help="Run selected checks (repeat or comma-separate)."
+    )
+    fmt = sub("fmt", "Format engine, Rust, and Python sources locally.")
+    fmt.add_argument("--check", action="store_true", help="Report needed changes without writing.")
+    fmt.add_argument("--fix", action="store_true", help="Also apply Ruff lint fixes.")
     modes = check.add_mutually_exclusive_group(required=True)
     modes.add_argument("--local", action="store_true")
     modes.add_argument("--gpu", action="store_true")
@@ -49,20 +55,30 @@ def build_parser() -> argparse.ArgumentParser:
     serve = sub("serve", "Manage the inference server on the execution host.")
     actions = serve.add_subparsers(dest="action", required=True)
     start = actions.add_parser("start", help="Launch the server and wait for readiness.")
+    restart = actions.add_parser("restart", help="Stop and start a fresh server.")
     stop = actions.add_parser("stop", help="Stop the server and release its GPU lease.")
     status = actions.add_parser("status", help="Show the GPU lease and live readiness.")
     logs = actions.add_parser("logs", help="Read recent server log lines.")
-    for action in (start, stop, status, logs):
+    for action in (start, restart, stop, status, logs):
         action.add_argument(
             "--json", action="store_true", default=argparse.SUPPRESS, help=json_help
         )
-    for flag in ("bind", "model-dir", "model-name", "api-key", "binary"):
-        start.add_argument("--" + flag)
-    for flag in ("max-context", "prefill-chunk-size", "prefix-cache-slots", "request-timeout-sec"):
-        start.add_argument("--" + flag, type=int)
-    start.add_argument("--no-cuda-graph", action="store_true")
-    start.add_argument("--no-spec", action="store_true")
-    start.add_argument("--build", action="store_true", help="Rebuild the engine and server first.")
+    for action in (start, restart):
+        for flag in ("bind", "model-dir", "model-name", "api-key", "binary"):
+            action.add_argument("--" + flag)
+        for flag in (
+            "max-context",
+            "prefill-chunk-size",
+            "prefix-cache-slots",
+            "request-timeout-sec",
+        ):
+            action.add_argument("--" + flag, type=int)
+        action.add_argument("--no-cuda-graph", action="store_true")
+        action.add_argument("--no-spec", action="store_true")
+        action.add_argument(
+            "--build", action="store_true", help="Rebuild the engine and server first."
+        )
+    restart.add_argument("--force", action="store_true")
     stop.add_argument("--force", action="store_true")
     logs.add_argument("--lines", type=int, default=100)
     return parser
@@ -74,7 +90,7 @@ def main(argv: list[str] | None = None) -> int:
     result = RunResult(f"dev {args.command}", True, {})
     root = find_repo_root(Path(__file__))
     try:
-        optional = args.command == "serve" or (args.command == "check" and args.local)
+        optional = args.command in {"serve", "fmt"} or (args.command == "check" and args.local)
         cfg = load_config(repo_root=root, allow_missing=optional)
         if args.command == "ssh":
             executor = Executor(cfg)
@@ -95,6 +111,7 @@ def main(argv: list[str] | None = None) -> int:
             handler = {
                 "build": commands.build,
                 "check": commands.check,
+                "fmt": commands.fmt,
                 "status": commands.status,
                 "serve": commands.serve,
             }[args.command]

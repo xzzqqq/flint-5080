@@ -85,6 +85,10 @@ int RunDaemon(std::span<char*> args) {
       synthetic = true;
       continue;
     }
+    if (key == "--reset-baseline") {
+      cfg.reset_baseline = true;
+      continue;
+    }
     if (++i == args.size()) throw std::runtime_error("missing daemon option value");
     auto v = args[i];
     if (key == "--socket")

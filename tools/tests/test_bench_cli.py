@@ -546,6 +546,7 @@ def test_zero_decode_and_empty_stream(decode_tokens, decode_ms):
     m = asyncio.run(run()).metrics
     assert m["cached_prefix_ratio"] == 0
     assert m["chunk_count"] == 0 and m["client_ttft_ms"] is None
+    assert "tokens_per_round" not in m and "spec_accepted_per_round" not in m
     assert "server_tpot_ms" not in m and "server_decode_tok_s" not in m
 
 
@@ -580,7 +581,22 @@ sys.exit(int(failed))
     monkeypatch.setattr(Executor, "_args", local_transport)
     monkeypatch.setattr(Executor, "sync", lambda self: calls.append(("sync", self.cfg.remote.host)))
     monkeypatch.setenv("FLINT_API_KEY", "secret-token")
-    res = invoke("run", "--suite", "short", "--rounds", "2", "--warmup", "1", "--json")
+    res = invoke(
+        "run",
+        "--suite",
+        "short",
+        "--rounds",
+        "2",
+        "--warmup",
+        "1",
+        "--case",
+        "short_chat",
+        "--case",
+        "short_debug",
+        "--tag",
+        "remote",
+        "--json",
+    )
     assert res["ok"] and Path(res["run_file"]).parent == repo / ".runs"
     assert calls[0] == ("sync", "gpu-5080")
     _, argv = calls[1]
@@ -595,6 +611,11 @@ sys.exit(int(failed))
         "--url",
         "http://127.0.0.1:9090",
     ]
+    assert [argv[i + 1] for i, flag in enumerate(argv) if flag == "--case"] == [
+        "short_chat",
+        "short_debug",
+    ]
+    assert argv[argv.index("--tag") + 1] == "remote"
     assert "--api-key-stdin" in argv and "secret-token" not in argv
     assert res["data"]["metadata"]["client_location"] == "remote_loopback"
 
@@ -638,3 +659,64 @@ def test_tool_call_parity_uses_payload(harness):
     path.write_text(json.dumps({"canary": [case]}))
     result = invoke("run", "--json", "--suite", "canary", "--canary-file", str(path))
     assert result["data"]["metadata"]["canary_passed"]
+
+
+def test_filtered_tagged_runs_and_aliases(harness, monkeypatch):
+    endpoint, invoke, repo = harness
+    run = ["run", "--rounds", "1", "--warmup", "0", "--json"]
+    first = invoke(*run, "--case", "short_chat", "--tag", "base.v2")
+    meta = first["data"]["metadata"]
+    assert meta["tag"] == "base.v2" and meta["cases_filter"] == ["short_chat"]
+    assert meta["suites"] == ["short"] and meta["canary_passed"] is None
+    assert len(endpoint.chat) == 1
+    pointer = json.loads((repo / ".runs/tags/base.v2.json").read_text())
+    assert pointer["tag"] == "base.v2" and pointer["suites"] == ["short"] and pointer["created_at"]
+    assert repo / ".runs" / pointer["run_file"] == Path(first["run_file"])
+    metrics = first["data"]["cases"]["short"]["short_chat"]["summary"]
+    assert metrics["tokens_per_round"]["median"] == 1.75
+    assert metrics["spec_accepted_per_round"]["median"] == 0.75
+    second = invoke(*run, "--case", "short_debug", "--case", "short_chat", "--case", "short_debug")
+    assert second["data"]["metadata"]["cases_filter"] == ["short_chat", "short_debug"]
+    invoke(*run, "--suite", "canary", "--case", "math_reasoning")
+
+    def compare(a, b):
+        return invoke("compare", a, b, "--json")["data"]
+
+    expected = compare(first["run_file"], second["run_file"])
+    assert compare("@base.v2", "prev") == compare("prev:short", "latest:short") == expected
+    assert any("cases_filter" in w for w in expected["warnings"])
+    assert expected["metrics"]["tokens_per_round"]["pairs"][0]["ratio"] == 1
+    assert compare("latest", "latest:canary")["warnings"] == []
+    monkeypatch.chdir(repo)
+    Path("latest").write_text(Path(first["run_file"]).read_text())
+    assert compare("latest", "@base.v2")["warnings"] == []
+    out = invoke("run", "--case", "short_chat", "--no-archive", "--tag", "skip", human=True)
+    assert "tok/rnd" in out and "acc" in out and "1.75" in out and "0.75" in out
+    assert not (repo / ".runs/tags/skip.json").exists()
+
+
+@pytest.mark.parametrize("tag", ["latest", "prev", "a/b", "@bad", "", "x y"])
+def test_invalid_tag(harness, tag):
+    endpoint, invoke, _ = harness
+    error = invoke("run", "--tag", tag, "--json", "--no-archive", code=1)["error"]
+    assert "Invalid bench tag" in error and not endpoint.requests
+
+
+def test_filters_and_alias_errors(harness):
+    endpoint, invoke, _ = harness
+    res = invoke(
+        "run",
+        "--suite",
+        "short",
+        "--case",
+        "math_reasoning",
+        "--case",
+        "missing",
+        "--no-archive",
+        "--json",
+        code=1,
+    )
+    assert all(word in res["error"] for word in ("short", "missing", "math_reasoning"))
+    assert not endpoint.requests
+    for arg in ("latest", "prev:short", "@absent", "prev:bad"):
+        assert arg in invoke("compare", arg, arg, "--json", code=1)["error"]

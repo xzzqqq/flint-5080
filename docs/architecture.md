@@ -74,9 +74,10 @@
 
 - **整图 `forward.so` 秒级热重载**：放弃固定算子槽位插件 ABI，将完整前向编排、CUDA Graph、DSpark 与全部算子统一链接为单一 `forward.so`（Forge ABI 见 [forward_abi.h](../engine/src/forge/forward_abi.h)），使跨算子融合、跨层重排、KV 编码改动或双流重叠均可无条件热加载。借助单架构 `sm_120a`、关闭 `-rdc`、动态链接 CUDA 运行时与头文件隔离的 `ops/*.cu`，单算子改动可秒级增量重编并进程内热替换。
 - **区间懒录制与安全对照**：前向接受逻辑层区间 `(begin, end)`，首次局部回放时宿主自动用冻结的 `baseline.so` 截获真实上下文与状态快照并缓存，零注册宏；每次 `dlopen`/`dlclose` 前后比对显存防止泄漏；内置 `--no-graph`、`--no-spec` 与 `return_logits` 零开销对照开关。
+- 宿主重启保留基线。`forge freeze-baseline [candidate]` 原子替换基线并清空回放缓存，`forge start --reset-baseline` 在启动时重新冻结当前构建。`--context-len N` 将用例循环填充至 N 个 token，分块预填充。重复测量复用显存中的 Full KV，仅恢复当前步可写的状态。
 - **三层闭环验证**：
-  - `forge`（`start/stop/status`、`run`、`ab`、`profile`、`dump`、`ls/rm`）驱动高频延迟/SOL 与交错 A/B 迭代；
-  - `weights golden`（`ops`/`e2e`/`mtp`/`chat` 四级夹具）锁死语义对齐，`weights kld` 经由常驻 `forge-host`（空闲时自动持锁拉起并回收）以 FP64 计算 teacher-forced KLD，为非逐位优化与量化守门；
+  - `forge`（`start/stop/status`、`run`、`ab`、`profile`、`dump`、`ls/rm`）驱动延迟/SOL 测量与交错 A/B；`profile --step 1` 输出 Verify 各阶段耗时，`profile --nsys` 在执行机汇总 kernel 和 CUDA API，`profile --compare` 在本地比较两份归档。
+  - `weights golden`（`ops`/`e2e`/`mtp`/`chat` 四级夹具）锁死语义对齐，`weights kld` 经由常驻 `forge-host`（空闲时自动持锁拉起并回收）以 FP64 计算 teacher-forced KLD，记录两份二进制文件的 SHA-256，摘要相同时提示警告；
   - `bench` 以黑盒 HTTP 压测与配对统计执行端到端验收。
 
 ---
@@ -85,8 +86,8 @@
 
 开发/评测统一收归 `tools/`，共享零第三方依赖的 `tools/common/`（`.dev.toml` 单一配置、本地/远程工作区隔离同步、权重/`ccache` 全局共享、单卡 lease 进程监管与 `--json` / `.runs/` 归档），仅暴露 4 个顶层入口（参数以 `--help` 为准）：
 
-- **`dev`**（纯 stdlib）：远程状态查询、增量构建、生产服务生命周期与本地/GPU 分层验收。
-- **`forge`**（纯 stdlib）：驱动常驻 `forge-host` 的全部热重载调优原语。
+- **`dev`**（纯 stdlib）：远程状态查询、增量构建与生产服务管理（含 `dev serve restart`）。`dev fmt` 统一本地格式化；`dev check --only` 可筛选本地或 GPU 验收项，支持 `ctest:<regex>`。
+- **`forge`**（纯 stdlib）：驱动常驻 `forge-host` 的热重载调优，宿主源文件更新时提示重启。`forge ptxas [files...] [--all]` 根据编译数据库单独编译 CUDA 单元并报告各 kernel 的寄存器、共享内存与溢出字节数。默认检查改动的 CUDA 文件，无改动时检查全部算子。
 - **`bench`**（轻量异步 HTTP）：黑盒 OpenAI HTTP 压测、canary 回归与配对统计对比。
 - **`weights`**（纯 stdlib 前端，离线生成走独立 PyTorch 环境）：权重检视、四级黄金夹具、teacher-forced KLD 与离线布局重排。
 

@@ -173,7 +173,7 @@ def _aggregate_tool_checks(tools, empty_reason):
     return {"status": "passed", "tools": tools}
 
 
-def _check_format(root, executor):
+def _engine_format_sources(root):
     suffixes = {".h", ".hpp", ".c", ".cc", ".cpp", ".cu", ".cuh"}
     engine = root / "engine"
     sources = []
@@ -189,17 +189,25 @@ def _check_format(root, executor):
             if Path(name).suffix in suffixes
         )
 
+    return sorted(sources)
+
+
+def _check_format(root, executor, *, check=True, fix=False):
+    sources = _engine_format_sources(root)
     tools = {}
     if not sources:
         tools["clang-format"] = {"status": "skipped", "reason": "no engine sources"}
     elif not shutil.which("clang-format"):
         tools["clang-format"] = {"status": "failed", "error": "clang-format is missing"}
     else:
-        command = shlex.join(["clang-format", "--dry-run", "--Werror", *sorted(sources)])
+        flags = ["--dry-run", "--Werror"] if check else ["-i"]
+        command = shlex.join(["clang-format", *flags, *sources])
         _check_step(executor, tools, "clang-format", command)
 
     if (root / "server/Cargo.toml").is_file():
-        _check_step(executor, tools, "cargo fmt", "cd server && cargo fmt --check")
+        _check_step(
+            executor, tools, "cargo fmt", "cd server && cargo fmt" + (" --check" if check else "")
+        )
     else:
         tools["cargo fmt"] = {"status": "skipped", "reason": "server/Cargo.toml is missing"}
 
@@ -208,9 +216,25 @@ def _check_format(root, executor):
     elif not (ruff := _ruff_runner()):
         tools["ruff format"] = {"status": "failed", "error": "ruff is missing"}
     else:
-        _check_step(executor, tools, "ruff format", f"{ruff} format --check tools")
+        if fix:
+            _check_step(
+                executor,
+                tools,
+                "ruff check",
+                f"{ruff} check" + ("" if check else " --fix") + " tools",
+            )
+        mode = " --check" if check else ""
+        _check_step(executor, tools, "ruff format", f"{ruff} format{mode} tools")
 
     return _aggregate_tool_checks(tools, "no engine, server, or python tool sources")
+
+
+def fmt(cfg, args, result):
+    local = replace(cfg, remote=replace(cfg.remote, enabled=False))
+    report = _check_format(cfg.repo_root, Executor(local), check=args.check, fix=args.fix)
+    result.data["tools"] = report["tools"]
+    if report["status"] == "failed":
+        result.ok, result.error = False, ", ".join(report["errors"])
 
 
 def _check_lint(root, executor):
@@ -235,17 +259,26 @@ def _check_lint(root, executor):
     return _aggregate_tool_checks(tools, "no server or python tool sources")
 
 
-def _check_local(cfg, checks):
+LOCAL_CHECKS = ("pytest", "cargo", "format", "lint", "hygiene")
+
+
+def _check_local(cfg, checks, selected):
     local = replace(cfg, remote=replace(cfg.remote, enabled=False))
     executor = Executor(local)
     runner = "uv run pytest" if shutil.which("uv") else "pytest"
-    _check_step(executor, checks, "pytest", f"{runner} tools/tests")
-    if (cfg.repo_root / "server/Cargo.toml").is_file():
-        _check_step(executor, checks, "cargo", "cd server && cargo test")
-    else:
-        checks["cargo"] = {"status": "skipped", "reason": "server/Cargo.toml is missing"}
-    checks["format"] = _check_format(cfg.repo_root, executor)
-    checks["lint"] = _check_lint(cfg.repo_root, executor)
+    if "pytest" in selected:
+        _check_step(executor, checks, "pytest", f"{runner} tools/tests")
+    if "cargo" in selected:
+        if (cfg.repo_root / "server/Cargo.toml").is_file():
+            _check_step(executor, checks, "cargo", "cd server && cargo test")
+        else:
+            checks["cargo"] = {"status": "skipped", "reason": "server/Cargo.toml is missing"}
+    if "format" in selected:
+        checks["format"] = _check_format(cfg.repo_root, executor)
+    if "lint" in selected:
+        checks["lint"] = _check_lint(cfg.repo_root, executor)
+    if "hygiene" not in selected:
+        return
     errors = []
     for name in ("dev", "forge", "bench", "weights"):
         path = cfg.repo_root / "bin" / name
@@ -351,20 +384,44 @@ def _gpu_check_commands(model_dir, golden_dir):
     }
 
 
+def _select_checks(requested, valid, *, gpu=False):
+    unknown = [
+        name
+        for name in requested
+        if name not in valid and not (gpu and name.startswith("ctest:") and name[6:])
+    ]
+    if unknown:
+        options = list(valid)
+        if gpu:
+            options.append("ctest:<regex>")
+        raise ValueError(
+            f"Unknown --only value(s) {unknown!r}. Valid options: {', '.join(options)}"
+        )
+    return list(dict.fromkeys(requested or valid))
+
+
 def check(cfg, args, result):
     result.data["mode"] = "local" if args.local else "gpu"
     checks = result.data["checks"] = {}
+    requested = [item.strip() for group in args.only or [] for item in group.split(",")]
     if args.local:
-        _check_local(cfg, checks)
+        selected = _select_checks(requested, LOCAL_CHECKS)
+        _check_local(cfg, checks, selected)
     else:
-        model_dir = cfg.resolve_model_dir(
-            error_message="Set model.weights_dir in .dev.toml for GPU acceptance checks"
-        )
-        golden_dir = cfg.resolve_golden_dir(model_dir)
+        model_dir = cfg.resolve_model_dir() if cfg.model.weights_dir else Path(".")
+        commands = _gpu_check_commands(model_dir, cfg.resolve_golden_dir(model_dir))
+        selected = _select_checks(requested, commands, gpu=True)
+        if not cfg.model.weights_dir and any(name.split(":")[0] != "ctest" for name in selected):
+            raise ConfigError("Set model.weights_dir in .dev.toml for GPU acceptance checks")
         executor = Executor(cfg)
         executor.sync()
         with GpuLeaseManager(cfg, executor).hold("dev-check"):
-            for name, lines in _gpu_check_commands(model_dir, golden_dir).items():
+            for name in selected:
+                if name.startswith("ctest:"):
+                    require, command = commands["ctest"]
+                    lines = [require, command + " -R " + shlex.quote(name.removeprefix("ctest:"))]
+                else:
+                    lines = commands[name]
                 _check_step(executor, checks, name, "\n".join(lines))
     failed = [name for name, detail in checks.items() if detail["status"] == "failed"]
     if failed:
@@ -377,13 +434,13 @@ def serve(cfg, args, result):
     data = result.data
     data["action"] = args.action
 
-    def call(payload):
+    def call(action, payload):
         python = "python3" if cfg.is_remote else sys.executable
-        command = shlex.join([python, "-m", "tools.dev_cli._serve_host", args.action])
+        command = shlex.join([python, "-m", "tools.dev_cli._serve_host", action])
         reply = executor.run(command, input_text=json.dumps(payload), check=True)
-        data.update(json.loads(reply.stdout))
+        return json.loads(reply.stdout)
 
-    if args.action == "start":
+    if args.action in {"start", "restart"}:
         model_dir = cfg.resolve_model_dir(
             args.model_dir, error_message="Set model.weights_dir or pass --model-dir"
         )
@@ -403,25 +460,36 @@ def serve(cfg, args, result):
             argv.append("--no-cuda-graph")
         if args.no_spec:
             argv.append("--no-spec")
+        restarting = args.action == "restart"
+        if restarting:
+            executor.sync()
+            call("stop", {"force": args.force})
         record = lease.acquire("serve")
         try:
             with lease.heartbeat(record, cfg.gpu.lease_ttl_sec):
                 if args.build:
-                    build(cfg, argparse.Namespace(no_sync=False, clean=False, target="all"), result)
-                else:
+                    build(
+                        cfg,
+                        argparse.Namespace(no_sync=restarting, clean=False, target="all"),
+                        result,
+                    )
+                elif not restarting:
                     executor.sync()
             if not result.ok:
                 lease.release_unbound(record.token)
                 return
-            call(
-                dict(
-                    argv=argv,
-                    bind=bind,
-                    binary=args.binary,
-                    api_key=args.api_key,
-                    token=record.token,
-                    lock=cfg.shared.lock_file,
-                    ttl=cfg.gpu.lease_ttl_sec,
+            data.update(
+                call(
+                    "start",
+                    dict(
+                        argv=argv,
+                        bind=bind,
+                        binary=args.binary,
+                        api_key=args.api_key,
+                        token=record.token,
+                        lock=cfg.shared.lock_file,
+                        ttl=cfg.gpu.lease_ttl_sec,
+                    ),
                 )
             )
         except BaseException:
@@ -429,11 +497,11 @@ def serve(cfg, args, result):
             raise
     elif args.action == "status":
         data["lease"] = lease.inspect_public()
-        call({})
+        data.update(call("status", {}))
     elif args.action == "logs":
-        call({"lines": args.lines})
+        data.update(call("logs", {"lines": args.lines}))
     else:
-        call({"force": args.force})
+        data.update(call("stop", {"force": args.force}))
 
 
 def _status_lines(data):
@@ -507,6 +575,10 @@ def human_format(result: RunResult) -> str:
         if "stopped" in data:
             lines.append("server stopped" if data["stopped"] else "server already stopped")
         lines.extend(data.get("lines", []))
+    elif result.command == "dev fmt":
+        for name, step in data.get("tools", {}).items():
+            detail = step.get("reason") or step.get("error") or f"{step['duration_ms']:.0f} ms"
+            lines.append(f"{name}: {step['status']} ({detail})")
     elif "checks" in data:
         for name, step in data["checks"].items():
             detail = step.get("reason") or step.get("error") or ", ".join(step.get("errors", []))

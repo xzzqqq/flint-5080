@@ -48,7 +48,8 @@ struct Fixture {
     pid = -1;
     Require(WIFEXITED(code) && !WEXITSTATUS(code) && !fs::exists(socket), "clean shutdown");
   }
-  void Launch(const char* host, const char* forward, const char* model = nullptr) {
+  void Launch(const char* host, const char* forward, const char* model = nullptr,
+              bool reset = false) {
     pid = fork();
     Require(pid >= 0, "fork");
     if (!pid) {
@@ -58,7 +59,8 @@ struct Fixture {
         _exit(127);
       }
       execl(host, host, "--daemon", "--socket", socket.c_str(), "--state-dir", root.c_str(),
-            "--baseline", forward, "--no-model", "--golden-dir", root.c_str(), nullptr);
+            "--baseline", forward, "--no-model", "--golden-dir", root.c_str(), "--kv-seq-len",
+            "2048", reset ? "--reset-baseline" : nullptr, nullptr);
       _exit(127);
     }
   }
@@ -254,6 +256,59 @@ void Test(const char* host, const char* forward) {
            {"input_ids", Array{1, 42, 123}},
            {"warmup", 1},
            {"iters", 2}};
+  Require(!status.at("baseline_preserved").as<bool>(), "initial baseline");
+  auto frozen = f.root / "candidates/baseline.so";
+  auto original = fs::file_size(frozen);
+  f.Shutdown();
+  fs::resize_file(frozen, original + 1);  // A trailing byte preserves a loadable ELF.
+  f.Launch(host, forward);
+  Require(f.Call({{"command", "status"}}).at("baseline_preserved").as<bool>() &&
+              fs::file_size(frozen) == original + 1,
+          "restart overwrote baseline");
+  f.Shutdown();
+  f.Launch(host, forward, nullptr, true);
+  Require(!f.Call({{"command", "status"}}).at("baseline_preserved").as<bool>() &&
+              fs::file_size(frozen) == original,
+          "baseline reset");
+
+  // Compare a tiled prefix and two decode positions with ordinary explicit-prompt replay.
+  auto explicit_prompt = q;
+  explicit_prompt["input_ids"] = Array{1, 42, 123, 1, 42};
+  auto context = q;
+  context["context_len"] = 5;
+  for (unsigned step : {1u, 2u}) {
+    explicit_prompt["step"] = step;
+    auto expected = f.Call(explicit_prompt).at("next_token_id").number<int>();
+    context["step"] = step == 1 ? 0 : step;
+    auto actual = f.Call(context);
+    Require(!actual.at("prefix_cache_hit").as<bool>() &&
+                actual.at("next_token_id").number<int>() == expected,
+            "tiled decode position");
+  }
+  context["step"] = 0;
+  context["context_len"] = 1301;
+  auto cold = f.Call(context);
+  Require(
+      cold.at("context_len").number<unsigned>() == 1301 && !cold.at("prefix_cache_hit").as<bool>(),
+      "chunked prefill");
+  auto token = cold.at("next_token_id").number<int>();
+  context["step"] = 1;
+  auto hit = f.Call(context);
+  Require(hit.at("prefix_cache_hit").as<bool>() && hit.at("next_token_id").number<int>() == token &&
+              hit.at("state_error").at("exact_match").as<bool>(),
+          "cached decode");
+  f.Call({{"command", "clear_cache"}});
+  Require(!f.Call(context).at("prefix_cache_hit").as<bool>(), "clear prefix cache");
+  context["step"] = 2;
+  Require(!f.Call(context).at("prefix_cache_hit").as<bool>(), "different step");
+  context["context_len"] = 2047;
+  try {
+    f.Call(context);
+    throw std::logic_error("expected capacity failure");
+  } catch (const std::runtime_error& e) {
+    Require(std::string_view(e.what()).find("--kv-seq-len") != std::string_view::npos,
+            "capacity diagnostic");
+  }
   auto e2e = f.Call(q);
   Require(
       e2e.at("next_token_match").as<bool>() && e2e.at("logits_error").at("exact_match").as<bool>(),
@@ -280,6 +335,8 @@ void Test(const char* host, const char* forward) {
   Require(!f.Call(q).at("lazy_cache_hit").as<bool>(), "first partial hit");
   q["use_cuda_graph"] = false;
   Require(f.Call(q).at("lazy_cache_hit").as<bool>(), "partial miss");
+  f.Call({{"command", "clear_cache"}});
+  Require(!f.Call(q).at("lazy_cache_hit").as<bool>(), "clear recording cache");
   q["command"] = "ab";
   q["so_a"] = forward;
   q["so_b"] = forward;

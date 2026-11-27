@@ -84,8 +84,12 @@ Replay::Replay(DaemonConfig cfg) : config_(std::move(cfg)) {
   next_ = ids_ + capacity_;
   for (auto dir : {"candidates", "loaded"}) fs::create_directories(config_.state_dir / dir);
   auto baseline = config_.state_dir / "candidates/baseline.so";
-  fs::copy_file(config_.baseline, baseline.string() + ".tmp", fs::copy_options::overwrite_existing);
-  fs::rename(baseline.string() + ".tmp", baseline);
+  baseline_preserved_ = fs::exists(baseline) && !config_.reset_baseline;
+  if (!baseline_preserved_) {
+    fs::copy_file(config_.baseline, baseline.string() + ".tmp",
+                  fs::copy_options::overwrite_existing);
+    fs::rename(baseline.string() + ".tmp", baseline);
+  }
   config_.baseline = baseline;
   CheckCuda(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
   try {
@@ -139,6 +143,7 @@ Object Replay::Status() const {
           {"io_bytes", io_->view().bytes},
           {"free_vram_bytes", free},
           {"total_vram_bytes", total},
+          {"baseline_preserved", baseline_preserved_},
           {"baseline", config_.baseline.string()},
           {"lazy_cache_entries", cache_.size()}};
 }
@@ -164,8 +169,7 @@ Recording Replay::Record(const std::vector<int>& ids, unsigned begin, unsigned e
   Recording r;
   r.ids = ids;
   auto baseline = Load(config_.baseline);
-  auto& state = kv_->view();
-  kv_->Reset(stream_);
+  ResetKv();
   Upload(stream_, ids_, ids);
   for (unsigned i = 0; i < step; ++i) {
     auto run =
@@ -175,25 +179,38 @@ Recording Replay::Record(const std::vector<int>& ids, unsigned begin, unsigned e
     r.generated.push_back(run.next_token_id);
     Upload(stream_, ids_, r.ids);
   }
-  r.blocks = baseline->Run(Spec(0, begin, r.ids.size(), r.position, true, false)).num_block_out;
+  RecordTail(r, *baseline, begin, end, false);
+  return r;
+}
+
+void Replay::RecordTail(Recording& r, ForwardModule& baseline, unsigned begin, unsigned end,
+                        bool resident_prefix) {
+  const auto& state = kv_->view();
+  r.blocks = baseline.Run(Spec(0, begin, r.ids.size(), r.position, true, false)).num_block_out;
   auto count = r.ids.size() * width_;
   r.hidden = ReadHidden(count);
   r.carry = Read(carry_, model::kCarryPlanes * count);
   for (unsigned v = begin; v < end; ++v) {
     for (auto [offset, bytes, kind, dtype] :
-         VisitSnapshotRanges(state, plan_[v], r.position + r.ids.size()))
+         VisitSnapshotRanges(state, plan_[v], r.position + r.ids.size())) {
+      if (resident_prefix && (kind == KvSliceKind::kKey || kind == KvSliceKind::kValue)) {
+        // The real model appends one row. The synthetic forward updates slot zero.
+        auto capacity = plan_[v].is_full_attention ? state.max_full_seq_len : state.swa_window;
+        bytes = model::kKvDim * sizeof(uint16_t);
+        if (weights_) offset += (r.position % capacity) * bytes;
+      }
       r.state.push_back({offset, kind, dtype,
                          Read(static_cast<const std::byte*>(state.arena_base) + offset, bytes)});
+    }
   }
   UploadHidden(r.hidden);
   bool head = begin == 0 && end == model::kNumLogicalVisits;
-  auto result = baseline->Run(Spec(begin, end, r.ids.size(), r.position, head, head, r.blocks),
-                              {.return_logits = head});
+  auto result = baseline.Run(Spec(begin, end, r.ids.size(), r.position, head, head, r.blocks),
+                             {.return_logits = head});
   r.post = ReadPostState(r, result.num_block_out);
   r.reference = ReadHidden(count);
   r.next = result.next_token_id;
   if (head) r.logits = Read(logits_, vocab_);
-  return r;
 }
 std::vector<float> Replay::ReadHidden(size_t count) const {
   auto bits = Read(out_, count);
@@ -224,6 +241,11 @@ void Replay::Restore(const Recording& r) {
 Object Replay::Request(const Json& q) {
   const auto cmd = q.at("command").as<std::string>();
   if (cmd == "status") return Status();
+  if (cmd == "clear_cache") {
+    cache_.clear();
+    prefix_.reset();
+    return {};
+  }
   if (cmd != "run" && cmd != "profile" && cmd != "dump" && cmd != "ab" && cmd != "kld")
     throw std::runtime_error("unknown command");
   const auto before = FreeBytes();
@@ -231,6 +253,7 @@ Object Replay::Request(const Json& q) {
   try {
     reply = cmd == "kld" ? Kld(q) : Measure(q, cmd);
   } catch (const std::exception& e) {
+    prefix_.reset();
     reply["error"] = e.what();
   }
   CheckCuda(cudaDeviceSynchronize());
@@ -280,7 +303,7 @@ Object Replay::Kld(const Json& q) {
     auto module = Load(reference ? ref : cand);
     for (auto& c : cases) {
       if (reference) c.reference.resize((c.ids.size() - c.eval_start) * vocab_);
-      kv_->Reset(stream_);
+      ResetKv();
       for (unsigned pos = 0; pos < c.ids.size();) {
         unsigned rows = std::min<size_t>(chunk, c.ids.size() - pos);
         CheckCuda(cudaMemcpyAsync(ids_, c.ids.data() + pos, rows * sizeof(int),
@@ -343,13 +366,17 @@ Replay::Measurement Replay::ParseMeasurement(const Json& q, const std::string& c
       throw std::runtime_error("invalid token id");
     ids.push_back(token);
   }
-  if (ids.empty() || ids.size() > capacity_)
+  auto context_len = q.get<unsigned>("context_len", 0);
+  if (ids.empty() || (!context_len && ids.size() > capacity_))
     throw std::runtime_error("input exceeds resident I/O capacity");
-  auto step = Count(q, "step", 0, 0, config_.kv_seq_len - ids.size());
+  auto step = q.get<unsigned>("step", 0);
+  if (context_len) step = std::max(step, 1u);
+  if (!context_len && ids.size() + size_t(step) > kv_->view().max_full_seq_len)
+    throw std::invalid_argument("decode exceeds KV capacity; increase --kv-seq-len");
   auto warmup = Count(q, "warmup", 1, 0, 10000), iters = Count(q, "iters", 5, 1, 10000);
   auto rounds = cmd == "ab" ? Count(q, "rounds", 5, 1, 10000) : 1;
   if (size_t(iters) * rounds > 100000) throw std::runtime_error("too many timed iterations");
-  return {begin, end, step, warmup, iters, rounds, name, std::move(ids)};
+  return {begin, end, step, warmup, iters, rounds, context_len, name, std::move(ids)};
 }
 const Recording& Replay::ResolveRecording(const Measurement& m, Object& reply,
                                           Recording& uncached) {
@@ -435,6 +462,7 @@ ForwardRunResult Replay::RunPair(ForwardModule& a, ForwardModule& b, const Forwa
   return last;
 }
 void Replay::FormatStages(const ForwardRunResult& last, Object& reply) {
+  if (last.num_stages > FLINT_MAX_STAGE_TIMINGS) throw std::runtime_error("invalid stage count");
   if (last.num_stages) {
     reply["profile_elapsed_ms"] = last.elapsed_ms;
     Array stages;
@@ -481,13 +509,13 @@ void Replay::Dump(const Json& q, const Measurement& m, const Recording& r,
   reply.merge(dump);
 }
 Replay::SpecRound Replay::RunSpecRound(ForwardModule& candidate, int anchor, const uint16_t* last,
-                                       unsigned pos, bool profile) {
+                                       unsigned pos, bool profiler_range, bool enable_profiling) {
   using Clock = std::chrono::steady_clock;
   SpecRound round{};
   round.block.resize(8);
   round.block[0] = anchor;
   CheckCuda(cudaStreamSynchronize(stream_));
-  if (profile) CheckCuda(cudaProfilerStart());
+  if (profiler_range) CheckCuda(cudaProfilerStart());
   try {
     auto start = Clock::now();
     candidate.Draft(anchor, last, pos, round.block.data() + 1);
@@ -495,7 +523,9 @@ Replay::SpecRound Replay::RunSpecRound(ForwardModule& candidate, int anchor, con
     Upload(stream_, ids_, round.block);
     auto s = Spec(0, model::kNumLogicalVisits, 8, pos, true, true);
     s.d_taps_out = taps_;
-    candidate.Verify(s, candidate.speculative_options);
+    auto verify_opts = candidate.speculative_options;
+    verify_opts.enable_profiling = enable_profiling;
+    round.verify_result = candidate.Verify(s, verify_opts);
     round.verified = Read(next_, 8);
     uint64_t seed = 0;
     auto result = VerifySpeculative(std::span(round.block).subspan(1), round.verified, {}, {},
@@ -512,46 +542,74 @@ Replay::SpecRound Replay::RunSpecRound(ForwardModule& candidate, int anchor, con
     round.emitted.assign(round.block.begin() + 1, round.block.begin() + count);
     round.emitted.push_back(result.bonus_token);
   } catch (...) {
-    if (profile) cudaProfilerStop();
+    if (profiler_range) cudaProfilerStop();
     throw;
   }
-  if (profile) CheckCuda(cudaProfilerStop());
+  if (profiler_range) CheckCuda(cudaProfilerStop());
   return round;
 }
-Object Replay::MeasureSpeculative(const Json& q, const std::string& cmd, const Measurement& m) {
-  if (capacity_ < 8 || m.ids.size() + m.step - 1 + 8 > kv_->view().max_full_seq_len)
-    throw std::invalid_argument("insufficient KV capacity for eight-token verification");
-  Object reply;
-  std::vector<int> prefix;
-  unsigned pos = 0, n = m.ids.size();
-  {
-    auto baseline = Load(config_.baseline);
-    Upload(stream_, ids_, m.ids);
-    for (unsigned i = 0; i < m.step; ++i) {
-      auto spec = Spec(0, model::kNumLogicalVisits, n, pos, true, true);
-      spec.reset_kv = !i;
-      spec.d_taps_out = taps_;
-      int anchor = baseline->Run(spec).next_token_id;
-      baseline->StoreContext(taps_, n, pos);
-      pos += n;
-      prefix.push_back(anchor);
-      if (i + 1 < m.step) {
-        CheckCuda(
-            cudaMemcpyAsync(ids_, &prefix.back(), sizeof(int), cudaMemcpyHostToDevice, stream_));
-        n = 1;
-      }
-    }
-    CheckCuda(cudaStreamSynchronize(stream_));
+void Replay::ResetKv() {
+  prefix_.reset();
+  kv_->Reset(stream_);
+}
+
+void Replay::PreparePrefix(const Measurement& m, bool speculative, Object& reply) {
+  const unsigned length = m.context_len ? m.context_len : m.ids.size();
+  const unsigned tail = speculative ? 8 : 1;
+  if (capacity_ < tail || uint64_t(length) + m.step - 1 + tail > kv_->view().max_full_seq_len)
+    throw std::invalid_argument(
+        "prefix and decode exceed available capacity; increase --kv-seq-len");
+  Array ids;
+  for (auto id : m.ids) ids.emplace_back(id);
+  auto key = Encode(Array{fs::last_write_time(config_.baseline).time_since_epoch().count(),
+                          std::move(ids), m.context_len, m.step, m.begin, m.end, speculative});
+  bool hit = m.context_len && prefix_ && prefix_->key == key;
+  reply["prefix_cache_hit"] = hit;
+  reply["context_len"] = m.context_len;
+  if (hit) return;
+  ResetKv();
+  auto baseline = Load(config_.baseline);
+  auto& prefix = prefix_.emplace();
+  prefix.key = std::move(key);
+  unsigned rows = 0;
+  auto advance = [&](const std::vector<int>& tokens, bool head) {
+    rows = tokens.size();
+    Upload(stream_, ids_, tokens);
+    auto spec = Spec(0, model::kNumLogicalVisits, rows, prefix.position, true, head);
+    if (speculative) spec.d_taps_out = taps_;
+    auto result = baseline->Run(spec);
+    if (speculative) baseline->StoreContext(taps_, rows, prefix.position);
+    prefix.position += rows;
+    if (head) prefix.generated.push_back(result.next_token_id);
+  };
+  unsigned chunk = m.context_len ? std::min(512u, capacity_) : length;
+  while (prefix.position < length) {
+    std::vector<int> tokens(std::min(chunk, length - prefix.position));
+    for (size_t i = 0; i < tokens.size(); ++i)
+      tokens[i] = m.ids[(prefix.position + i) % m.ids.size()];
+    advance(tokens, prefix.position + tokens.size() == length);
   }
-  // Full KV is append-only. Only mutable ring slots, convolution history and
-  // the last committed tap need restoration between candidate rounds.
-  auto last_tap = Read(taps_ + size_t(n - 1) * 4 * width_, 4 * width_);
+  for (unsigned i = 1; i < m.step; ++i) advance({prefix.generated.back()}, true);
+  if (speculative) {
+    CheckCuda(cudaStreamSynchronize(stream_));
+    prefix.last_tap = Read(taps_ + size_t(rows - 1) * 4 * width_, 4 * width_);
+    SaveSpecState(prefix);
+  } else {
+    auto& r = prefix.recording;
+    r.ids = {prefix.generated.back()};
+    r.position = prefix.position;
+    Upload(stream_, ids_, r.ids);
+    RecordTail(r, *baseline, m.begin, m.end, true);
+  }
+}
+
+void Replay::SaveSpecState(Prefix& prefix) {
+  const unsigned pos = prefix.position;
   const auto& kv = kv_->view();
   auto sizes = ComputeKvArenaSizes(model_config_, true);
-  std::vector<std::pair<std::byte*, std::vector<std::byte>>> saved;
   auto save = [&](void* ptr, size_t bytes) {
     auto* address = static_cast<std::byte*>(ptr);
-    saved.emplace_back(address, Read(address, bytes));
+    prefix.mutable_state.emplace_back(address, Read(address, bytes));
   };
   save(kv.kv_conv_state, sizes.kv_conv);
   save(kv.sublayer_conv_state, sizes.sublayer_conv);
@@ -567,23 +625,31 @@ Object Replay::MeasureSpeculative(const Json& q, const std::string& cmd, const M
   };
   save_ring(kv.swa_kv, kv.swa_window, 2 * kv.num_swa_visits);
   save_ring(kv.mtp_swa_kv, kv.mtp_swa_window, 4);
+}
+Object Replay::MeasureSpeculative(const Json& q, const std::string& cmd, const Measurement& m) {
+  Object reply;
+  PreparePrefix(m, true, reply);
+  const auto& prefix = *prefix_;
   auto a = Load(q.at(cmd == "ab" ? "so_a" : "so_path").as<std::string>());
   auto b = cmd == "ab" ? Load(q.at("so_b").as<std::string>()) : std::nullopt;
   a->speculative_options.use_cuda_graph = q.get("use_cuda_graph", true);
+  const bool enable_profiling =
+      (cmd == "profile" && !q.get("profiler_range", false)) || q.get("enable_profiling", false);
   if (b) b->speculative_options = a->speculative_options;
   SpecRound result;
-  bool profile = false;
+  bool profiler_range = false;
   auto round = [&](ForwardModule& candidate) {
-    for (auto& [ptr, bytes] : saved) Upload(stream_, ptr, bytes);
-    Upload(stream_, taps_, last_tap);
-    result = RunSpecRound(candidate, prefix.back(), taps_, pos, profile);
+    for (auto& [ptr, bytes] : prefix.mutable_state) Upload(stream_, ptr, bytes);
+    Upload(stream_, taps_, prefix.last_tap);
+    result = RunSpecRound(candidate, prefix.generated.back(), taps_, prefix.position,
+                          profiler_range, enable_profiling);
     return result.elapsed_ms;
   };
   for (unsigned i = 0; i < m.warmup; ++i) {
     round(*a);
     if (b) round(*b);
   }
-  profile = q.get("profiler_range", false);
+  profiler_range = q.get("profiler_range", false);
   std::vector<double> times, paired;
   Array pairs;
   for (unsigned j = 0; j < m.rounds; ++j) {
@@ -622,6 +688,8 @@ Object Replay::MeasureSpeculative(const Json& q, const std::string& cmd, const M
   reply["spec_accepted"] = emitted.size() - 1;
   reply["tokens_emitted"] = emitted.size();
   if (cmd == "profile" || q.get("enable_profiling", false)) {
+    FormatStages(result.verify_result, reply);
+    reply["verify_logical_bytes"] = result.verify_result.logical_bytes;
     reply["draft_ms"] = result.draft_ms;
     reply["verify_ms"] = result.verify_ms;
     reply["commit_and_store_ms"] = result.elapsed_ms - result.draft_ms - result.verify_ms;
@@ -629,7 +697,7 @@ Object Replay::MeasureSpeculative(const Json& q, const std::string& cmd, const M
   Array ids;
   for (int token : emitted) ids.emplace_back(token);
   reply["emitted_ids"] = std::move(ids);
-  if (!config_.golden_dir.empty() &&
+  if (!m.context_len && !config_.golden_dir.empty() &&
       m.name.find_first_not_of(
           "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-.") ==
           std::string::npos) {
@@ -640,7 +708,8 @@ Object Replay::MeasureSpeculative(const Json& q, const std::string& cmd, const M
       if (prompt && expected && prompt->dtype == TensorDType::kI32 &&
           expected->dtype == TensorDType::kI32 && prompt->nbytes == m.ids.size() * sizeof(int) &&
           !std::memcmp(file.Bytes(*prompt).data(), m.ids.data(), prompt->nbytes)) {
-        reply["golden"] = CompareSpeculativeGolden(file.Bytes(*expected), prefix, emitted);
+        reply["golden"] =
+            CompareSpeculativeGolden(file.Bytes(*expected), prefix.generated, emitted);
       }
     }
   }
@@ -656,25 +725,29 @@ Object Replay::MeasureSpeculative(const Json& q, const std::string& cmd, const M
 }
 Object Replay::Measure(const Json& q, const std::string& cmd) {
   auto m = ParseMeasurement(q, cmd);
+  if (!m.context_len) prefix_.reset();
   bool e2e = m.e2e();
   if (e2e && m.step && weights_ && weights_->view().has_mtp && q.get("use_speculative", true))
     return MeasureSpeculative(q, cmd, m);
-  Object reply;
+  Object reply{{"context_len", m.context_len}, {"prefix_cache_hit", false}};
   using Clock = std::chrono::steady_clock;
   auto elapsed_ms = [](Clock::time_point start) {
     return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
   };
   auto record_start = Clock::now();
   Recording uncached;
-  const auto& r = ResolveRecording(m, reply, uncached);
+  if (m.context_len) PreparePrefix(m, false, reply);
+  const auto& r = m.context_len ? prefix_->recording : ResolveRecording(m, reply, uncached);
   reply["recording_ms"] = elapsed_ms(record_start);
   auto spec = Spec(m.begin, m.end, r.ids.size(), r.position, e2e, e2e, r.blocks);
   UploadHidden(r.hidden);
   Upload(stream_, ids_, r.ids);
-  ForwardOptions options{.use_cuda_graph = q.get("use_cuda_graph", true),
-                         .use_speculative = q.get("use_speculative", true),
-                         .return_logits = e2e,
-                         .enable_profiling = cmd == "profile" || q.get("enable_profiling", false)};
+  ForwardOptions options{
+      .use_cuda_graph = q.get("use_cuda_graph", true),
+      .use_speculative = q.get("use_speculative", true),
+      .return_logits = e2e,
+      .enable_profiling = (cmd == "profile" && !q.get("profiler_range", false)) ||
+                          q.get("enable_profiling", false)};
   auto load_start = Clock::now();
   auto a = Load(q.at(cmd == "ab" ? "so_a" : "so_path").as<std::string>());
   auto b = cmd == "ab" ? Load(q.at("so_b").as<std::string>()) : std::nullopt;
@@ -704,8 +777,9 @@ Object Replay::Measure(const Json& q, const std::string& cmd) {
   b.reset();
   a.reset();
   reply["module_unload_ms"] = elapsed_ms(unload_start);
-  CompareGolden(reply, config_.golden_dir, m.name, m.ids, r.generated, spec, e2e ? logits : output,
-                width_, last.next_token_id);
+  if (!m.context_len)
+    CompareGolden(reply, config_.golden_dir, m.name, m.ids, r.generated, spec,
+                  e2e ? logits : output, width_, last.next_token_id);
   if (cmd == "dump") Dump(q, m, r, output, reply);
   return reply;
 }

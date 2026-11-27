@@ -213,3 +213,15 @@ def test_supervisor_signal_preserves_replacement_state(local):
     finally:
         path.unlink(missing_ok=True)
         manager.release(replacement.token)
+
+
+def test_restart_stopped_and_running(local):
+    cfg, run, binary = local
+    install(binary)
+    first = run("restart", "--model-name", "stubborn")
+    fresh = run("restart", "--force", "--model-name", "fresh", "--no-spec")
+    assert first["pid"] != fresh["pid"] and fresh["action"] == "restart"
+    assert fresh["ready"]["model"] == "fresh" and "--no-spec" in fresh["ready"]["argv"]
+    assert run("status")["lease"]["record"]["pid"] == fresh["pid"]
+    run("stop")
+    assert not Path(cfg.shared.lock_file).exists()

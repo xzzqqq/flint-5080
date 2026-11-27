@@ -8,9 +8,7 @@ from collections.abc import Sequence
 from .config import DevConfig
 
 
-def engine_build_script(
-    cfg: DevConfig, *, clean: bool = False, targets: Sequence[str] = (), incremental: bool = False
-) -> str:
+def engine_configure_script(cfg: DevConfig) -> str:
     build = cfg.build
     flags = [
         "cmake",
@@ -18,6 +16,7 @@ def engine_build_script(
         "engine",
         "-B",
         "engine/build",
+        "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
         "-G",
         "Ninja",
         f"-DCMAKE_BUILD_TYPE={build.build_type}",
@@ -28,12 +27,6 @@ def engine_build_script(
         configure += f' "-DCMAKE_{lang}_COMPILER_LAUNCHER=$launcher"'
     for kind in ("EXE", "SHARED", "MODULE"):
         configure += f' "-DCMAKE_{kind}_LINKER_FLAGS=$link_flags"'
-    compile_args = ["cmake", "--build", "engine/build"]
-    if targets:
-        compile_args.extend(["--target", *targets])
-    compile_args.append("--parallel")
-    if build.jobs:
-        compile_args.append(str(build.jobs))
     lines = [
         f"use_ccache={1 if build.use_ccache else 0}",
         'launcher=""',
@@ -48,9 +41,23 @@ def engine_build_script(
         'link_flags=""',
         'if [ "$linker" != system ] && [ -n "$linker" ]; then link_flags="-fuse-ld=$linker"; fi',
     ]
-    if clean:
-        lines.append("rm -rf engine/build")
+    return "\n".join([*lines, configure])
+
+
+def engine_build_script(
+    cfg: DevConfig, *, clean: bool = False, targets: Sequence[str] = (), incremental: bool = False
+) -> str:
+    configure = engine_configure_script(cfg)
     if incremental:
-        configure = f"if ! test -f engine/build/build.ninja; then {configure}; fi"
-    lines.extend([configure, shlex.join(compile_args)])
-    return "\n".join(lines)
+        configure = (
+            "if ! test -f engine/build/build.ninja || "
+            f"! test -f engine/build/compile_commands.json; then\n{configure}\nfi"
+        )
+    compile_args = ["cmake", "--build", "engine/build"]
+    if targets:
+        compile_args.extend(["--target", *targets])
+    compile_args.append("--parallel")
+    if cfg.build.jobs:
+        compile_args.append(str(cfg.build.jobs))
+    lines = ["rm -rf engine/build"] if clean else []
+    return "\n".join([*lines, configure, shlex.join(compile_args)])

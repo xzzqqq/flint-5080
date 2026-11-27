@@ -48,12 +48,15 @@ def emit_result(
     json_mode: bool,
     human_formatter: Callable[[RunResult], str],
     archive: bool = True,
+    after_archive: Callable[[Path], None] | None = None,
     repo_root: Path | None = None,
 ) -> int:
     run_file = None
     if archive:
         try:
             run_file = archive_run(repo_root or find_repo_root(), result)
+            if after_archive:
+                after_archive(run_file)
         except OSError as exc:
             result.ok = False
             error = f"Cannot archive run: {exc}"

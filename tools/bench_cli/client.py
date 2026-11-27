@@ -88,9 +88,11 @@ def record_usage(metrics, frame, telemetry):
         if "queue_wait_ms" in t:
             metrics["queue_wait_ms"] = t["queue_wait_ms"]
         metrics["telemetry_source"] = "server"
-        if t["decode_rounds"] > 0:
-            metrics["server_tpot_ms"] = t["decode_ms"] / t["decode_rounds"]
         decode_generated = max(0, t["decode_tokens"] - 1)
+        if t["decode_rounds"] > 0:
+            metrics["tokens_per_round"] = decode_generated / t["decode_rounds"]
+            metrics["spec_accepted_per_round"] = t["spec_accepted"] / t["decode_rounds"]
+            metrics["server_tpot_ms"] = t["decode_ms"] / t["decode_rounds"]
         if t["decode_ms"] > 0 and decode_generated > 0:
             metrics["server_decode_tok_s"] = decode_generated / (t["decode_ms"] / 1000)
         metrics["cached_prefix_ratio"] = t["cached_prefix_tokens"] / max(1, t["prefill_tokens"])

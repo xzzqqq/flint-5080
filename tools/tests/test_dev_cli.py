@@ -416,3 +416,79 @@ def test_release_artifact_sizes(cfg, monkeypatch):
         (folder / "server").write_bytes(b"binary")
     sizes = commands._artifact_sizes(commands.Executor(cfg), "server")
     assert sizes == {"server/target/linux-target/release/server": 6}
+
+
+def test_local_filter(entry, executor, capsys):
+    assert (
+        entry(["check", "--local", "--only", "pytest,hygiene", "--only", "pytest", "--json"]) == 0
+    )
+    checks = json.loads(capsys.readouterr().out)["data"]["checks"]
+    assert set(checks) == {"pytest", "hygiene"}
+    assert len(executor.runs) == 1 and "pytest" in executor.runs[0][0]
+
+
+@pytest.mark.parametrize(
+    ("mode", "item", "valid"),
+    [
+        ("--gpu", "hygiene", "ctest:<regex>"),
+        ("--gpu", "ctest:", "ops-golden"),
+        ("--local", "ctest:abc", "hygiene"),
+    ],
+)
+def test_unknown_filter_fails_before_running(entry, executor, capsys, mode, item, valid):
+    assert entry(["check", mode, "--only", item, "--json"]) == 1
+    error = json.loads(capsys.readouterr().out)["error"]
+    assert item in error and valid in error
+    assert not executor.runs and not executor.syncs
+
+
+def test_filtered_ctest_without_weights(cfg, entry, executor, capsys):
+    regex = "forge_tests|test foo's"
+    cfg.model.weights_dir = ""
+    assert entry(["check", "--gpu", "--only", "ctest:" + regex, "--json"]) == 0
+    assert list(json.loads(capsys.readouterr().out)["data"]["checks"]) == ["ctest:" + regex]
+    assert shlex.split(executor.runs[0][0].splitlines()[-1]) == [
+        "ctest",
+        "--test-dir",
+        "engine/build",
+        "--output-on-failure",
+        "--no-tests=error",
+        "-R",
+        regex,
+    ]
+    assert executor.syncs == 1 and not Path(cfg.shared.lock_file).exists()
+
+
+@pytest.mark.parametrize(
+    ("flags", "check", "fix"),
+    [
+        ([], False, False),
+        (["--fix"], False, True),
+        (["--check"], True, False),
+        (["--fix", "--check"], True, True),
+    ],
+)
+def test_fmt(entry, cfg, executor, monkeypatch, capsys, flags, check, fix):
+    for name in (
+        "engine/src/a.cu",
+        "engine/build/generated.cpp",
+        "engine/third_party/a.hpp",
+        "server/Cargo.toml",
+        "tools/example.py",
+    ):
+        path = cfg.repo_root / name
+        path.parent.mkdir(exist_ok=True, parents=True)
+        path.touch()
+    monkeypatch.setattr(commands.shutil, "which", lambda name: name)
+    assert entry(["fmt", *flags]) == 0
+    output = capsys.readouterr().out
+    assert "clang-format: passed (4 ms)" in output and "cargo fmt: passed" in output
+    invoked = [cmd for cmd, _ in executor.runs]
+    assert invoked[:2] == [
+        "clang-format " + ("--dry-run --Werror" if check else "-i") + " engine/src/a.cu",
+        "cd server && cargo fmt" + (" --check" if check else ""),
+    ]
+    assert invoked[-1] == "uv run ruff format " + ("--check " if check else "") + "tools"
+    if fix:
+        assert invoked[2] == "uv run ruff check " + ("" if check else "--fix ") + "tools"
+    assert len(invoked) == 3 + int(fix)
