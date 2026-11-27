@@ -185,23 +185,29 @@ ModelConfig TestConfig(const fs::path& path) {
   Require(config.unpadded_vocab_size == 200058 && config.pad_token_id == 199999 &&
               config.loop_gate_rank == 64 && config.rms_norm_eps == 1e-6f,
           "config fields");
-  Require(!config.has_mtp, "AR-only config");
-  std::string draft_config = kConfig;
-  draft_config.insert(draft_config.find('{') + 1, R"("mtp_config":{
-    "hidden_size":2304,"num_hidden_layers":3,"num_attention_heads":24,"num_key_value_heads":8,
-    "head_dim":128,"intermediate_size":9216,"max_position_embeddings":1048576,"block_size":8,
-    "markov_rank":256,"rms_norm_eps":0.000001,"rope_theta":1000000,"sliding_window_size":1024,
-    "local_layer_ids":[0,2],"target_layer_ids":[5,23,41,48]},)");
-  std::ofstream(path) << draft_config;
-  auto draft = LoadModelConfig(path);
-  Require(draft.has_mtp && draft.mtp.markov_rank == 256 && draft.mtp.target_layer_ids[3] == 48 &&
-              !draft.mtp.is_local_layer[1],
-          "MTP config");
+  Require(!config.has_draft, "AR-only config");
+  auto draft_path = path.parent_path() / "draft-config.json";
+  std::ofstream(draft_path) << R"({
+    "architectures":["DFlash2DraftModel"], "model_type":"qwen3",
+    "hidden_size":2304, "num_hidden_layers":5, "num_attention_heads":32, "num_key_value_heads":8,
+    "head_dim":128, "intermediate_size":6912, "vocab_size":201024, "rms_norm_eps":1e-6,
+    "sliding_window":2048, "rope_parameters":{"rope_theta":10000.0},
+    "layer_types":["sliding_attention","sliding_attention","sliding_attention",
+                   "sliding_attention","sliding_attention"],
+    "dflash_config":{"block_size":8, "conv_group_size":16, "conv_kernel_size":2,
+      "final_logit_softcapping":30, "mask_token_id":200056, "selector_rank":256,
+      "selector_top_k":16, "selector_softcap_mode":"after_correction","target_layer_ids":[5,23,41,48]}
+  })";
+  auto draft = config;
+  draft.draft = LoadDraftConfig(draft_path);
+  draft.has_draft = 1;
+  Require(draft.draft.selector_rank == 256 && draft.draft.target_layer_ids[3] == 48,
+          "draft config");
   auto base = ComputeKvArenaSizes(draft), sizes = ComputeKvArenaSizes(draft, true);
-  Require(sizes.Fixed() == base.Fixed() + 2 * 1032 * 4096 && sizes.per_token == 9 * 4096 &&
+  Require(sizes.Fixed() == base.Fixed() + 5 * 2056 * 4096 && sizes.per_token == 8 * 4096 &&
               KvStateArena::MaxFullSeqLenForBudget(draft, sizes.Fixed() + 32 * sizes.per_token,
                                                    true) == 32,
-          "MTP KV budget");
+          "Draft KV budget");
   auto plan = BuildVisitPlan(config);
   unsigned swa = 0, full = 0;
   for (unsigned i = 0; i < plan.size(); ++i) {

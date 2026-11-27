@@ -48,7 +48,7 @@ target_link_libraries(engine_loader PUBLIC CUDA::cudart)
 
 add_library(engine_ops OBJECT
     src/ops/exl3_linear.cu src/ops/norm_embed.cu src/ops/sconv.cu
-    src/ops/dspark.cu src/ops/attention.cu src/ops/moe.cu src/ops/loop_res.cu
+    src/ops/dflash2.cu src/ops/spec_rollback.cu src/ops/attention.cu src/ops/moe.cu src/ops/loop_res.cu
     src/ops/gemm_cublas.cpp)
 set_target_properties(engine_ops PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(engine_ops PUBLIC src)
@@ -56,7 +56,7 @@ target_link_libraries(engine_ops PUBLIC CUDA::cudart CUDA::cublas)
 target_compile_options(engine_ops PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:-rdc=false>")
 flint_configure_cuda_target(engine_ops)
 
-add_library(engine_model OBJECT src/model/dspark_forward.cpp src/model/inkling2_forward.cpp src/model/submodules.cpp)
+add_library(engine_model OBJECT src/model/dflash2_forward.cpp src/model/inkling2_forward.cpp src/model/submodules.cpp)
 set_target_properties(engine_model PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(engine_model PUBLIC engine_ops CUDA::cudart CUDA::cublas)
 
@@ -133,7 +133,7 @@ target_include_directories(runtime_tests PRIVATE src)
 target_link_libraries(runtime_tests PRIVATE engine CUDA::cudart)
 add_test(NAME runtime_tests COMMAND runtime_tests)
 
-add_executable(mtp_tests tests/test_mtp_golden.cpp)
-target_include_directories(mtp_tests PRIVATE src)
-target_link_libraries(mtp_tests PRIVATE engine CUDA::cudart CUDA::cublas)
-add_test(NAME mtp_tests COMMAND mtp_tests)
+add_executable(dflash2_tests tests/test_dflash2_golden.cpp)
+target_include_directories(dflash2_tests PRIVATE src)
+target_link_libraries(dflash2_tests PRIVATE engine CUDA::cudart CUDA::cublas)
+add_test(NAME dflash2_tests COMMAND dflash2_tests)

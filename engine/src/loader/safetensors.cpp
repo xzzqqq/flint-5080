@@ -201,40 +201,46 @@ ModelConfig LoadModelConfig(const std::filesystem::path& path) {
   }
   for (unsigned i = 0; i < c.num_hidden_layers; ++i)
     Check(c.is_full_layer[i] == defaults.is_full_layer[i], "unsupported local layer schedule");
-  if (root.as<Json::Object>().contains("mtp_config")) {
-    const auto& m = root.at("mtp_config");
-    auto& d = c.mtp;
-    d.hidden_size = Expected(m, "hidden_size", model::kMtpConfig.hidden_size);
-    d.num_hidden_layers = Expected(m, "num_hidden_layers", model::kMtpConfig.num_hidden_layers);
-    d.num_attention_heads =
-        Expected(m, "num_attention_heads", model::kMtpConfig.num_attention_heads);
-    d.num_key_value_heads =
-        Expected(m, "num_key_value_heads", model::kMtpConfig.num_key_value_heads);
-    d.head_dim = Expected(m, "head_dim", model::kMtpConfig.head_dim);
-    d.intermediate_size = Expected(m, "intermediate_size", model::kMtpConfig.intermediate_size);
-    d.max_position_embeddings =
-        Expected(m, "max_position_embeddings", model::kMtpConfig.max_position_embeddings);
-    d.sliding_window_size =
-        Expected(m, "sliding_window_size", model::kMtpConfig.sliding_window_size);
-    d.block_size = Expected(m, "block_size", model::kMtpConfig.block_size);
-    d.markov_rank = Expected(m, "markov_rank", model::kMtpConfig.markov_rank);
-    d.rms_norm_eps = Expected(m, "rms_norm_eps", model::kMtpConfig.rms_norm_eps);
-    d.rope_theta = Expected(m, "rope_theta", model::kMtpConfig.rope_theta);
-    for (auto& id : m.at("local_layer_ids").as<Json::Array>()) {
-      auto i = id.number<unsigned>();
-      Check(i < 3 && !d.is_local_layer[i], "invalid draft local layer");
-      d.is_local_layer[i] = 1;
-    }
-    const auto& ids = m.at("target_layer_ids").as<Json::Array>();
-    Check(ids.size() == 4, "invalid draft tap count");
-    for (unsigned i = 0; i < 4; ++i) d.target_layer_ids[i] = ids[i].number<unsigned>();
-    Check(std::equal(std::begin(d.target_layer_ids), std::end(d.target_layer_ids),
-                     model::kMtpConfig.target_layer_ids) &&
-              std::equal(std::begin(d.is_local_layer), std::end(d.is_local_layer),
-                         model::kMtpConfig.is_local_layer),
-          "unsupported draft schedule");
-    c.has_mtp = 1;
-  }
   return c;
+}
+DraftConfig LoadDraftConfig(const std::filesystem::path& path) {
+  std::ifstream file(path);
+  Check(file.is_open(), "cannot open " + path.string());
+  std::string input{std::istreambuf_iterator<char>(file), {}};
+  auto root = Parser(input).Parse();
+  auto d = model::kDraftConfig;
+  const auto& architectures = root.at("architectures").as<Json::Array>();
+  Check(architectures.size() == 1 && architectures[0].as<std::string>() == "DFlash2DraftModel" &&
+            root.at("model_type").as<std::string>() == "qwen3",
+        "unsupported draft architecture");
+  Expected(root, "hidden_size", d.hidden_size);
+  Expected(root, "num_hidden_layers", d.num_hidden_layers);
+  Expected(root, "num_attention_heads", d.num_attention_heads);
+  Expected(root, "num_key_value_heads", d.num_key_value_heads);
+  Expected(root, "head_dim", d.head_dim);
+  Expected(root, "intermediate_size", d.intermediate_size);
+  Expected(root, "rms_norm_eps", d.rms_norm_eps);
+  Expected(root, "sliding_window", d.sliding_window_size);
+  Expected(root, "vocab_size", 201024);
+  Expected(root.at("rope_parameters"), "rope_theta", d.rope_theta);
+  auto& layers = root.at("layer_types").as<Json::Array>();
+  Check(layers.size() == 5, "invalid draft layer count");
+  for (auto& l : layers)
+    Check(l.as<std::string>() == "sliding_attention", "unsupported draft attention");
+  auto& cfg = root.at("dflash_config");
+  Expected(cfg, "block_size", d.block_size);
+  Expected(cfg, "selector_rank", d.selector_rank);
+  Expected(cfg, "selector_top_k", 16);
+  Expected(cfg, "conv_group_size", 16);
+  Expected(cfg, "conv_kernel_size", 2);
+  Expected(cfg, "mask_token_id", 200056);
+  Expected(cfg, "final_logit_softcapping", 30.f);
+  Check(cfg.at("selector_softcap_mode").as<std::string>() == "after_correction",
+        "unsupported selector");
+  auto& ids = cfg.at("target_layer_ids").as<Json::Array>();
+  Check(ids.size() == 4, "invalid target tap count");
+  for (unsigned i = 0; i < 4; ++i)
+    Check(ids[i].number<unsigned>() == d.target_layer_ids[i], "unsupported target tap");
+  return d;
 }
 }  // namespace flint

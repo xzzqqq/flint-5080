@@ -124,7 +124,7 @@ class Inkling2LoopReference:
         path = Path(path)
         config = json.loads((path / "config.json").read_text())
         self.c = SimpleNamespace(**config["text_config"])
-        self.taps = config["mtp_config"]["target_layer_ids"]
+        self.taps = [5, 23, 41, 48]
         self.device = torch.device(device)
         self.file = safe_open(path / "model.safetensors", framework="pt", device="cpu")
         self.cache = []
@@ -340,7 +340,7 @@ class Inkling2LoopReference:
         def run(i, previous=None):
             nonlocal visit, x, blocks
             if visit in self.taps:
-                states[f"mtp_tap_{visit}"] = x
+                states[f"draft_tap_{visit}"] = x
             messages = (
                 residual_attention(*previous, self.message_queries(i))
                 if previous is not None
@@ -366,7 +366,7 @@ class Inkling2LoopReference:
         final = rms(final, self.weight("norm.weight")).to(x.dtype)
         states["final_hidden"] = final
         if visit in self.taps:
-            states[f"mtp_tap_{visit}"] = final
+            states[f"draft_tap_{visit}"] = final
         logits = linear(final, self.unembedding())
         states["logits"] = softcap(logits, self.c.final_logit_softcapping)
         self.position += len(ids)

@@ -3,17 +3,13 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <numeric>
 #include <stdexcept>
 
+#include "common/splitmix64.h"
+#include "ops/draft_types.h"
+
 namespace flint {
-namespace {
-double Uniform(uint64_t& rng) {
-  uint64_t bits = (rng += 0x9e3779b97f4a7c15ULL);
-  bits = (bits ^ (bits >> 30)) * 0xbf58476d1ce4e5b9ULL;
-  bits = (bits ^ (bits >> 27)) * 0x94d049bb133111ebULL;
-  return static_cast<double>((bits ^ (bits >> 31)) >> 11) * 0x1p-53;
-}
-}  // namespace
 double Sampler::Transform(std::span<const float> logits, float temperature, int32_t top_k,
                           float top_p) {
   if (!(temperature > 0)) throw std::invalid_argument("positive temperature required");
@@ -113,7 +109,7 @@ int32_t Sampler::Sample(std::span<const float> logits, float temperature, int32_
   }
   auto sum = Transform(logits, temperature, top_k, top_p);
   const auto& c = candidates_;
-  double draw = Uniform(rng) * sum;
+  double draw = SplitMixUniform(rng) * sum;
   for (auto item : c) {
     draw -= item.weight;
     if (draw < 0) return item.id;
@@ -121,7 +117,8 @@ int32_t Sampler::Sample(std::span<const float> logits, float temperature, int32_
   return c.back().id;
 }
 SpeculativeResult VerifySpeculative(std::span<const int32_t> ids, std::span<const int32_t> argmax,
-                                    std::span<const float> draft, std::span<const float> target,
+                                    std::span<const int32_t> candidates,
+                                    std::span<const float> q_probs, std::span<const float> target,
                                     int vocab, float temp, int32_t k, float p, uint64_t& rng) {
   if (temp == 0) {
     if (argmax.size() != ids.size() + 1) throw std::invalid_argument("target argmax size");
@@ -129,20 +126,29 @@ SpeculativeResult VerifySpeculative(std::span<const int32_t> ids, std::span<cons
     while (n < ids.size() && ids[n] == argmax[n]) ++n;
     return {int(n), argmax[n]};
   }
-  if (!(temp > 0) || vocab <= 0 || draft.size() != ids.size() * vocab ||
-      target.size() != draft.size() + vocab)
+  if (!(temp > 0) || vocab <= 0 || candidates.size() != ids.size() * kSelectorTopK ||
+      q_probs.size() != candidates.size() || target.size() != (ids.size() + 1) * vocab)
     throw std::invalid_argument("invalid verification distributions");
   Sampler sampler;
   for (size_t i = 0; i < ids.size(); ++i) {
     int id = ids[i];
-    auto q = sampler.Probabilities(draft.subspan(i * vocab, vocab), temp, k, p);
+    auto support = candidates.subspan(i * kSelectorTopK, kSelectorTopK);
+    auto q = q_probs.subspan(i * kSelectorTopK, kSelectorTopK);
     auto prob = sampler.Probabilities(target.subspan(i * vocab, vocab), temp, k, p);
-    if (id < 0 || id >= vocab || q[id] <= 0)
+    auto it = std::ranges::find(support, id);
+    if (id < 0 || id >= vocab || it == support.end() || !(q[it - support.begin()] > 0))
       throw std::invalid_argument("draft outside proposal support");
-    if (Uniform(rng) * q[id] < prob[id]) continue;
-    double sum = 0;
-    for (int j = 0; j < vocab; ++j) sum += (prob[j] = std::max(0., prob[j] - q[j]));
-    double draw = Uniform(rng) * sum;
+    // Normalize the returned FP32 masses in double, exactly as the device path walk does.
+    const double total = std::accumulate(q.begin(), q.end(), 0.);
+    if (SplitMixUniform(rng) * (q[it - support.begin()] / total) < prob[id]) continue;
+    for (int j = 0; j < kSelectorTopK; ++j) {
+      if (support[j] < 0 || support[j] >= vocab)
+        throw std::invalid_argument("invalid candidate ID");
+      auto& mass = prob[support[j]];
+      mass = std::max(0., mass - q[j] / total);
+    }
+    double sum = std::accumulate(prob.begin(), prob.end(), 0.);
+    double draw = SplitMixUniform(rng) * sum;
     int last = -1;
     for (int j = 0; j < vocab; ++j)
       if (prob[j] > 0) {

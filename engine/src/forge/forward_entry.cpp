@@ -2,17 +2,17 @@
 
 #include "common/cuda_check.h"
 #include "forge/forward_abi.h"
-#include "model/dspark_forward.h"
+#include "model/dflash2_forward.h"
 #include "model/inkling2_forward.h"
 struct ForwardContext {
   ScratchArenaView draft_scratch;
   flint::InklingRunner runner;
-  std::optional<flint::DsparkRunner> draft;
+  std::optional<flint::DFlash2Runner> draft;
   ForwardContext(const ModelWeightsView& w, const KvStateArenaView& kv, ScratchArenaView ws,
                  cudaStream_t s)
-      : draft_scratch(w.has_mtp ? flint::DsparkRunner::ReserveScratch(ws) : ScratchArenaView{}),
+      : draft_scratch(w.has_draft ? flint::DFlash2Runner::ReserveScratch(ws) : ScratchArenaView{}),
         runner(w, kv, ws, s) {
-    if (w.has_mtp) draft.emplace(w, kv, draft_scratch, runner.stream());
+    if (w.has_draft) draft.emplace(w, kv, draft_scratch, runner.stream());
   }
 };
 uint32_t flint_forward_abi_version() { return FLINT_FORWARD_ABI_VERSION; }
@@ -76,10 +76,11 @@ int32_t flint_forward_store_context(ForwardContext* c, const void* taps, uint32_
     return 0;
   });
 }
-int32_t flint_forward_draft(ForwardContext* c, int32_t anchor, const void* tap, uint32_t pos,
-                            int32_t* h_ids) {
+int32_t flint_forward_draft(ForwardContext* c, const ForwardDraftSpec* spec,
+                            ForwardDraftResult* result) {
   return DraftCall(c, [&]() {
-    c->draft->DraftGreedy(anchor, tap, pos, h_ids);
+    if (!spec || !result) return int(cudaErrorInvalidValue);
+    c->draft->Draft(*spec, *result);
     return 0;
   });
 }

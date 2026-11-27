@@ -251,6 +251,7 @@ def test_gpu_missing_weights_config(cfg, entry, capsys, monkeypatch):
 
 def test_gpu_missing_builds_and_cleanup(cfg, entry, capsys):
     cfg.model.weights_dir = "tiny"
+    cfg.model.draft_weights_dir = "draft"
     assert entry(["check", "--gpu", "--json"]) == 1
     checks = json.loads(capsys.readouterr().out)["data"]["checks"]
     assert set(checks) == {
@@ -259,7 +260,7 @@ def test_gpu_missing_builds_and_cleanup(cfg, entry, capsys):
         "e2e-golden",
         "server",
         "forge-host",
-        "mtp-golden",
+        "dflash2-golden",
         "runtime-golden",
     }
     assert all("dev build" in check["error"] for check in checks.values())
@@ -273,7 +274,7 @@ def test_gpu_missing_builds_and_cleanup(cfg, entry, capsys):
         "model",
         "golden",
         "ops_golden.safetensors",
-        "mtp_golden.safetensors",
+        "dflash2_golden.safetensors",
         "e2e_short_math.safetensors",
         "e2e_short_sky.safetensors",
         "e2e_short_code.safetensors",
@@ -282,9 +283,10 @@ def test_gpu_missing_builds_and_cleanup(cfg, entry, capsys):
 def test_gpu_missing_golden_prerequisite(cfg, entry, capsys, missing):
     cfg.shared.models_dir = str(cfg.repo_root / "models")
     cfg.model.weights_dir = "tiny"
+    cfg.model.draft_weights_dir = "draft"
     build = cfg.repo_root / "engine/build"
     build.mkdir(parents=True)
-    for name in ("ops_tests", "e2e_tests", "runtime_tests", "mtp_tests"):
+    for name in ("ops_tests", "e2e_tests", "runtime_tests", "dflash2_tests"):
         (build / name).write_text("#!/bin/sh\nexit 0\n")
         (build / name).chmod(0o755)
     if missing != "forward.so":
@@ -296,7 +298,7 @@ def test_gpu_missing_golden_prerequisite(cfg, entry, capsys, missing):
         golden.mkdir(parents=True)
         for name in (
             "ops_golden",
-            "mtp_golden",
+            "dflash2_golden",
             "e2e_short_math",
             "e2e_short_sky",
             "e2e_short_code",
@@ -307,14 +309,15 @@ def test_gpu_missing_golden_prerequisite(cfg, entry, capsys, missing):
     assert entry(["check", "--gpu", "--json"]) == 1
     checks = json.loads(capsys.readouterr().out)["data"]["checks"]
     if missing == "model":
-        for name in ("ops-golden", "e2e-golden", "runtime-golden", "mtp-golden"):
+        for name in ("ops-golden", "e2e-golden", "runtime-golden", "dflash2-golden"):
             assert "Missing model directory" in checks[name]["error"]
     elif missing == "forward.so":
         assert "Missing engine/build/forward.so. Run dev build" in checks["e2e-golden"]["error"]
     else:
-        name = {"ops_golden.safetensors": "ops-golden", "mtp_golden.safetensors": "mtp-golden"}.get(
-            missing, "e2e-golden"
-        )
+        name = {
+            "ops_golden.safetensors": "ops-golden",
+            "dflash2_golden.safetensors": "dflash2-golden",
+        }.get(missing, "e2e-golden")
         error = checks[name]["error"]
         assert (".forge/golden/tiny" if missing == "golden" else missing) in error
         assert "Run weights golden" in error
@@ -328,6 +331,7 @@ def test_ssh_argv(entry, capsys):
 @pytest.mark.parametrize("interrupted", [False, True])
 def test_gpu_steps_run_under_lease(cfg, entry, executor, capsys, interrupted):
     cfg.model.weights_dir = "model's weights"
+    cfg.model.draft_weights_dir = "draft"
     cfg.shared.models_dir = "/shared models"
     cfg.weights.golden_dir = "golden fixtures"
     model = "/shared models/model's weights"
@@ -354,7 +358,7 @@ def test_gpu_steps_run_under_lease(cfg, entry, executor, capsys, interrupted):
             "ctest",
             "ops-golden",
             "e2e-golden",
-            "mtp-golden",
+            "dflash2-golden",
             "runtime-golden",
             "forge-host",
             "server",
@@ -383,8 +387,15 @@ def test_gpu_steps_run_under_lease(cfg, entry, executor, capsys, interrupted):
             model,
             "--golden-dir",
             golden,
+            "--draft-dir",
+            "/shared models/draft",
         ]
-        assert shlex.split(runs[4].splitlines()[-1]) == ["engine/build/mtp_tests", model, golden]
+        assert shlex.split(runs[4].splitlines()[-1]) == [
+            "engine/build/dflash2_tests",
+            model,
+            "/shared models/draft",
+            golden,
+        ]
         assert "forge-host --smoke" in runs[5]
         assert runs[6].splitlines()[-3] == '"$server" --smoke'
         assert shlex.split(runs[6].splitlines()[-1]) == [
@@ -392,6 +403,8 @@ def test_gpu_steps_run_under_lease(cfg, entry, executor, capsys, interrupted):
             "--check-chat-golden",
             "--model-dir",
             model,
+            "--draft-dir",
+            "/shared models/draft",
             "--golden",
             "workloads/chat_golden.json",
             "--golden-cases",
@@ -399,7 +412,11 @@ def test_gpu_steps_run_under_lease(cfg, entry, executor, capsys, interrupted):
         ]
         server, smoke, flag, config = shlex.split(runs[6].splitlines()[-2])
         assert (server, smoke, flag) == ("$server", "--smoke", "--config-json")
-        assert json.loads(config) == {"model_dir": model, "max_context": 2048}
+        assert json.loads(config) == {
+            "model_dir": model,
+            "draft_model_dir": "/shared models/draft",
+            "max_context": 2048,
+        }
 
 
 def test_missing_required_config(repo, monkeypatch, capsys):

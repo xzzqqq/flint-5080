@@ -44,7 +44,8 @@ class DeviceArena {
 class WeightsArena : public detail::DeviceArena<ModelWeightsView> {
  public:
   static WeightsArena Load(const std::filesystem::path& checkpoint_dir,
-                           cudaStream_t stream = nullptr, bool load_mtp = false);
+                           cudaStream_t stream = nullptr,
+                           const std::filesystem::path& draft_dir = {});
   float transfer_ms() const { return transfer_ms_; }
 
  private:
@@ -55,9 +56,9 @@ class WeightsArena : public detail::DeviceArena<ModelWeightsView> {
 class KvStateArena : public detail::DeviceArena<KvStateArenaView> {
  public:
   static KvStateArena Allocate(const ModelConfig& config, uint32_t max_full_seq_len,
-                               bool with_mtp = false);
+                               bool with_draft = false);
   static uint32_t MaxFullSeqLenForBudget(const ModelConfig& config, size_t budget_bytes,
-                                         bool with_mtp = false);
+                                         bool with_draft = false);
   void Reset(cudaStream_t stream = nullptr);
 
  private:

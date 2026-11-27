@@ -29,8 +29,6 @@ def pattern(name):
 
 
 def component(file, name):
-    if file == "model-mtp.safetensors":
-        return "mtp_dspark"
     if file == "model-vision.safetensors":
         return "vision"
     parts = name.split(".")
@@ -304,7 +302,7 @@ def inspect_directory(directory, include_tensors=False):
     files, tensors, headers = [], [], []
     sizes = {}
     for path in sorted(root.rglob("*"), key=lambda p: p.relative_to(root).as_posix()):
-        if not path.is_file():
+        if path.name == "model-mtp.safetensors" or not path.is_file():
             continue
         file = path.relative_to(root).as_posix()
         sizes[file] = path.stat().st_size

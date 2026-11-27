@@ -9,10 +9,10 @@
 #include "loader/model_constants.h"
 namespace flint {
 struct KvArenaSizes {
-  size_t swa, per_token, kv_conv, sublayer_conv, mtp_swa, mtp_per_token;
-  size_t Fixed() const { return swa + kv_conv + sublayer_conv + mtp_swa; }
+  size_t swa, per_token, kv_conv, sublayer_conv, draft_swa;
+  size_t Fixed() const { return swa + kv_conv + sublayer_conv + draft_swa; }
 };
-inline KvArenaSizes ComputeKvArenaSizes(const ModelConfig& c, bool with_mtp = false) {
+inline KvArenaSizes ComputeKvArenaSizes(const ModelConfig& c, bool with_draft = false) {
   if (c.num_key_value_heads != model::kNumKvHeads || c.head_dim != model::kHeadDim ||
       c.hidden_size != model::kHiddenSize || c.sconv_kernel_size != model::kSconvKernelSize ||
       c.sliding_window_size != model::kSlidingWindow)
@@ -20,14 +20,12 @@ inline KvArenaSizes ComputeKvArenaSizes(const ModelConfig& c, bool with_mtp = fa
   size_t channels = c.num_key_value_heads * c.head_dim;
   size_t kv_pair = 2 * channels * sizeof(uint16_t);
   size_t state = model::kNumLogicalVisits * 2 * (c.sconv_kernel_size - 1) * sizeof(float);
-  if (with_mtp && !c.has_mtp) throw std::invalid_argument("missing MTP config");
-  size_t mtp_pair = with_mtp ? kv_pair : 0;
-  return {model::kNumSwaVisits * c.sliding_window_size * kv_pair,
-          model::kNumFullVisits * kv_pair + mtp_pair,
-          state * channels,
-          state * c.hidden_size,
-          2 * (c.mtp.sliding_window_size + c.mtp.block_size) * mtp_pair,
-          mtp_pair};
+  if (with_draft && !c.has_draft) throw std::invalid_argument("missing Draft config");
+  size_t draft_pair = with_draft ? kv_pair : 0;
+  return {
+      model::kNumSwaVisits * c.sliding_window_size * kv_pair, model::kNumFullVisits * kv_pair,
+      state * channels, state * c.hidden_size,
+      c.draft.num_hidden_layers * (c.draft.sliding_window_size + c.draft.block_size) * draft_pair};
 }
 
 struct KvVisitPointers {
@@ -56,7 +54,7 @@ inline std::array<std::pair<void*, size_t>, 4> FixedKvRegions(const KvStateArena
   return {{{kv.swa_kv, sizes.swa},
            {kv.kv_conv_state, sizes.kv_conv},
            {kv.sublayer_conv_state, sizes.sublayer_conv},
-           {kv.mtp_swa_kv, sizes.mtp_swa}}};
+           {kv.draft_swa_kv, sizes.draft_swa}}};
 }
 
 inline void CopyFixedKvToSnapshot(void* snapshot_base, const KvStateArenaView& kv,

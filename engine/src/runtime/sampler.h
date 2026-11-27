@@ -26,7 +26,8 @@ struct SpeculativeResult {
 };
 SpeculativeResult VerifySpeculative(std::span<const int32_t> draft_ids,
                                     std::span<const int32_t> target_argmax,
-                                    std::span<const float> draft_logits,
+                                    std::span<const int32_t> candidates,
+                                    std::span<const float> q_probs,
                                     std::span<const float> target_logits, int vocab,
                                     float temperature, int32_t top_k, float top_p, uint64_t& rng);
 }  // namespace flint

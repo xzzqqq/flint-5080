@@ -1,29 +1,15 @@
 # Flint-5080
 
-A focused local LLM inference engine for serving **Inkling 2 mini** (with `dspark` speculative decoding) on a single **RTX 5080 16 GB** (`sm_120a`), built from scratch for low-latency personal chat and coding agents.
+A focused local LLM inference engine for serving **Inkling 2 mini** (with DFlash 2 speculative decoding) on a single **RTX 5080 16 GB** (`sm_120a`), built from scratch for low-latency personal chat and coding agents.
 
-> **Status:** Feature-complete baseline (`AR + DSpark + VRAM Prefix Cache + forge + bench + weights kld + /metrics`) verified on RTX 5080; entering continuous RTX 5080 SOL optimization (targeting `≥70%` DSpark round SOL and 128K context).
-
----
-
-## Current Baseline (RTX 5080, Reference Kernels)
-
-Frozen on `Maxrio/Inkling-2-Mini-exl3` (`3.3bpw`, greedy C1, `remote_loopback`; see [2026-11-26-phase3-dspark-baseline.md](docs/findings/2026-11-26-phase3-dspark-baseline.md)):
-
-| Metric | DSpark (default) | AR (`--no-spec`, ref) | Target |
-|---|---:|---:|---|
-| `short_chat` (63 tok) | 36.81 tok/s (114.1 ms/rnd, 4.20 tok/rnd) | 23.75 tok/s | `≥70%` DSpark round SOL |
-| `short_debug` (273 tok) | 32.04 tok/s (131.1 ms/rnd, 4.20 tok/rnd) | 21.79 tok/s | `≥70%` DSpark round SOL |
-| `short_review` (1,091 tok) | 27.95 tok/s (187.5 ms/rnd, 5.25 tok/rnd) | 16.99 tok/s | `≥70%` DSpark round SOL |
-| Auto-sized context (BF16 KV, 3 prefix slots) | 40,355 tok | 67,176 tok | 128K (`131,072` tok) with DSpark |
-| Correctness (`canary` / `weights kld`) | 6/6 / 288/288 AR parity | 6/6 / 0.0 KL (288 pos) | 100% canary + KLD gated |
-
----
+The target loads from `--model-dir`. Set `[model].draft_weights_dir` or pass
+`--draft-dir` to load `incoai/Inkling-2-Mini-DFlash2`. Use `--no-spec` for AR.
+DFlash 2 passed RTX 5080 acceptance and all six HTTP canaries. On the three greedy short cases it delivered 1.262× Round 1 DSpark throughput and 1.880× Round 1 AR throughput. [Measured baseline](docs/findings/2026-11-27-dflash2-pivot-baseline.md)
 
 ## Goals
 
 - **Single-GPU focus:** Linux with one RTX 5080 16 GB (`sm_120a`), targeting low concurrency (C1 latency first with decode approaching Speed of Light, C2 when feasible, no artificial concurrency cap, 128K context).
-- **Capabilities:** OpenAI-compatible Chat Completions (SSE streaming and non-streaming), reasoning, tool calls, Prometheus `/metrics`, VRAM prefix reuse, and `dspark` speculative decoding. Clean extension points are reserved for Responses API, host KV-RAM, Vision, and web UI.
+- **Capabilities:** OpenAI-compatible Chat Completions (SSE streaming and non-streaming), reasoning, tool calls, Prometheus `/metrics`, VRAM prefix reuse, and DFlash 2 speculative decoding. Clean extension points are reserved for Responses API, host KV-RAM, Vision, and web UI.
 - **Minimal surface:** Standard `safetensors` weights (including offline layout repacks in the same format), zero-bloat single-binary serving, and a fast resident hot-reload workbench (`forge`) for kernel and graph iteration.
 
 ---
@@ -41,7 +27,7 @@ server/   (Thin single-crate Rust shell)
         ▼
 engine/   (Self-contained C++/CUDA sm_120a engine)
           safetensors mmap loader, static VRAM arenas, VRAM prefix cache,
-          scheduler, CUDA Graphs, AR + dspark forward & kernels
+          scheduler, CUDA Graphs, AR + DFlash 2 forward & kernels
 ```
 
 The engine builds into two mutually exclusive runtime modes on the 5080:
@@ -67,7 +53,7 @@ Development uses a Mac laptop ↔ remote Linux 5080 workflow backed by four focu
 ## Documentation
 
 - [Architecture](docs/architecture.md) — System boundaries, `engine_api.h`, engine invariants, `forge` hot-reload design, and toolchain.
-- [Model & Hardware Budget](docs/model.md) — Inkling 2 mini + DSpark specs, EXL3 subset, 16 GiB / 128K VRAM budget, and 960 GB/s Roofline.
+- [Model & Hardware Budget](docs/model.md) — Inkling 2 mini + DFlash 2 specs, EXL3 subset, 16 GiB / 128K VRAM budget, and 960 GB/s Roofline.
 - [Benchmark Protocol](docs/benchmark.md) — Fixed workloads, timing rules, statistical comparisons, and acceptance gates.
 - [GPU Findings](docs/findings/README.md) — Dated experiment reports, frozen baselines, numerical analyses, and rejected dead ends.
 - [AGENTS.md](AGENTS.md) — Engineering guardrails, optimization workflow, numerical verification rules, and documentation map.

@@ -99,6 +99,8 @@ int RunDaemon(std::span<char*> args) {
       cfg.state_dir = v;
     else if (key == "--model-dir")
       cfg.model_dir = v;
+    else if (key == "--draft-dir")
+      cfg.draft_dir = v;
     else if (key == "--golden-dir")
       cfg.golden_dir = v;
     else if (key == "--kv-seq-len")
@@ -113,7 +115,7 @@ int RunDaemon(std::span<char*> args) {
     throw std::runtime_error(
         "expected --socket PATH --baseline PATH --state-dir PATH and --model-dir PATH or "
         "--no-model");
-  if (!cfg.kv_seq_len) cfg.kv_seq_len = synthetic ? 256 : 65536;
+  if (synthetic && !cfg.kv_seq_len) cfg.kv_seq_len = 256;
   if (!cfg.scratch_mb) cfg.scratch_mb = synthetic ? 16 : 450;
   std::filesystem::create_directories(cfg.state_dir);
   Fd server{socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0)};

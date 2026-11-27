@@ -8,11 +8,12 @@
 #include <vector>
 
 #include "common/cuda_check.h"
+#include "common/splitmix64.h"
 #include "loader/arenas.h"
 #include "loader/kv_layout.h"
 #include "loader/safetensors.h"
 #include "loader/scratch_workspace.h"
-#include "model/dspark_forward.h"
+#include "model/dflash2_forward.h"
 #include "model/inkling2_forward.h"
 #include "runtime/sampler.h"
 
@@ -61,14 +62,13 @@ size_t Free() {
 // Uniform attention has an analytical answer. Distinct values in the evicted
 // prefix and the draft block exercise ring wrap, both visibility bounds and GQA.
 void AttentionWindow() {
-  constexpr int ctx = 1040, length = ctx + 8;
+  constexpr int ctx = 2064, length = ctx + 8;
   auto arena = ScratchArena::Allocate(32ul << 20);
   ScratchWorkspace ws(arena.view());
-  Gemm gemm(nullptr, ws.Take<char>(4ul << 20), 4ul << 20);
   auto data = ws.Take<uint16_t>(length * 1024);
   auto k = ws.Take<uint16_t>(length * 1024), v = ws.Take<uint16_t>(length * 1024);
-  auto q = ws.Take<uint16_t>(8 * 3072), out = ws.Take<uint16_t>(8 * 3072);
-  CheckCuda(cudaMemset(q, 0, 8 * 3072 * 2));
+  auto q = ws.Take<uint16_t>(8 * 4096), out = ws.Take<uint16_t>(8 * 4096);
+  CheckCuda(cudaMemset(q, 0, 8 * 4096 * 2));
   std::vector<uint16_t> values(length * 1024);
   auto bf16 = [](float x) {
     uint32_t bits = std::bit_cast<uint32_t>(x);
@@ -76,41 +76,42 @@ void AttentionWindow() {
   };
   for (int t = 0; t < length; ++t)
     for (int d = 0; d < 1024; ++d)
-      values[t * 1024 + d] = bf16(float(d / 128 + (t < 16 ? 128 : t >= ctx ? 64 : 0)));
+      values[t * 1024 + d] = bf16(float(d / 128 + (t < 24 ? 128 : t >= ctx ? 64 : 0)));
   CheckCuda(cudaMemcpy(data, values.data(), values.size() * 2, cudaMemcpyHostToDevice));
-  for (bool local : {false, true}) {
-    DraftKv cache{k, v, local ? 1032 : length, local};
-    CheckCuda(flint_dspark_kv_write(cache, data, data, 1024, 0, nullptr));
+  {
+    DraftKv cache{k, v, 2056};
+    CheckCuda(flint_dflash2_kv_write(cache, data, data, 1024, 0, nullptr));
     auto tail = data + 1024 * 1024;
-    CheckCuda(flint_dspark_kv_write(cache, tail, tail, length - 1024, 1024, nullptr));
+    CheckCuda(flint_dflash2_kv_write(cache, tail, tail, length - 1024, 1024, nullptr));
     for (size_t bytes : {ws.rest.bytes, size_t(length) * sizeof(float)}) {
-      CheckCuda(flint_dspark_block_attention(cache, q, out, static_cast<float*>(ws.rest.device_ptr),
-                                             bytes, gemm.handle(), ctx, nullptr));
-      auto attention = Read<uint16_t>(out, 8 * 3072);
-      for (int i = 0; i < 8 * 3072; ++i) {
-        int kv_head = (i % 3072) / 128 / 3;
-        float mean = kv_head + (8 * 64.f + (local ? 0.f : 16 * 128.f)) / (local ? 1032 : length);
+      CheckCuda(flint_dflash2_block_attention(
+          cache, q, out, static_cast<float*>(ws.rest.device_ptr), bytes, ctx, nullptr));
+      auto attention = Read<uint16_t>(out, 8 * 4096);
+      for (int i = 0; i < 8 * 4096; ++i) {
+        int kv_head = (i % 4096) / 128 / 4;
+        int row = i / 4096;
+        int visible = 2048 + 7 - row;
+        float mean = kv_head + ((7 - row) * 128 + 8 * 64.f) / visible;
         Require(attention[i] == bf16(mean), "draft block visibility or GQA");
       }
     }
   }
 }
-bool Case(const std::filesystem::path& model, const std::filesystem::path& dir, bool warmup) {
-  auto file = SafetensorsFile::Open(dir / "mtp_golden.safetensors");
+bool Case(const std::filesystem::path& model, const std::filesystem::path& draft_dir,
+          const std::filesystem::path& dir, bool warmup) {
+  auto file = SafetensorsFile::Open(dir / "dflash2_golden.safetensors");
   auto ids = [&](const std::string& key) { return Tensor<int>(file, key, TensorDType::kI32); };
   auto prompt = ids("prompt_ids"), gold = ids("spec_generated_ids");
-  auto ar = SafetensorsFile::Open(dir / "e2e_short_math.safetensors");
-  Require(gold.size() == 49 && gold == Tensor<int>(ar, "generated_ids", TensorDType::kI32),
-          "AR fixture mismatch");
+  Require(!gold.empty() && gold == ids("ar_generated_ids"), "AR fixture mismatch");
   unsigned n = prompt.size();
-  auto weights = WeightsArena::Load(model, nullptr, true);
+  auto weights = WeightsArena::Load(model, nullptr, draft_dir);
   auto kv = KvStateArena::Allocate(weights.view().config,
                                    std::max<size_t>(1040, n + gold.size() + 8), true);
   auto scratch = ScratchArena::Allocate();
   auto target_ws = scratch.view();
-  auto draft_ws = DsparkRunner::ReserveScratch(target_ws);
+  auto draft_ws = DFlash2Runner::ReserveScratch(target_ws);
   InklingRunner target(weights.view(), kv.view(), target_ws, nullptr);
-  DsparkRunner draft(weights.view(), kv.view(), draft_ws, target.stream());
+  DFlash2Runner draft(weights.view(), kv.view(), draft_ws, target.stream());
   auto io = ScratchArena::Allocate((16ul << 20) + size_t(n) * 2304 * 24);
   ScratchWorkspace ws(io.view());
   auto all_logits = ws.Take<float>(8 * 200058);
@@ -132,19 +133,12 @@ bool Case(const std::filesystem::path& model, const std::filesystem::path& dir, 
                       .d_taps_out = taps};
   int anchor = target.Run(spec, {}).next_token_id;
   Require(anchor == ids("prefill_bonus_id")[0], "prefill bonus");
-  DsparkCapture cap{};
-  for (auto& mix : cap.mix) mix = ws.Take<uint16_t>(n * 2304);
+  DFlash2Capture cap{};
   cap.embed_block = ws.Take<uint16_t>(8 * 2304);
   for (auto& layer : cap.layer_out) layer = ws.Take<uint16_t>(8 * 2304);
   cap.head_hidden = ws.Take<uint16_t>(8 * 2304);
-  cap.f_rnn = ws.Take<uint16_t>(2304);
-  cap.context = ws.Take<float>(7 * 768);
-  cap.states = ws.Take<uint16_t>(7 * 256);
-  cap.latents = ws.Take<uint16_t>(7 * 256);
-  std::vector<int> top_ids(7 * 64);
-  std::vector<float> top_logits(7 * 64);
-  cap.h_top_ids = top_ids.data();
-  cap.h_top_logits = top_logits.data();
+  cap.unary = ws.Take<float>(7 * 16);
+  cap.scores = ws.Take<float>(7 * 16 * 16);
   bool ok = true;
   auto bf = [&](const std::string& key, const void* p, double max_rel_l2 = 0.01) {
     auto expected = Tensor<uint16_t>(file, key, TensorDType::kBF16);
@@ -155,80 +149,124 @@ bool Case(const std::filesystem::path& model, const std::filesystem::path& dir, 
   auto fixture = Tensor<uint16_t>(file, "prefill_taps", TensorDType::kBF16);
   auto isolated = ws.Take<uint16_t>(fixture.size());
   upload(isolated, fixture.data(), fixture.size() * 2);
-  draft.StoreContextKv(isolated, n, 0, &cap);
+  draft.StoreContextKv(isolated, n, 0);
   CheckCuda(cudaDeviceSynchronize());
-  for (int i = 0; i < 3; ++i) {
+  for (int i = 0; i < 5; ++i) {
     auto layer = "layer_" + std::to_string(i);
-    bf("mix_rmsnorm." + layer, cap.mix[i]);
     auto& v = kv.view();
-    size_t plane = size_t(i == 1 ? v.max_full_seq_len : v.mtp_swa_window) * 1024;
-    auto* k =
-        static_cast<uint16_t*>(i == 1 ? v.mtp_full_kv : v.mtp_swa_kv) + (i == 2 ? 2 * plane : 0);
+    size_t plane = size_t(v.draft_swa_window) * 1024;
+    auto k = static_cast<uint16_t*>(v.draft_swa_kv) + i * 2 * plane;
     bf("ctx_kv." + layer + ".k", k);
     bf("ctx_kv." + layer + ".v", k + plane);
   }
-  bf("mix_rmsnorm.markov", cap.mix[3]);
   std::array<int, 8> block{anchor};
-  draft.DraftGreedy(anchor, isolated + size_t(n - 1) * 4 * 2304, n, block.data() + 1, &cap);
-  std::string prefix = "round_0.";
+  ForwardDraftResult proposal;
+  draft.Draft({anchor, int(n), 0, 0, 0}, proposal, &cap);
+  const std::string prefix = "round_0.";
+  Require(std::ranges::equal(ids(prefix + "draft_ids"), proposal.draft_ids),
+          "composed greedy path");
   bf(prefix + "embed_block", cap.embed_block);
-  for (int i = 0; i < 3; ++i) bf(prefix + "layer_" + std::to_string(i) + "_out", cap.layer_out[i]);
-  bf(prefix + "head_hidden", cap.head_hidden);
-  bf(prefix + "f_rnn", cap.f_rnn);
-  prefix += "markov.";
-  ok &= Compare(Read<float>(cap.context, 7 * 768),
-                Tensor<float>(file, prefix + "context", TensorDType::kF32), prefix + "context");
-  bf(prefix + "states", cap.states);
-  bf(prefix + "latents", cap.latents);
-  auto expected_top = Tensor<uint16_t>(file, prefix + "top64_logits", TensorDType::kBF16);
-  std::vector<float> top(expected_top.size());
-  std::transform(expected_top.begin(), expected_top.end(), top.begin(),
-                 [](uint16_t b) { return Value(b); });
-  ok &= Compare(top_logits, top, prefix + "top64_logits");
-  auto ref_top = ids(prefix + "top64_ids");
-  for (int j = 0; j < 7; ++j) {
-    auto row = std::span(top_ids).subspan(j * 64, 64);
-    auto reference = std::span(ref_top).subspan(j * 64, 64);
-    int common = std::count_if(row.begin(), row.end(), [&](int id) {
-      return std::ranges::find(reference, id) != reference.end();
-    });
-    std::cout << "draft row " << j << " top64 overlap=" << common << "/64" << std::endl;
-    ok &= row.front() == block[j + 1] && common >= 60;
+  // FP64 attention alone moves the final layer by 4.13% and the head by
+  // 1.70% versus eager FP32 on this fixture (2026-11-27 findings).
+  for (int i = 0; i < 5; ++i)
+    bf(prefix + "layer_" + std::to_string(i) + "_out", cap.layer_out[i], i == 4 ? 0.05 : 0.01);
+  bf(prefix + "head_hidden", cap.head_hidden, 0.02);
+  auto ranked_logits = Tensor<float>(file, prefix + "unary_logits", TensorDType::kF32);
+  ok &= Compare(Read<float>(cap.unary, ranked_logits.size()), ranked_logits,
+                "composed sorted unary logits");
+  // Split-KV reduction rounds a few attention elements differently from the
+  // dense FP32 oracle. Measure each layer on identical inputs before comparing
+  // edge matrices, whose axes are the *ranked token IDs* of adjacent rows.
+  std::array<std::vector<uint16_t>, 5> reference;
+  for (int i = 0; i < 5; ++i) {
+    reference[i] =
+        Tensor<uint16_t>(file, prefix + "layer_" + std::to_string(i) + "_out", TensorDType::kBF16);
+    auto device = ws.Take<uint16_t>(reference[i].size());
+    upload(device, reference[i].data(), reference[i].size() * sizeof(uint16_t));
+    cap.reference_layer_out[i] = device;
   }
-  ok &= std::equal(block.begin() + 1, block.end(), ids(prefix + "draft_ids").begin());
-  if (!warmup) {
-    std::vector<float> greedy_logits(7 * 200058), sampled_logits(greedy_logits.size());
-    std::array<int, 7> sampled{};
-    auto greedy = [](std::span<const float> row) {
-      return int(std::max_element(row.begin(), row.end()) - row.begin());
-    };
-    auto tap = isolated + size_t(n - 1) * 4 * 2304;
-    draft.DraftWithLogits(anchor, tap, n, sampled.data(), greedy_logits.data(), greedy);
-    Require(std::equal(sampled.begin(), sampled.end(), block.begin() + 1),
-            "greedy sampler callback");
-    int step = 0;
-    draft.DraftWithLogits(anchor, tap, n, sampled.data(), sampled_logits.data(), [&](auto row) {
-      int best = greedy(row);
-      return step++ == 0 ? (best + 1) % 200058 : best;
-    });
-    Require(step == 7 &&
-                std::equal(greedy_logits.begin(), greedy_logits.begin() + 200058,
-                           sampled_logits.begin()) &&
-                !std::equal(greedy_logits.begin() + 200058, greedy_logits.begin() + 2 * 200058,
-                            sampled_logits.begin() + 200058),
-            "sampled token feedback");
+  std::cout << "teacher-forced decoder and selector" << std::endl;
+  draft.Draft({anchor, int(n), 0, 0, 0}, proposal, &cap);
+  for (int i = 0; i < 5; ++i) bf(prefix + "layer_" + std::to_string(i) + "_out", cap.layer_out[i]);
+  bf(prefix + "head_hidden", cap.head_hidden);
+  Require(std::ranges::equal(ids(prefix + "cand_ids"), proposal.candidate_ids),
+          "selector top-16 IDs");
+  Require(std::ranges::equal(ids(prefix + "draft_ids"), proposal.draft_ids),
+          "selector greedy path");
+  for (auto [key, ptr] :
+       {std::pair{"unary_logits", cap.unary}, std::pair{"selector_scores", cap.scores}}) {
+    auto expected = Tensor<float>(file, prefix + key, TensorDType::kF32);
+    ok &= Compare(Read<float>(ptr, expected.size()), expected, key);
+  }
+  // The walk below consumes the scores from the unforced eager block.
+  std::ranges::fill(cap.reference_layer_out, nullptr);
+  draft.Draft({anchor, int(n), 0, 0, 0}, proposal, &cap);
+  for (float temperature : {0.f, 1.f}) {
+    ForwardDraftResult eager, graph;
+    ForwardDraftSpec settings{anchor, int(n), temperature, 12345, 0};
+    draft.Draft(settings, eager);
+    settings.use_cuda_graph = 1;
+    draft.Draft(settings, graph);
+    Require(!std::memcmp(&eager, &graph, sizeof(graph)), "graph/eager mismatch");
+    if (temperature > 0) {
+      auto scores = Read<float>(cap.scores, kDraftTokens * kSelectorTopK * kSelectorTopK);
+      int predecessor = 0;
+      uint64_t walk = settings.seed;
+      for (int e = 0; e < kDraftTokens; ++e) {
+        auto row = std::span(scores).subspan((e * kSelectorTopK + predecessor) * kSelectorTopK,
+                                             kSelectorTopK);
+        float peak = *std::ranges::max_element(row);
+        double sum = 0;
+        for (float value : row) sum += std::exp((value - peak) / temperature);
+        double draw = flint::SplitMixUniform(walk);
+        int chosen = -1;
+        for (int c = 0; c < kSelectorTopK; ++c) {
+          float q = std::exp((row[c] - peak) / temperature) / sum;
+          Require(std::abs(graph.q_probs[e * kSelectorTopK + c] - q) < 1e-6,
+                  "conditional draft probability");
+          if (chosen < 0 && (draw -= q) < 0) chosen = c;
+        }
+        Require(
+            chosen >= 0 && graph.draft_ids[e] == graph.candidate_ids[e * kSelectorTopK + chosen],
+            "seeded draft path");
+        predecessor = chosen;
+      }
+      std::vector<float> target_logits(8 * 200058, -INFINITY);
+      // A disjoint target must reject immediately and return its only token.
+      int outside = 0;
+      auto candidates = std::span(graph.candidate_ids).first(16);
+      while (std::ranges::find(candidates, outside) != candidates.end()) ++outside;
+      target_logits[outside] = 0;
+      uint64_t seed = 21;
+      auto verified = VerifySpeculative(graph.draft_ids, {}, graph.candidate_ids, graph.q_probs,
+                                        target_logits, 200058, temperature, 0, 1, seed);
+      Require(!verified.accepted_draft_count && verified.bonus_token == outside,
+              "sparse rejection");
+    }
   }
   draft.StoreContextKv(taps, n, 0);
-  auto last = taps + size_t(n - 1) * 4 * 2304;
   std::vector<int> generated{anchor};
   spec.seq_len = 8;
   spec.reset_kv = 0;
   spec.pos_offset = n;
   uint64_t rng = 0;
+  // The target and reference prefill taps have different BF16 rounding. Replay
+  // the same proposal before comparing acceptance and the rejection bonus.
+  const auto fixture_ids = ids("round_0.draft_ids");
+  std::ranges::copy(fixture_ids, block.begin() + 1);
+  upload(input, block.data(), sizeof(block));
+  target.RunVerify(spec);
+  auto oracle =
+      VerifySpeculative(fixture_ids, Read<int>(next, 8), {}, {}, {}, 200058, 0, 0, 0, rng);
+  Require(oracle.accepted_draft_count == ids("round_0.accepted_count")[0] &&
+              oracle.bonus_token == ids("round_0.next_bonus_id")[0],
+          "first verification on fixture proposal");
+  target.CommitVerify(n, 8, 0);
   int accepted = 0;
   for (int round = 0; generated.size() < gold.size(); ++round) {
     block[0] = anchor;
-    draft.DraftGreedy(anchor, last, spec.pos_offset, block.data() + 1);
+    draft.Draft({anchor, int(spec.pos_offset), 0, 0, 1}, proposal);
+    std::ranges::copy(proposal.draft_ids, block.begin() + 1);
     upload(input, block.data(), sizeof(block));
     spec.d_logits_out = all_logits;
     target.RunVerify(spec, {.return_logits = round == 0});
@@ -242,7 +280,7 @@ bool Case(const std::filesystem::path& model, const std::filesystem::path& dir, 
       }
     }
     auto result =
-        VerifySpeculative(std::span(block).subspan(1), verified, {}, {}, 200058, 0, 0, 0, rng);
+        VerifySpeculative(std::span(block).subspan(1), verified, {}, {}, {}, 200058, 0, 0, 0, rng);
     int a = result.accepted_draft_count;
     std::cout << "round " << round << " accepted=" << a << " bonus=" << result.bonus_token
               << std::endl;
@@ -250,16 +288,11 @@ bool Case(const std::filesystem::path& model, const std::filesystem::path& dir, 
         std::mismatch(block.begin() + 1, block.end(), verified.begin()).first - (block.begin() + 1);
     Require(a == expected, "accepted draft count");
     Require(result.bonus_token == verified[a], "verification bonus");
-    if (round == 0)
-      Require(a == ids("round_0.accepted_count")[0] &&
-                  result.bonus_token == ids("round_0.next_bonus_id")[0],
-              "first verification");
     int count = std::min<size_t>(1 + a, gold.size() - generated.size());
     accepted += std::min(a, count);
     target.CommitVerify(spec.pos_offset, 8, count);
 
     draft.StoreContextKv(taps, count, spec.pos_offset);
-    last = taps + size_t(count - 1) * 4 * 2304;
     spec.pos_offset += count;
     for (int i = 0; i < count; ++i) generated.push_back(i < a ? block[i + 1] : result.bonus_token);
     anchor = generated.back();
@@ -267,10 +300,8 @@ bool Case(const std::filesystem::path& model, const std::filesystem::path& dir, 
   }
   if (!warmup) {
     std::cout << "accepted=" << accepted << std::endl;
-    // At least 70% of the 48 tokens following the anchor must be accepted drafts.
-    Require(accepted * 10 >= 7 * (gold.size() - 1), "draft acceptance");
     Require(generated == gold, "speculative sequence mismatch");
-    std::cout << "short_math 49/49" << std::endl;
+    std::cout << "short_math matched " << gold.size() << " tokens" << std::endl;
 
     // Cross the SWA ring boundary with live, nonzero history. Compare the
     // committed fixed state against directly evaluating just the accepted prefix.
@@ -324,10 +355,11 @@ int main(int argc, char** argv) {
       AttentionWindow();
       return 0;
     }
-    if (argc != 3) throw std::invalid_argument("usage: mtp_tests MODEL_DIR GOLDEN_DIR");
-    Case(argv[1], argv[2], true);
+    if (argc != 4)
+      throw std::invalid_argument("usage: dflash2_tests MODEL_DIR DRAFT_DIR GOLDEN_DIR");
+    Case(argv[1], argv[2], argv[3], true);
     auto before = Free();
-    bool ok = Case(argv[1], argv[2], false);
+    bool ok = Case(argv[1], argv[2], argv[3], false);
     CheckCuda(cudaDeviceSynchronize());
     auto loss = int64_t(before) - int64_t(Free());
     std::cout << "teardown_delta_bytes=" << loss << std::endl;

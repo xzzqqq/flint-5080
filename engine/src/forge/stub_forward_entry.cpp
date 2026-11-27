@@ -315,8 +315,8 @@ int32_t flint_forward_store_context(ForwardContext*, const void* taps, uint32_t 
                                     uint32_t pos) {
   return cudaErrorNotSupported;
 }
-int32_t flint_forward_draft(ForwardContext*, int32_t anchor, const void* tap, uint32_t pos,
-                            int32_t* h_ids) {
+int32_t flint_forward_draft(ForwardContext*, const ForwardDraftSpec* spec,
+                            ForwardDraftResult* result) {
   return cudaErrorNotSupported;
 }
 int32_t flint_forward_verify(ForwardContext*, const ForwardRunSpec* spec,

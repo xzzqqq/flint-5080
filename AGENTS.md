@@ -3,7 +3,7 @@
 ## Project
 
 Flint-5080 is a local inference engine for personal chat and coding agents,
-serving **Inkling 2 mini** (with `dspark` speculative decoding) on one
+serving **Inkling 2 mini** (with DFlash 2 speculative decoding) on one
 **RTX 5080 16 GB** (`sm_120a`).
 
 Optimize for C1 latency with decode approaching SOL (Speed of Light), and C2

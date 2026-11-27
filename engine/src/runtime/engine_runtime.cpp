@@ -19,10 +19,11 @@
 
 #include "common/cuda_check.h"
 #include "common/json_output.h"
+#include "common/splitmix64.h"
 #include "loader/arenas.h"
 #include "loader/kv_layout.h"
 #include "loader/scratch_workspace.h"
-#include "model/dspark_forward.h"
+#include "model/dflash2_forward.h"
 #include "model/inkling2_forward.h"
 #include "ops/stub_ops.h"
 #include "runtime/config.h"
@@ -104,24 +105,22 @@ std::unique_ptr<T, FreePinned> AllocatePinned(size_t count) {
   return std::unique_ptr<T, FreePinned>(ptr);
 }
 
-constexpr uint32_t kBlock = model::kMtpConfig.block_size;
+constexpr uint32_t kBlock = model::kDraftConfig.block_size;
 constexpr size_t kTap = 4 * model::kHiddenSize;
 constexpr size_t kVocab = model::kUnpaddedVocabSize;
-PrefixCache AllocatePrefixCache(RuntimeConfig& cfg, const ModelConfig& c, bool with_mtp) {
+PrefixCache AllocatePrefixCache(RuntimeConfig& cfg, const ModelConfig& c, bool with_draft) {
   size_t free, total;
   CheckCuda(cudaMemGetInfo(&free, &total));
   size_t budget = free - std::min(free, cfg.vram_reserve_bytes);
-  size_t fixed = ComputeKvArenaSizes(c, with_mtp).Fixed();
+  size_t fixed = ComputeKvArenaSizes(c, with_draft).Fixed();
   if (cfg.prefix_cache_slots > budget / fixed)
     throw std::invalid_argument("prefix_cache_slots exceed free VRAM budget");
   auto capacity =
-      KvStateArena::MaxFullSeqLenForBudget(c, budget - fixed * cfg.prefix_cache_slots, with_mtp);
-  // Draft attention writes a whole block, even at the logical context boundary.
-  if (with_mtp) capacity -= std::min(capacity, kBlock - 1);
+      KvStateArena::MaxFullSeqLenForBudget(c, budget - fixed * cfg.prefix_cache_slots, with_draft);
   if (!capacity || cfg.max_context > capacity)
     throw std::invalid_argument("max_context exceeds free KV VRAM budget");
   if (!cfg.max_context) cfg.max_context = capacity;
-  return PrefixCache(cfg.prefix_cache_slots, c, cfg.max_context, with_mtp);
+  return PrefixCache(cfg.prefix_cache_slots, c, cfg.max_context, with_draft);
 }
 struct DecodeState {
   uint32_t position;
@@ -133,24 +132,24 @@ class ModelExecutor {
   ModelExecutor(RuntimeConfig& cfg, cudaStream_t stream)
       : config_(cfg),
         stream_(stream),
-        weights_(WeightsArena::Load(cfg.model_dir, stream, cfg.use_speculative)),
-        active_(weights_.view().has_mtp),
+        weights_(WeightsArena::Load(cfg.model_dir, stream,
+                                    cfg.use_speculative ? cfg.draft_model_dir : "")),
+        active_(weights_.view().has_draft),
         rows_(active_ ? std::max(kBlock, cfg.prefill_chunk_size) : cfg.prefill_chunk_size),
-        // The minimum 64 MiB target configuration previously had a separate 32 MiB draft arena.
-        scratch_(ScratchArena::Allocate(active_ ? std::max(cfg.scratch_bytes, size_t{96} << 20)
-                                                : cfg.scratch_bytes)),
+        scratch_(ScratchArena::Allocate(
+            active_ ? std::max(cfg.scratch_bytes, (size_t{64} << 20) + DFlash2Runner::kScratchBytes)
+                    : cfg.scratch_bytes)),
         target_scratch_(scratch_.view()),
-        draft_scratch_(active_ ? DsparkRunner::ReserveScratch(target_scratch_)
+        draft_scratch_(active_ ? DFlash2Runner::ReserveScratch(target_scratch_)
                                : ScratchArenaView{}),
         io_(ScratchArena::Allocate(rows_ *
                                        (model::kHiddenSize * sizeof(uint16_t) + sizeof(int32_t)) +
                                    kVocab * sizeof(float) * (active_ ? kBlock : 1) + 2048 +
-                                   (active_ ? (rows_ + 1) * kTap * sizeof(uint16_t) : 0))),
+                                   (active_ ? rows_ * kTap * sizeof(uint16_t) : 0))),
         cache_(AllocatePrefixCache(cfg, model_config(), active_)),
         host_ids_(AllocatePinned<int32_t>(rows_)),
         host_logits_(AllocatePinned<float>(kVocab * (active_ ? kBlock : 1))),
-        kv_(KvStateArena::Allocate(model_config(), cfg.max_context + (active_ ? kBlock - 1 : 0),
-                                   active_)),
+        kv_(KvStateArena::Allocate(model_config(), cfg.max_context, active_)),
         runner_(weights_.view(), kv_.view(), target_scratch_, stream) {
     ScratchWorkspace ws(io_.view());
     ids_ = ws.Take<int32_t>(rows_);
@@ -159,11 +158,8 @@ class ModelExecutor {
     next_ = ws.Take<int32_t>(active_ ? kBlock : 1);
     if (active_) {
       taps_ = ws.Take<uint16_t>(rows_ * kTap);
-      last_tap_ = ws.Take<uint16_t>(kTap);
-      host_tap_ = AllocatePinned<uint16_t>(kTap);
       host_next_ = AllocatePinned<int32_t>(kBlock);
-      draft_logits_ = AllocatePinned<float>((kBlock - 1) * kVocab);
-      dspark_.emplace(weights_.view(), kv_.view(), draft_scratch_, stream);
+      dflash2_.emplace(weights_.view(), kv_.view(), draft_scratch_, stream);
     }
   }
 
@@ -189,11 +185,7 @@ class ModelExecutor {
     return {host_logits_.get(), model_config().unpadded_vocab_size};
   }
 
-  void StoreContext(uint32_t rows, uint32_t pos) {
-    dspark_->StoreContextKv(taps_, rows, pos);
-    CheckCuda(cudaMemcpyAsync(last_tap_, taps_ + (rows - 1) * kTap, kTap * sizeof(uint16_t),
-                              cudaMemcpyDeviceToDevice, stream_));
-  }
+  void StoreContext(uint32_t rows, uint32_t pos) { dflash2_->StoreContextKv(taps_, rows, pos); }
   void SpecRound(Request&, uint32_t& pos, int32_t& anchor);
   const RuntimeConfig& config_;
   cudaStream_t stream_;
@@ -208,11 +200,9 @@ class ModelExecutor {
   std::unique_ptr<float, FreePinned> host_logits_;
   KvStateArena kv_;
   InklingRunner runner_;
-  std::optional<DsparkRunner> dspark_;
+  std::optional<DFlash2Runner> dflash2_;
   std::unique_ptr<int32_t, FreePinned> host_next_;
-  std::unique_ptr<uint16_t, FreePinned> host_tap_;
-  std::unique_ptr<float, FreePinned> draft_logits_;
-  uint16_t *taps_{}, *last_tap_{};
+  uint16_t* taps_{};
   Sampler sampler_;
   int32_t *ids_, *next_;
   uint16_t* hidden_;
@@ -249,9 +239,6 @@ int32_t ModelExecutor::Forward(RequestParams& params, std::span<const int32_t> i
     graphs_ = runner_.graph_stats();
   }
   if (!opts.return_logits) return out.next_token_id;
-  if (active_ && !decode && cache_.enabled())
-    CheckCuda(cudaMemcpyAsync(host_tap_.get(), last_tap_, kTap * sizeof(uint16_t),
-                              cudaMemcpyDeviceToHost, stream_));
   CheckCuda(cudaMemcpyAsync(host_logits_.get(), logits_, HostLogits().size_bytes(),
                             cudaMemcpyDeviceToHost, stream_));
   CheckCuda(cudaStreamSynchronize(stream_));
@@ -268,11 +255,6 @@ DecodeState ModelExecutor::Prefill(Request& r) {
   if (copied_state) cache_.Restore(plan.restore_slot, kv_.view(), stream_);
   int32_t token = 0;
   if (plan.use_cached_logits) {
-    if (active_) {
-      auto tap = cache_.SlotLastTap(plan.logits_slot);
-      CheckCuda(cudaMemcpyAsync(last_tap_, tap.data(), tap.size_bytes(), cudaMemcpyHostToDevice,
-                                stream_));
-    }
     token = Sample(r.params, cache_.SlotLogits(plan.logits_slot));
   } else {
     cache_.OnKvWrite(pos);
@@ -289,9 +271,7 @@ DecodeState ModelExecutor::Prefill(Request& r) {
       if (cache_.enabled() && (pos == plan.pin_pos || last) && !r.cancelled) {
         std::span<const float> logits;
         if (last) logits = HostLogits();
-        std::span<const uint16_t> tap;
-        if (last && active_) tap = {host_tap_.get(), kTap};
-        cache_.Save(prompt.first(pos), kv_.view(), logits, stream_, tap);
+        cache_.Save(prompt.first(pos), kv_.view(), logits, stream_);
         copied_state = true;
       }
     }
@@ -308,11 +288,11 @@ void ModelExecutor::SpecRound(Request& r, uint32_t& pos, int32_t& anchor) {
   const uint32_t len = std::min(kBlock, config_.max_context - pos);
   std::span<int32_t, kBlock> block(host_ids_.get(), kBlock);
   block.front() = anchor;
-  if (stochastic)
-    dspark_->DraftWithLogits(anchor, last_tap_, pos, block.data() + 1, draft_logits_.get(),
-                             [&](auto row) { return Sample(p, row); });
-  else
-    dspark_->DraftGreedy(anchor, last_tap_, pos, block.data() + 1, nullptr, config_.use_cuda_graph);
+  ForwardDraftResult proposal;
+  dflash2_->Draft({anchor, int(pos), p.temperature, p.seed, config_.use_cuda_graph}, proposal);
+  // Reserve seven SplitMix draws for the draft before drawing acceptance uniforms.
+  if (stochastic) p.seed += uint64_t(kDraftTokens) * kSplitMixIncrement;
+  std::ranges::copy(proposal.draft_ids, block.begin() + 1);
   auto input = block.first(len);
   CheckCuda(
       cudaMemcpyAsync(ids_, input.data(), input.size_bytes(), cudaMemcpyHostToDevice, stream_));
@@ -331,9 +311,8 @@ void ModelExecutor::SpecRound(Request& r, uint32_t& pos, int32_t& anchor) {
   SpeculativeResult result;
   try {
     std::span<int32_t> argmax(host_next_.get(), len);
-    std::span<const float> draft, target;
+    std::span<const float> target;
     if (stochastic) {
-      draft = {draft_logits_.get(), (len - 1) * kVocab};
       target = {host_logits_.get(), len * kVocab};
       CheckCuda(cudaMemcpyAsync(host_logits_.get(), logits_, target.size_bytes(),
                                 cudaMemcpyDeviceToHost, stream_));
@@ -342,8 +321,10 @@ void ModelExecutor::SpecRound(Request& r, uint32_t& pos, int32_t& anchor) {
                                 stream_));
     }
     CheckCuda(cudaStreamSynchronize(stream_));
-    result = VerifySpeculative(input.subspan(1), argmax, draft, target, kVocab, p.temperature,
-                               p.top_k, p.top_p, p.seed);
+    result = VerifySpeculative(input.subspan(1), argmax,
+                               std::span(proposal.candidate_ids).first((len - 1) * kSelectorTopK),
+                               std::span(proposal.q_probs).first((len - 1) * kSelectorTopK), target,
+                               kVocab, p.temperature, p.top_k, p.top_p, p.seed);
   } catch (...) {
     runner_.CommitVerify(pos, len, 0);
     throw;

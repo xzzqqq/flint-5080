@@ -63,6 +63,8 @@ def start(cfg, args, ex, lease, data, *, transient=False):
         path = cfg.resolve_model_dir(
             args.path, error_message="Set model.weights_dir or pass --path / --no-model"
         )
+        if draft := cfg.resolve_draft_dir(args.draft_dir):
+            argv.extend(["--draft-dir", str(draft)])
         golden = cfg.resolve_golden_dir(path)
         argv.extend(["--model-dir", str(path), "--golden-dir", str(golden)])
     for key in ("kv_seq_len", "scratch_mb"):

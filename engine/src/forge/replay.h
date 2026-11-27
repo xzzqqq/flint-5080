@@ -52,8 +52,8 @@ class Replay {
     ForwardRunResult verify_result{};
     double draft_ms, verify_ms, elapsed_ms;
   };
-  SpecRound RunSpecRound(ForwardModule&, int anchor, const uint16_t* last, unsigned position,
-                         bool profiler_range, bool enable_profiling = false);
+  SpecRound RunSpecRound(ForwardModule&, int anchor, unsigned position, bool profiler_range,
+                         bool enable_profiling = false);
   Object MeasureSpeculative(const Json&, const std::string&, const Measurement&);
   Object Kld(const Json& request);
   Object Measure(const Json& request, const std::string& command);
@@ -69,7 +69,6 @@ class Replay {
     std::string key;
     unsigned position{};
     std::vector<int> generated;
-    std::vector<uint16_t> last_tap;
     std::vector<std::pair<std::byte*, std::vector<std::byte>>> mutable_state;
     Recording recording;
   };

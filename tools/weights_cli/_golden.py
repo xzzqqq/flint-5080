@@ -20,7 +20,7 @@ from safetensors.torch import save_file
 from tools.common.config import load_config
 
 from .__main__ import build_parser
-from ._dspark_ref import Inkling2DSparkReference
+from ._dflash2_ref import Inkling2DFlash2Reference
 from ._inkling2_ref import (
     Inkling2LoopReference,
     decode_inner,
@@ -181,7 +181,7 @@ def e2e_case(model, case, steps):
     return saved, generated, metrics
 
 
-def mtp_fixture(path, device, model, case, steps, ar_ids=None):
+def draft_fixture(path, device, model, case, steps, ar_ids=None):
     if steps < 1:
         raise ValueError("decode_steps must be positive")
     prompt = case["input_ids"]
@@ -191,17 +191,17 @@ def mtp_fixture(path, device, model, case, steps, ar_ids=None):
         for _ in range(steps):
             logits = model.decode_step(ar_ids[-1])["logits"]
             ar_ids.append(int(logits[-1].argmax()))
-    drafter = Inkling2DSparkReference(path, device, model)
+    drafter = Inkling2DFlash2Reference(path, device, model)
     generated, trace = drafter.speculative_decode_greedy(model, prompt, steps + 1)
     if generated != ar_ids:
         mismatch = next(i for i, (a, b) in enumerate(zip(generated, ar_ids, strict=True)) if a != b)
         raise ValueError(
-            f"DSpark greedy mismatch at token {mismatch}: "
+            f"DFlash2 greedy mismatch at token {mismatch}: "
             f"spec={generated[mismatch]}, AR={ar_ids[mismatch]}"
         )
+    trace["ar_generated_ids"] = torch.tensor(ar_ids, dtype=torch.int32)
     accepted = [int(v) for k, v in trace.items() if k.endswith(".accepted_count")]
     rounds = len(accepted)
-    error = drafter.folded_logit_error(trace["round_0.markov.latents"])
     return trace, dict(
         greedy_match_rate=1.0,
         rounds_executed=rounds,
@@ -209,7 +209,6 @@ def mtp_fixture(path, device, model, case, steps, ar_ids=None):
         total_draft_tokens_accepted=sum(accepted),
         mean_tokens_per_round=(len(generated) - 1) / rounds,
         mean_draft_acceptance_rate=sum(accepted) / (rounds * (drafter.c.block_size - 1)),
-        folded_vs_unfolded_max_abs_logit_diff=error,
     )
 
 
@@ -225,7 +224,7 @@ def summarize_checks(checks):
 
 
 def write_fixture(directory, name, tensors):
-    # safetensors rejects overlapping storage (e.g. the final MTP tap and final_hidden).
+    # safetensors rejects overlapping storage (e.g. the final Draft tap and final_hidden).
     values = {k: v.cpu().contiguous().clone() for k, v in tensors.items()}
     path = directory / name
     save_file(values, path)
@@ -256,7 +255,7 @@ def generate(args, staging):
     if not cases:
         raise ValueError("Empty golden case manifest")
     operator_ids = cases[0]["input_ids"][:4]
-    mtp_case = next((c for c in cases if c["name"] == "short_math"), None)
+    draft_case = next((c for c in cases if c["name"] == "short_math"), None)
     if args.case:
         cases = [c for c in cases if c["name"] in args.case]
     device = (
@@ -298,17 +297,21 @@ def generate(args, staging):
                     text=tok.decode(ids, skip_special_tokens=False),
                 )
             )
-    mtp_check = None
-    if not args.skip_mtp:
-        if mtp_case is None:
-            raise ValueError("DSpark fixtures require the short_math case")
-        steps = mtp_case["decode_steps"] if args.steps is None else args.steps
-        print(f"Generating DSpark short_math ({steps} cached steps)", file=sys.stderr, flush=True)
+    draft_check = None
+    if not args.skip_draft:
+        if draft_case is None:
+            raise ValueError("DFlash2 fixtures require the short_math case")
+        steps = draft_case["decode_steps"] if args.steps is None else args.steps
+        print(f"Generating DFlash2 short_math ({steps} cached steps)", file=sys.stderr, flush=True)
         ar_ids = next((c["generated_ids"] for c in outputs if c["name"] == "short_math"), None)
-        tensors, mtp_check = mtp_fixture(path, device, model, mtp_case, steps, ar_ids)
-        files["mtp_golden.safetensors"] = write_fixture(staging, "mtp_golden.safetensors", tensors)
+        tensors, draft_check = draft_fixture(
+            args.draft_path, device, model, draft_case, steps, ar_ids
+        )
+        files["dflash2_golden.safetensors"] = write_fixture(
+            staging, "dflash2_golden.safetensors", tensors
+        )
     manifest = dict(
-        schema_version=1,
+        schema_version=2,
         created_at=datetime.now(UTC).isoformat(),
         weights_dir=str(path),
         checkpoint={
@@ -318,7 +321,7 @@ def generate(args, staging):
         cases_sha256=sha256(cases_path),
         generator_sha256={
             p: sha256(Path(__file__).with_name(p))
-            for p in ("_golden.py", "_inkling2_ref.py", "_dspark_ref.py")
+            for p in ("_golden.py", "_inkling2_ref.py", "_dflash2_ref.py")
         },
         transformers_reference="430050f6f71195b76004b5d61bbb446ec0508fb3",
         python=platform.python_version(),
@@ -340,28 +343,40 @@ def generate(args, staging):
         wall_seconds=time.monotonic() - start,
         out_dir=str(Path(args.out).resolve()),
     )
-    if mtp_check is not None:
-        manifest["checkpoint"]["model-mtp.safetensors"] = sha256(path / "model-mtp.safetensors")
-        manifest["mtp_verification"] = mtp_check
+    if draft_check is not None:
+        manifest["draft_weights_dir"] = str(args.draft_path)
+        for name in ("config.json", "model.safetensors"):
+            manifest["checkpoint"]["draft/" + name] = sha256(Path(args.draft_path) / name)
+        manifest["draft_verification"] = draft_check
     return manifest
 
 
 def preserve_skipped(manifest, previous, args):
+    if previous.get("schema_version") != manifest.get("schema_version"):
+        return
     for key in ("model.safetensors", "config.json"):
         if previous.get("checkpoint", {}).get(key) != manifest["checkpoint"][key]:
             return
     old_files = previous["files"]
-    for name, skip in (
-        ("ops_golden.safetensors", args.skip_ops),
-        ("mtp_golden.safetensors", args.skip_mtp),
+    if args.skip_ops and "ops_golden.safetensors" in old_files:
+        manifest["files"]["ops_golden.safetensors"] = old_files["ops_golden.safetensors"]
+    if (
+        args.skip_draft
+        and args.draft_path
+        and str(args.draft_path) == previous.get("draft_weights_dir")
+        and "draft_verification" in previous
+        and all(
+            (Path(args.draft_path) / name).is_file()
+            and sha256(Path(args.draft_path) / name) == previous["checkpoint"].get("draft/" + name)
+            for name in ("config.json", "model.safetensors")
+        )
     ):
-        if skip and name in old_files:
-            manifest["files"][name] = old_files[name]
-    if args.skip_mtp and "mtp_verification" in previous:
-        manifest["mtp_verification"] = previous["mtp_verification"]
-        manifest["checkpoint"]["model-mtp.safetensors"] = previous["checkpoint"][
-            "model-mtp.safetensors"
-        ]
+        name = "dflash2_golden.safetensors"
+        manifest["files"][name] = old_files[name]
+        manifest["draft_verification"] = previous["draft_verification"]
+        manifest["draft_weights_dir"] = previous["draft_weights_dir"]
+        for key in ("draft/model.safetensors", "draft/config.json"):
+            manifest["checkpoint"][key] = previous["checkpoint"][key]
     if args.skip_e2e or args.case:
         selected = {c["name"] for c in manifest["cases"]}
         retained = [c for c in previous["cases"] if c["name"] not in selected]
@@ -383,12 +398,13 @@ def main(argv=None):
     args = build_parser().parse_args(["golden", *(sys.argv[1:] if argv is None else argv)])
     if not args.path:
         raise ValueError("--path is required for the standalone generator")
+    args.skip_draft = args.skip_draft or not args.draft_path
     if args.out is None:
         cfg = load_config(allow_missing=True)
         base = Path(cfg.weights.golden_dir or cfg.repo_root / ".forge/golden")
         args.out = str(base / Path(args.path).name)
     out = Path(args.out)
-    if args.skip_ops and args.skip_e2e and args.skip_mtp:
+    if args.skip_ops and args.skip_e2e and args.skip_draft:
         raise ValueError("Select at least one fixture tier.")
     out.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=out) as tmp:
@@ -402,7 +418,7 @@ def main(argv=None):
             fresh = list(manifest["files"])
             destination = out / "manifest.json"
             if destination.exists() and (
-                args.skip_ops or args.skip_e2e or args.skip_mtp or args.case
+                args.skip_ops or args.skip_e2e or args.skip_draft or args.case
             ):
                 preserve_skipped(manifest, json.loads(destination.read_text()), args)
             staged_manifest = staging / "manifest.json"
@@ -410,6 +426,9 @@ def main(argv=None):
             try:
                 for name in fresh:
                     (staging / name).replace(out / name)
+                # GPU acceptance opens this fixture by filename.
+                if "dflash2_golden.safetensors" not in manifest["files"]:
+                    (out / "dflash2_golden.safetensors").unlink(missing_ok=True)
                 staged_manifest.replace(destination)
             except OSError:
                 destination.unlink(missing_ok=True)
@@ -420,8 +439,8 @@ def main(argv=None):
         k: manifest[k]
         for k in ("out_dir", "cases", "self_verification", "wall_seconds", "peak_vram_bytes")
     }
-    if "mtp_verification" in manifest:
-        summary["mtp_verification"] = manifest["mtp_verification"]
+    if "draft_verification" in manifest:
+        summary["draft_verification"] = manifest["draft_verification"]
     print(json.dumps(dict(**summary, files=[*manifest["files"], "manifest.json"]), allow_nan=False))
 
 

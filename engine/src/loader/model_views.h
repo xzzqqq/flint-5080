@@ -15,13 +15,12 @@ enum {
 };
 #define FLINT_EXL3_MUL1_MAGIC 0x83DCD12Du
 
-typedef struct MtpConfig {
+typedef struct DraftConfig {
   uint32_t hidden_size, num_hidden_layers, num_attention_heads, num_key_value_heads, head_dim;
-  uint32_t intermediate_size, max_position_embeddings, sliding_window_size, block_size, markov_rank;
+  uint32_t intermediate_size, sliding_window_size, block_size, selector_rank;
   float rms_norm_eps, rope_theta;
-  uint8_t is_local_layer[3];
   uint32_t target_layer_ids[4];
-} MtpConfig;
+} DraftConfig;
 
 typedef struct ModelConfig {
   uint32_t hidden_size, num_hidden_layers, vocab_size, unpadded_vocab_size;
@@ -34,8 +33,8 @@ typedef struct ModelConfig {
   uint32_t loop_core_start, loop_core_end, loop_num_passes, loop_gate_rank;
   uint32_t eos_token_id, pad_token_id;
   uint8_t is_full_layer[FLINT_NUM_PHYSICAL_LAYERS];
-  uint8_t has_mtp;
-  MtpConfig mtp;
+  uint8_t has_draft;
+  DraftConfig draft;
 } ModelConfig;
 
 typedef struct Exl3MatrixView {
@@ -70,17 +69,16 @@ typedef struct LayerWeightsView {
   ControllerWeightsView controllers[FLINT_NUM_CONTROLLERS];
 } LayerWeightsView;
 
-typedef struct MtpLayerWeightsView {
-  const void *dflare_norm, *input_layernorm, *post_attention_layernorm;
+typedef struct DraftLayerWeightsView {
+  const void *input_layernorm, *post_attention_layernorm;
   const void *q_proj, *k_proj, *v_proj, *o_proj, *q_norm, *k_norm;
-  const void *k_proj_ctx, *v_proj_ctx, *k_norm_ctx, *gate_proj, *up_proj, *down_proj;
-} MtpLayerWeightsView;
-typedef struct MtpWeightsView {
-  const void *fuse_weight, *mask_embed, *norm, *dflare_norm, *hidden_out, *hidden_bias;
-  const void *markov_w1, *rnn_proj, *rnn_bias;
-  const float* fuse_alpha;
-  MtpLayerWeightsView layers[3];
-} MtpWeightsView;
+  const void *attention_base, *attention_kernel, *mlp_base, *mlp_kernel, *gate_proj, *up_proj,
+      *down_proj;
+} DraftLayerWeightsView;
+typedef struct DraftWeightsView {
+  const void *fc, *hidden_norm, *norm, *projection, *predecessor, *successor;
+  DraftLayerWeightsView layers[5];
+} DraftWeightsView;
 
 typedef struct ModelWeightsView {
   ModelConfig config;
@@ -92,15 +90,15 @@ typedef struct ModelWeightsView {
   uint32_t mapped_tensor_count, verified_mul1_count;
   /* Device table [physical layer][gate_up, down][expert]. */
   const Exl3ExpertDesc* expert_table;
-  uint8_t has_mtp;
-  MtpWeightsView mtp;
+  uint8_t has_draft;
+  DraftWeightsView draft;
 } ModelWeightsView;
 
 typedef struct VisitPlanEntry {
   uint8_t visit_idx, physical_layer, pass_idx, is_full_attention;
   uint8_t is_block_boundary, has_messages, kv_slot_idx;
   uint8_t is_loop_pass_start, is_prologue_end;
-  int8_t mtp_tap_idx;
+  int8_t draft_tap_idx;
 } VisitPlanEntry;
 
 typedef struct KvStateArenaView {
@@ -111,9 +109,9 @@ typedef struct KvStateArenaView {
   uint32_t hidden_size;
   void *swa_kv, *full_kv;
   float *kv_conv_state, *sublayer_conv_state;
-  uint8_t has_mtp_kv;
-  uint32_t mtp_swa_window;
-  void *mtp_swa_kv, *mtp_full_kv;
+  uint8_t has_draft_kv;
+  uint32_t draft_swa_window;
+  void* draft_swa_kv;
 } KvStateArenaView;
 
 typedef struct ScratchArenaView {

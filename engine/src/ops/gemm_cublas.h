@@ -16,9 +16,6 @@ class Gemm {
   void Multiply(const void* a, const void* b, void* c, int m, int n, int k, FlintType operand_type,
                 FlintType output_type, bool transpose_b) const;
 
-  void LinearStrided(const float* x, const float* w, float* y, int m, int n, int k,
-                     int weight_stride, bool accumulate) const;
-
  private:
   cublasHandle_t handle_{};
   cudaStream_t stream_;

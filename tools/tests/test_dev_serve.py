@@ -51,6 +51,7 @@ def local(cfg, monkeypatch, capsys):
     cfg.remote.enabled = False
     cfg.gpu.lease_ttl_sec = 1
     cfg.model.weights_dir = "fixture"
+    cfg.model.draft_weights_dir = "draft"
     cfg.shared.models_dir = str(cfg.repo_root / "weights")
     monkeypatch.setattr(cli, "find_repo_root", lambda _: cfg.repo_root)
     monkeypatch.setattr(cli, "load_config", lambda **_: cfg)
@@ -107,6 +108,8 @@ def test_serve_lifecycle(local, monkeypatch):
     assert ready["key_set"] and ready["model"] == "mini"
     assert ready["model_dir"] == str(Path(cfg.shared.models_dir) / cfg.model.weights_dir)
     assert ready["argv"] == [
+        "--draft-dir",
+        str(Path(cfg.shared.models_dir) / "draft"),
         "--max-context",
         "512",
         "--prefill-chunk-size",

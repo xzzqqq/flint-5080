@@ -2,12 +2,13 @@
 #define FLINT_FORWARD_ABI_H
 
 #include "model/forward_types.h"
+#include "ops/draft_types.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#define FLINT_FORWARD_ABI_VERSION 5u
+#define FLINT_FORWARD_ABI_VERSION 6u
 
 typedef struct ForwardContext ForwardContext;
 
@@ -40,8 +41,9 @@ int32_t flint_forward_run_smoke(ForwardContext* context, const ForwardWorkspace*
                                 ForwardSmokeOutput* result);
 int32_t flint_forward_store_context(ForwardContext* c, const void* taps, uint32_t count,
                                     uint32_t pos);
-int32_t flint_forward_draft(ForwardContext* c, int32_t anchor, const void* tap, uint32_t pos,
-                            int32_t* h_ids);
+/* Host spec and result. Returns after all seven conditional proposal rows are ready. */
+int32_t flint_forward_draft(ForwardContext* c, const ForwardDraftSpec* spec,
+                            ForwardDraftResult* result);
 int32_t flint_forward_verify(ForwardContext* c, const ForwardRunSpec* spec,
                              const ForwardOptions* opts, ForwardRunResult* result);
 int32_t flint_forward_commit(ForwardContext* c, uint32_t pos, uint32_t len, uint32_t accepted);

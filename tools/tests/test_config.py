@@ -114,3 +114,13 @@ def test_resolve_golden_dir(cfg):
     assert cfg.resolve_golden_dir(PurePosixPath("mini")) == PurePosixPath(
         "/reference fixtures/mini"
     )
+
+
+def test_draft_directory(cfg):
+    cfg.shared.models_dir = "/weights"
+    assert cfg.resolve_draft_dir() is None
+    cfg.model.draft_weights_dir = "draft"
+    assert cfg.resolve_draft_dir() == PurePosixPath("/weights/draft")
+    assert cfg.resolve_draft_dir("/external") == PurePosixPath("/external")
+    assert cfg.resolve_draft_dir("override") == PurePosixPath("/weights/override")
+    assert cfg.resolve_draft_dir("") is None

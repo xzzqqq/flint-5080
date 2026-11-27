@@ -44,6 +44,7 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument(
         "--only", action="append", help="Run selected checks (repeat or comma-separate)."
     )
+    check.add_argument("--draft-dir")
     fmt = sub("fmt", "Format engine, Rust, and Python sources locally.")
     fmt.add_argument("--check", action="store_true", help="Report needed changes without writing.")
     fmt.add_argument("--fix", action="store_true", help="Also apply Ruff lint fixes.")
@@ -64,7 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
             "--json", action="store_true", default=argparse.SUPPRESS, help=json_help
         )
     for action in (start, restart):
-        for flag in ("bind", "model-dir", "model-name", "api-key", "binary"):
+        for flag in ("bind", "model-dir", "draft-dir", "model-name", "api-key", "binary"):
             action.add_argument("--" + flag)
         for flag in (
             "max-context",

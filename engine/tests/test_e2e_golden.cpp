@@ -170,7 +170,7 @@ bool Case(Runner& run, const ModelConfig& c, const KvStateArenaView& kv,
                   CaptureKind::PrefillHidden);
   int i = 0;
   for (int v : {5, 23, 41, 48})
-    ok &= Compare(file, "prefill.mtp_tap_" + std::to_string(v), cap.taps[i++], n,
+    ok &= Compare(file, "prefill.draft_tap_" + std::to_string(v), cap.taps[i++], n,
                   CaptureKind::PrefillHidden);
   ok &= Compare(file, "prefill.last_logits", logits, vocab, CaptureKind::Logits);
   if (name == "short_math") {
@@ -308,10 +308,10 @@ void Smoke(const std::string& path) {
                 p.has_messages == (v >= 18 && v < 42) && p.is_block_boundary == (layer % 6 == 0) &&
                 p.is_full_attention == (layer % 6 == 5) &&
                 p.is_loop_pass_start == (v == 18 || v == 30) && p.is_prologue_end == (v == 5) &&
-                p.mtp_tap_idx == (v == 5    ? 0
-                                  : v == 23 ? 1
-                                  : v == 41 ? 2
-                                            : -1) &&
+                p.draft_tap_idx == (v == 5    ? 0
+                                    : v == 23 ? 1
+                                    : v == 41 ? 2
+                                              : -1) &&
                 p.kv_slot_idx == (p.is_full_attention ? full++ : swa++),
             "visit plan");
   }

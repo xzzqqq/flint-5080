@@ -15,7 +15,7 @@ fn toml_cli_environment_and_engine_defaults() {
     let model = dir.path().join("mini");
     fs::create_dir(&model).unwrap();
     let file = dir.path().join("server.toml");
-    fs::write(&file,format!("model_dir = '{}'\napi_key='file'\nno_cuda_graph=true\nno_spec=true\nrequest_timeout_sec=0\nbind='localhost:1234'",model.display())).unwrap();
+    fs::write(&file,format!("model_dir = '{}'\ndraft_dir='draft'\napi_key='file'\nno_cuda_graph=true\nno_spec=true\nrequest_timeout_sec=0\nbind='localhost:1234'",model.display())).unwrap();
     let parse = |args: &[&str]| {
         Cli::parse_from(
             ["server", "--config", file.to_str().unwrap()]
@@ -32,7 +32,7 @@ fn toml_cli_environment_and_engine_defaults() {
     assert_eq!(config.request_timeout, None);
     assert_eq!(
         serde_json::from_str::<Value>(&config.engine_json()).unwrap(),
-        json!({"model_dir":model,"max_context":0,"prefix_cache_slots":3,"prefill_chunk_size":256,"use_cuda_graph":false,"use_speculative":false})
+        json!({"model_dir":model,"draft_model_dir":"draft","max_context":0,"prefix_cache_slots":3,"prefill_chunk_size":256,"use_cuda_graph":false,"use_speculative":false})
     );
     fs::write(
         model.join("generation_config.json"),
@@ -48,6 +48,8 @@ fn toml_cli_environment_and_engine_defaults() {
         Some("env")
     );
     let config = parse(&[
+        "--draft-dir",
+        "override",
         "--api-key",
         "cli",
         "--model-name",
@@ -60,6 +62,10 @@ fn toml_cli_environment_and_engine_defaults() {
     .resolve(Some("env".into()))
     .unwrap();
     assert_eq!(config.api_key.as_deref(), Some("cli"));
+    assert_eq!(
+        config.draft_dir.unwrap(),
+        std::path::PathBuf::from("override")
+    );
     assert_eq!(config.temperature, 0.7);
     assert_eq!(config.model_name, "alias");
     assert!(config.use_cuda_graph && config.use_speculative);

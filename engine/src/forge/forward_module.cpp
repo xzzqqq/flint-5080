@@ -46,8 +46,6 @@ ForwardModule::ForwardModule(const fs::path& path, const fs::path& load_dir,
     stats_ = reinterpret_cast<decltype(stats_)>(dlsym(handle_, "flint_forward_graph_stats"));
     store_context_ = Symbol<decltype(store_context_)>(handle_, "flint_forward_store_context");
     draft_ = Symbol<decltype(draft_)>(handle_, "flint_forward_draft");
-    set_draft_graph_ = reinterpret_cast<decltype(set_draft_graph_)>(
-        dlsym(handle_, "flint_forward_set_draft_graph"));
     verify_ = Symbol<decltype(verify_)>(handle_, "flint_forward_verify");
     commit_ = Symbol<decltype(commit_)>(handle_, "flint_forward_commit");
     auto create = Symbol<decltype(&flint_forward_create)>(handle_, "flint_forward_create");
@@ -84,9 +82,10 @@ ForwardRunResult ForwardModule::Run(const ForwardRunSpec& spec, const ForwardOpt
 void ForwardModule::StoreContext(const void* taps, uint32_t n, uint32_t pos) {
   CheckCuda(store_context_(context_, taps, n, pos), "store draft context");
 }
-void ForwardModule::Draft(int anchor, const void* taps, uint32_t pos, int* ids) {
-  if (set_draft_graph_) set_draft_graph_(speculative_options.use_cuda_graph);
-  CheckCuda(draft_(context_, anchor, taps, pos, ids), "draft block");
+ForwardDraftResult ForwardModule::Draft(const ForwardDraftSpec& spec) {
+  ForwardDraftResult result;
+  CheckCuda(draft_(context_, &spec, &result), "draft block");
+  return result;
 }
 ForwardRunResult ForwardModule::Verify(const ForwardRunSpec& spec, const ForwardOptions& o) {
   ForwardRunResult r{};

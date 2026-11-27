@@ -13,9 +13,9 @@
 #include "loader/scratch_workspace.h"
 #include "model/submodules.h"
 #include "model/visit_plan.h"
-#include "ops/dspark_ops.h"
 #include "ops/norm_ops.h"
 #include "ops/sconv_ops.h"
+#include "ops/spec_rollback.h"
 
 namespace flint {
 
@@ -125,7 +125,7 @@ InklingRunner::InklingRunner(const ModelWeightsView& w, const KvStateArenaView& 
   auto workspace = ws.Take<char>(bytes);
   c.d_next_token = ws.Take<int32_t>(1);
   c.d_decode_pos = ws.Take<int32_t>(1);
-  if (kv.has_mtp_kv) {
+  if (kv.has_draft_kv) {
     c.backup = ws.Take<uint16_t>(8 * 2 * model::kNumSwaVisits * model::kKvDim);
     c.kv_trace = ws.Take<float>(11 * 2 * model::kNumLogicalVisits * model::kKvDim);
     c.sub_trace = ws.Take<float>(11 * 2 * model::kNumLogicalVisits * model::kHiddenSize);
@@ -213,7 +213,7 @@ void InklingRunner::Impl::RunInkling(const ForwardRunSpec& s, const ForwardOptio
       copy(block(0), block(5), plane);
       count = 1;
     }
-    if (visit.mtp_tap_idx >= 0) tap(visit.mtp_tap_idx);
+    if (visit.draft_tap_idx >= 0) tap(visit.draft_tap_idx);
     int nq = visit.is_full_attention ? 3 : 1;
     if (visit.physical_layer) aggregate(carry, count, hidden, FLINT_BF16, l.attn_query, nq, attn);
     if (visit.has_messages) {

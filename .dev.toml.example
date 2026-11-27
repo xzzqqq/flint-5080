@@ -43,6 +43,7 @@ use_ccache = true
 lease_ttl_sec = 600
 
 [model]
+draft_weights_dir = ""
 # Model safetensors directory (absolute path on 5080 or relative to shared.models_dir).
 weights_dir = ""
 

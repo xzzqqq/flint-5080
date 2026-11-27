@@ -17,7 +17,7 @@ specific cases from the selected suites. Use `--tag NAME` to name an archived ru
 | Suite | Request schedule | Readout |
 | --- | --- | --- |
 | short | Serial short chat, medium debugging, long code review. Nominal input sizes ~40/256/1024 tokens, maximum 64 output tokens. | Short-context steady C1 decode and SOL |
-| agent | Four frozen SWE-bench Verified coding-agent snapshots spanning Q1–Q4 context lengths (8.5K / 15.1K / 22.4K / 47.1K tokens) across edit, explore and debug stages. `reasoning_effort: "max"`, maximum 8,192 output tokens, natural EOS. | Realistic long-context C1 decode under Full-Attention KV load and DSpark acceptance |
+| agent | Four frozen SWE-bench Verified coding-agent snapshots spanning Q1–Q4 context lengths (8.5K / 15.1K / 22.4K / 47.1K tokens) across edit, explore and debug stages. `reasoning_effort: "max"`, maximum 8,192 output tokens, natural EOS. | Realistic long-context C1 decode under Full-Attention KV load and DFlash 2 acceptance |
 | canary | One greedy pass over arithmetic, code, single/multiple tool calls, stop strings and bilingual UTF-8. The parity case also sends one non-streaming request. | All assertions pass, including exact reconstructed content, reasoning and tool-call payloads for parity, excluding request-specific IDs |
 
 Inputs and checks live in `workloads/{bench,canary}_cases.json`. All cases use
@@ -91,13 +91,19 @@ unmatched conditions is diagnostic.
   run exit code and a case-level diagnostic.
 - Report speculative decoding in `server_decode_tok_s`, `ms/round`
   (`server_tpot_ms`), `tokens/round`, `spec_accepted`, and context-matched
-  DSpark round SOL (`100 × dspark_round_floor_ms / server_tpot_ms`, accounting
+  DFlash 2 round SOL (`100 × draft_round_floor_ms / server_tpot_ms`, accounting
   for draft + verify unique-expert weight and KV traffic at 960 GB/s; see
-  `docs/model.md`). AR (`--no-spec`) context-matched SOL (`3.550 ms`
+  `docs/model.md`). AR (`--no-spec`) context-matched SOL (`3.487 ms`
   short-context weight floor) may be recorded alongside as a diagnostic
   reference.
+- Freeze the greedy DFlash 2 baseline with one warmup and three cold-nonce requests
+  per case. Record accepted drafts/round as well as emitted tokens/round. A separate
+  temperature-1.0 streaming smoke uses the short prompts, seed 5080, and the
+  server telemetry header. Seed 0 asks the engine to choose a fresh seed. Keep these single-request samples outside greedy medians.
+  The verified 5080 baseline uses 31,508 tokens of context and three prefix slots.
+  [Baseline measurements and run IDs](findings/2026-11-27-dflash2-pivot-baseline.md)
 - Optimization and regression thresholds: target at least **70% of
-  context-matched DSpark round SOL** to maximize end-to-end
+  context-matched DFlash 2 round SOL** to maximize end-to-end
   `server_decode_tok_s`. Use a 5% regression review threshold on `short` and
   `agent` decode latency/throughput against the active frozen baseline
   (clean-restart repeatability over `remote_loopback` is verified below 0.1%).

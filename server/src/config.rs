@@ -15,6 +15,8 @@ pub struct Options {
     #[arg(long)]
     pub model_dir: Option<PathBuf>,
     #[arg(long)]
+    pub draft_dir: Option<PathBuf>,
+    #[arg(long)]
     pub model_name: Option<String>,
     #[arg(long)]
     pub api_key: Option<String>,
@@ -39,6 +41,7 @@ pub struct Options {
 pub struct Config {
     pub bind: String,
     pub model_dir: PathBuf,
+    pub draft_dir: Option<PathBuf>,
     pub model_name: String,
     pub api_key: Option<String>,
     pub max_context: u32,
@@ -97,6 +100,7 @@ impl Options {
                 .or(file.bind)
                 .unwrap_or_else(|| "127.0.0.1:8080".into()),
             model_dir,
+            draft_dir: self.draft_dir.or(file.draft_dir),
             model_name,
             temperature,
             api_key: self.api_key.or(env_api_key).or(file.api_key),
@@ -126,7 +130,7 @@ impl Options {
 
 impl Config {
     pub fn engine_json(&self) -> String {
-        json!({"model_dir": self.model_dir, "max_context": self.max_context,
+        json!({"model_dir": self.model_dir, "draft_model_dir": self.draft_dir.as_deref().unwrap_or(std::path::Path::new("")), "max_context": self.max_context,
             "prefill_chunk_size": self.prefill_chunk_size, "prefix_cache_slots": self.prefix_cache_slots,
             "use_speculative": self.use_speculative, "use_cuda_graph": self.use_cuda_graph}).to_string()
     }

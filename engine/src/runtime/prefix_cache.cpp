@@ -15,16 +15,15 @@ PrefixCache::PrefixCache(uint32_t slots, size_t vocab_size) : slots_(slots) {
   for (auto& slot : slots_) slot.last_logits.resize(vocab_size);
 }
 PrefixCache::PrefixCache(uint32_t slots, const ModelConfig& config, uint32_t max_context,
-                         bool with_mtp)
+                         bool with_draft)
     : PrefixCache(slots, config.unpadded_vocab_size) {
   if (!enabled()) return;
   live_tokens_.reserve(max_context);
   last_prompt_.reserve(max_context);
   for (auto& slot : slots_) {
     slot.tokens.reserve(max_context);
-    if (with_mtp) slot.last_tap.resize(4 * config.hidden_size);
   }
-  sizes_ = ComputeKvArenaSizes(config, with_mtp);
+  sizes_ = ComputeKvArenaSizes(config, with_draft);
   if (slots > std::numeric_limits<size_t>::max() / sizes_.Fixed())
     throw std::length_error("prefix cache size overflow");
   snapshots_ = AllocateDeviceBuffer(slots * sizes_.Fixed());
@@ -46,7 +45,7 @@ PrefixPlan PrefixCache::Match(std::span<const int32_t> prompt) {
     best_lcp = std::max(best_lcp, lcp);
     if (lcp != slot.tokens.size() || lcp <= plan.matched_tokens) continue;
     bool exact = lcp == prompt.size();
-    if (exact && (!slot.has_logits || (!slot.last_tap.empty() && !slot.has_tap))) continue;
+    if (exact && !slot.has_logits) continue;
     plan.matched_tokens = lcp;
     plan.restore_slot = exact && live_lcp == lcp && live_tokens_.size() == lcp ? -1 : int(i);
     plan.use_cached_logits = exact;
@@ -79,8 +78,7 @@ void PrefixCache::Restore(int index, const KvStateArenaView& kv, cudaStream_t st
 }
 
 void PrefixCache::Save(std::span<const int32_t> tokens, const KvStateArenaView& kv,
-                       std::span<const float> last_logits, cudaStream_t stream,
-                       std::span<const uint16_t> last_tap) {
+                       std::span<const float> last_logits, cudaStream_t stream) {
   if (!enabled()) return;
   auto it = std::find_if(slots_.begin(), slots_.end(), [&](const Slot& s) {
     return s.valid && std::ranges::equal(s.tokens, tokens);
@@ -89,8 +87,6 @@ void PrefixCache::Save(std::span<const int32_t> tokens, const KvStateArenaView& 
     it = std::min_element(slots_.begin(), slots_.end(), [](const Slot& a, const Slot& b) {
       return a.valid != b.valid ? !a.valid : a.lru_tick < b.lru_tick;
     });
-  if (!last_tap.empty() && last_tap.size() != it->last_tap.size())
-    throw std::invalid_argument("invalid prefix tap size");
   if (!last_logits.empty() && it->last_logits.size() != last_logits.size())
     throw std::invalid_argument("invalid prefix logits size");
   if (snapshots_) {
@@ -98,8 +94,6 @@ void PrefixCache::Save(std::span<const int32_t> tokens, const KvStateArenaView& 
     CopyFixedKvToSnapshot(dst, kv, sizes_, stream);
   }
   it->tokens.assign(tokens.begin(), tokens.end());
-  it->has_tap = !last_tap.empty();
-  std::ranges::copy(last_tap, it->last_tap.begin());
   it->has_logits = !last_logits.empty();
   std::ranges::copy(last_logits, it->last_logits.begin());
   it->lru_tick = ++tick_;

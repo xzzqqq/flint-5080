@@ -37,10 +37,4 @@ void Gemm::Multiply(const void* a, const void* b, void* c, int m, int n, int k, 
                      b, Type(operand), transpose_b ? k : n, a, Type(operand), k, &zero, c,
                      Type(output), n, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
 }
-void Gemm::LinearStrided(const float* x, const float* w, float* y, int m, int n, int k,
-                         int weight_stride, bool accumulate) const {
-  float one = 1, beta = accumulate ? 1.f : 0.f;
-  Check(cublasSgemm(handle_, CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, &one, w, weight_stride, x, k, &beta,
-                    y, n));
-}
 }  // namespace flint

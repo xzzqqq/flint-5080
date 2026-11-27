@@ -50,6 +50,7 @@ class GpuConfig:
 
 @dataclass
 class ModelConfig:
+    draft_weights_dir: str = ""
     weights_dir: str = ""
 
 
@@ -116,6 +117,10 @@ class DevConfig:
         if self.model.weights_dir:
             return PurePosixPath(self.shared.models_dir) / self.model.weights_dir
         raise ConfigError(error_message or "Set model.weights_dir in .dev.toml or pass --path.")
+
+    def resolve_draft_dir(self, override: str | Path | None = None) -> PurePosixPath | None:
+        value = self.model.draft_weights_dir if override is None else override
+        return PurePosixPath(self.shared.models_dir) / value if value else None
 
     def resolve_golden_dir(self, model_dir: str | PurePosixPath) -> PurePosixPath:
         return (

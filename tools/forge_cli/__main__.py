@@ -79,6 +79,7 @@ def build_parser():
         if name == "start":
             p.add_argument("--reset-baseline", action="store_true")
             model = p.add_mutually_exclusive_group()
+            p.add_argument("--draft-dir")
             model.add_argument("--path")
             model.add_argument("--no-model", action="store_true")
             p.add_argument("--kv-seq-len", type=positive)

@@ -291,7 +291,7 @@ def _check_local(cfg, checks, selected):
     checks["hygiene"] = {"status": "failed" if errors else "passed", "errors": errors}
 
 
-def _gpu_check_commands(model_dir, golden_dir):
+def _gpu_check_commands(model_dir, golden_dir, draft_dir=None):
     def require(flag, path, message):
         test = shlex.join(["test", flag, str(path)])
         return f"{test} || {{ echo {shlex.quote(message)} >&2; exit 1; }}"
@@ -310,8 +310,15 @@ def _gpu_check_commands(model_dir, golden_dir):
     e2e = "engine/build/e2e_tests"
     forward = "engine/build/forward.so"
     runtime = "engine/build/runtime_tests"
-    model_config = json.dumps({"model_dir": str(model_dir), "max_context": 2048})
-    return {
+    draft_args = ["--draft-dir", str(draft_dir)] if draft_dir else []
+    model_config = json.dumps(
+        {
+            "model_dir": str(model_dir),
+            "max_context": 2048,
+            **({"draft_model_dir": str(draft_dir)} if draft_dir else {}),
+        }
+    )
+    checks = {
         "ctest": [
             build("-f", "engine/build/CTestTestfile.cmake"),
             "ctest --test-dir engine/build --output-on-failure --no-tests=error",
@@ -347,13 +354,24 @@ def _gpu_check_commands(model_dir, golden_dir):
             build("-x", runtime),
             model,
             golden("-d", golden_dir),
-            shlex.join([runtime, "--model-dir", str(model_dir), "--golden-dir", str(golden_dir)]),
+            shlex.join(
+                [
+                    runtime,
+                    "--model-dir",
+                    str(model_dir),
+                    "--golden-dir",
+                    str(golden_dir),
+                    *draft_args,
+                ]
+            ),
         ],
-        "mtp-golden": [
-            build("-x", "engine/build/mtp_tests"),
+        "dflash2-golden": [
+            build("-x", "engine/build/dflash2_tests"),
             model,
-            golden("-f", golden_dir / "mtp_golden.safetensors"),
-            shlex.join(["engine/build/mtp_tests", str(model_dir), str(golden_dir)]),
+            golden("-f", golden_dir / "dflash2_golden.safetensors"),
+            shlex.join(
+                ["engine/build/dflash2_tests", str(model_dir), str(draft_dir), str(golden_dir)]
+            ),
         ],
         "forge-host": [
             build("-x", "engine/build/forge-host"),
@@ -374,6 +392,7 @@ def _gpu_check_commands(model_dir, golden_dir):
                     "--check-chat-golden",
                     "--model-dir",
                     str(model_dir),
+                    *draft_args,
                     "--golden",
                     "workloads/chat_golden.json",
                     "--golden-cases",
@@ -382,6 +401,10 @@ def _gpu_check_commands(model_dir, golden_dir):
             ),
         ],
     }
+
+    if not draft_dir:
+        del checks["dflash2-golden"]
+    return checks
 
 
 def _select_checks(requested, valid, *, gpu=False):
@@ -409,7 +432,9 @@ def check(cfg, args, result):
         _check_local(cfg, checks, selected)
     else:
         model_dir = cfg.resolve_model_dir() if cfg.model.weights_dir else Path(".")
-        commands = _gpu_check_commands(model_dir, cfg.resolve_golden_dir(model_dir))
+        commands = _gpu_check_commands(
+            model_dir, cfg.resolve_golden_dir(model_dir), cfg.resolve_draft_dir(args.draft_dir)
+        )
         selected = _select_checks(requested, commands, gpu=True)
         if not cfg.model.weights_dir and any(name.split(":")[0] != "ctest" for name in selected):
             raise ConfigError("Set model.weights_dir in .dev.toml for GPU acceptance checks")
@@ -446,6 +471,8 @@ def serve(cfg, args, result):
         )
         bind = args.bind or cfg.server.bind
         argv = ["--bind", bind, "--model-dir", str(model_dir)]
+        if draft := cfg.resolve_draft_dir(args.draft_dir):
+            argv.extend(["--draft-dir", str(draft)])
         for key in (
             "model_name",
             "max_context",

@@ -1,7 +1,7 @@
 # Flint-5080 系统架构
 
 > **目标硬件**：单卡 Linux RTX 5080 16 GiB（Blackwell `sm_120a`），配合 Mac Laptop 远程开发  
-> **目标场景**：面向 **Inkling 2 mini**（含 `dspark` 投机解码）的个人本地 chat 与 coding-agent 推理服务，C1 极致低延迟优先、兼顾 C2，并发不设硬上限。  
+> **目标场景**：面向 **Inkling 2 mini**（含 DFlash 2 投机解码）的个人本地 chat 与 coding-agent 推理服务，C1 极致低延迟优先、兼顾 C2，并发不设硬上限。
 > **延伸文档**：模型拓扑、算子语义与显存/Roofline 账本见 [model.md](model.md)，压测协议与门禁见 [benchmark.md](benchmark.md)，优化追踪与实测证据见 [findings/](findings/README.md)，工程红线见 [AGENTS.md](../AGENTS.md)。
 
 ---
@@ -19,8 +19,8 @@
 
 **现有能力**
 - **推理引擎与显存管理**：以标准 `safetensors` 只读 `mmap` 一次载入并静态划分显存 Arena，支持 chunked prefill、请求取消与静态 CUDA Graph。
-- **DSpark 投机解码**：默认加载 MTP 权重执行多 token 草拟与批验证，支持精确状态回滚与贪心/无偏随机拒绝采样，`--no-spec` 可切换回 AR。
-- **VRAM Prefix Cache**：在显存内复用多轮对话前缀（含滑窗 KV、卷积状态、末位 logits 与 tap），精确命中可零 prefill 直接进入解码。
+- **DFlash 2 投机解码**：通过 `--draft-dir` 加载独立 BF16 草拟器。四路目标 tap 生成各层的上下文 KV；一个 CUDA Graph 同时支持贪心和随机路径，每轮返回 7 个草拟 token 及各自的 16 个条件候选和概率（共 924 B）。目标模型批量验证，并按接受长度提交或恢复滑窗与卷积状态。随机模式在拒绝处从归一化的 `max(p−q, 0)` 采样；`--no-spec` 切换到 AR。
+- **VRAM Prefix Cache**：在显存内复用多轮对话前缀（含目标与草拟器的滑窗 KV、目标卷积状态及末位 logits），精确命中可零 prefill 直接进入解码。
 - **OpenAI 兼容服务壳**：提供 Chat Completions（SSE / 非流式 / stop 字符串 / 超时取消）、离线 HF 黄金对齐的 Tokenizer 与 Jinja 模板、独立 Reasoning/Tool-Call 流式解析器及免鉴权 `/health`、`/ready`、`/metrics`（Prometheus）。
 - **调优工作台与精度守门**：通过 `forge` 实现常驻权重 + 整图 `forward.so` 热重载、A/B 交错与分阶段剖析，配合 `weights golden`/`kld` 和 `bench` 完成数值与性能闭环验收。
 
@@ -50,7 +50,7 @@
                  ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │  完整推理引擎（engine/ — 纯 C++/CUDA，sm_120a，不依赖 Rust 编译）          │
-│  静态显存分区、VRAM Prefix Cache、调度、AR/DSpark 前向与 sm_120a 算子     │
+│  静态显存分区、VRAM Prefix Cache、调度、AR/DFlash 2 前向与 sm_120a 算子     │
 │  双运行形态：libengine.a（生产） / forge-host + forward.so（调优）         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -72,12 +72,12 @@
 
 ## 4. 调优工作台与数值守门（`forge` + `weights`）
 
-- **整图 `forward.so` 秒级热重载**：放弃固定算子槽位插件 ABI，将完整前向编排、CUDA Graph、DSpark 与全部算子统一链接为单一 `forward.so`（Forge ABI 见 [forward_abi.h](../engine/src/forge/forward_abi.h)），使跨算子融合、跨层重排、KV 编码改动或双流重叠均可无条件热加载。借助单架构 `sm_120a`、关闭 `-rdc`、动态链接 CUDA 运行时与头文件隔离的 `ops/*.cu`，单算子改动可秒级增量重编并进程内热替换。
+- **整图 `forward.so` 秒级热重载**：放弃固定算子槽位插件 ABI，将完整前向编排、CUDA Graph、DFlash 2 与全部算子统一链接为单一 `forward.so`（Forge ABI 见 [forward_abi.h](../engine/src/forge/forward_abi.h)），使跨算子融合、跨层重排、KV 编码改动或双流重叠均可无条件热加载。借助单架构 `sm_120a`、关闭 `-rdc`、动态链接 CUDA 运行时与头文件隔离的 `ops/*.cu`，单算子改动可秒级增量重编并进程内热替换。
 - **区间懒录制与安全对照**：前向接受逻辑层区间 `(begin, end)`，首次局部回放时宿主自动用冻结的 `baseline.so` 截获真实上下文与状态快照并缓存，零注册宏；每次 `dlopen`/`dlclose` 前后比对显存防止泄漏；内置 `--no-graph`、`--no-spec` 与 `return_logits` 零开销对照开关。
-- 宿主重启保留基线。`forge freeze-baseline [candidate]` 原子替换基线并清空回放缓存，`forge start --reset-baseline` 在启动时重新冻结当前构建。`--context-len N` 将用例循环填充至 N 个 token，分块预填充。重复测量复用显存中的 Full KV，仅恢复当前步可写的状态。
+- Forge 在分配双模型权重和 scratch 后，按剩余显存扣除 I/O 和 512 MiB 预留量，再确定 KV 容量；可用 `--kv-seq-len` 显式指定。宿主重启保留基线。`forge freeze-baseline [candidate]` 原子替换基线并清空回放缓存，`forge start --reset-baseline` 在启动时重新冻结当前构建。`--context-len N` 将用例循环填充至 N 个 token，分块预填充。重复测量复用显存中的 Full KV，仅恢复当前步可写的状态。
 - **三层闭环验证**：
-  - `forge`（`start/stop/status`、`run`、`ab`、`profile`、`dump`、`ls/rm`）驱动延迟/SOL 测量与交错 A/B；`profile --step 1` 输出 Verify 各阶段耗时，`profile --nsys` 在执行机汇总 kernel 和 CUDA API，`profile --compare` 在本地比较两份归档。
-  - `weights golden`（`ops`/`e2e`/`mtp`/`chat` 四级夹具）锁死语义对齐，`weights kld` 经由常驻 `forge-host`（空闲时自动持锁拉起并回收）以 FP64 计算 teacher-forced KLD，记录两份二进制文件的 SHA-256，摘要相同时提示警告；
+  - `forge`（`start/stop/status`、`run`、`ab`、`profile`、`dump`、`ls/rm`）驱动延迟/SOL 测量与交错 A/B；投机 `run` 同时记录草拟、验证和提交耗时的中位数；`profile --step 1` 输出 Verify 各阶段耗时，`profile --nsys` 在执行机汇总 kernel 和 CUDA API，`profile --compare` 在本地比较两份归档。
+  - `weights golden`（`ops`/`e2e`/`dflash2`/`chat` 四级夹具）锁死语义对齐，`weights kld` 经由常驻 `forge-host`（空闲时自动持锁拉起并回收）以 FP64 计算 teacher-forced KLD，记录两份二进制文件的 SHA-256，摘要相同时提示警告；
   - `bench` 以黑盒 HTTP 压测与配对统计执行端到端验收。
 
 ---

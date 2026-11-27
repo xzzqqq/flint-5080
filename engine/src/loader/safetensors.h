@@ -47,6 +47,7 @@ class SafetensorsFile {
   std::map<std::string, std::string> metadata_;
 };
 
+DraftConfig LoadDraftConfig(const std::filesystem::path& path);
 ModelConfig LoadModelConfig(const std::filesystem::path& path);
 }  // namespace flint
 #endif

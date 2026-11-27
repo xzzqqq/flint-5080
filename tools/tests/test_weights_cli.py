@@ -77,10 +77,8 @@ def checkpoint(tmp_path):
         ("model.llm.unembed.weight", "BF16", [32, 16]),
     ]
     write_weights(root / "model.safetensors", rows)
-    write_weights(
-        root / "model-mtp.safetensors", [("layers.0.self_attn.q_proj.weight", "BF16", [4])]
-    )
     write_weights(root / "model-vision.safetensors", [("model.visual.proj_in.weight", "BF16", [8])])
+    (root / "model-mtp.safetensors").write_bytes(b"unused legacy file")
     (root / "quantization_config.json").write_text(json.dumps({"bits": bits}))
     return root
 
@@ -89,6 +87,7 @@ def test_inspect_headers_and_files(checkpoint):
     data = _inspect.inspect_directory(checkpoint, include_tensors=True)
     assert data["weights_dir"] == str(checkpoint)
     paths = [f["path"] for f in data["files"]]
+    assert "model-mtp.safetensors" not in paths
     assert paths == sorted(paths) and "tiktoken/tokenizer.model" in paths
     assert data["total_dir_bytes"] == sum((checkpoint / p).stat().st_size for p in paths)
     assert data["sha256sums_present"] and data["sha256sums_entry_count"] == 1
@@ -98,7 +97,7 @@ def test_inspect_headers_and_files(checkpoint):
     assert h["dtypes"]["I16"] == {"count": 4, "bytes": 416}
     assert h["dtypes"]["I32"] == {"count": 4, "bytes": 16}
     assert h["file_size_bytes"] == 8 + h["header_bytes"] + h["total_tensor_bytes"]
-    assert len(data["tensors"]) == 28
+    assert len(data["tensors"]) == 27
     config = data["configs"]
     assert config["config"]["text_config"]["hidden_size"] == 16
     assert config["processor_config"] == config["special_tokens_map"] == {"example": 42}
@@ -148,11 +147,9 @@ def test_exl3_inventory(checkpoint):
         "moe_experts": 688,
         "norms": 64,
         "loop_or_other": 64,
-        "mtp_dspark": 8,
         "vision": 16,
     }
     assert comps["moe_experts"]["quantized"] == {"count": 16, "bytes": 688}
-    assert comps["mtp_dspark"]["unquantized"] == {"count": 1, "bytes": 8}
     assert exl3["loop_or_other_patterns"] == {
         "model.llm.layers.{i}.controllers.attn.down_weight": {"count": 2, "bytes": 64}
     }
@@ -186,7 +183,7 @@ def test_exl3_inventory(checkpoint):
         bytes_per_tensor=[96, 112],
         sample_name="0.experts.down_proj.0.trellis",
     )
-    assert sum(g["count"] for g in data["groups"]) == 28
+    assert sum(g["count"] for g in data["groups"]) == 27
     assert sum(g["total_bytes"] for g in data["groups"]) == sum(c["bytes"] for c in comps.values())
     q = data["configs"]["quantization_summary"]
     assert q["top_level_fields"] == ["bits"] and q["methods"] == ["exl3"]
@@ -206,8 +203,26 @@ def test_path_resolution(cfg, checkpoint, mode):
         override = str(checkpoint)
     cfg.remote.enabled = mode == "local"
     result = RunResult("weights inspect", True, {})
-    commands.inspect(cfg, Namespace(path=override, local=mode == "local", tensors=False), result)
+    commands.inspect(
+        cfg, Namespace(path=override, draft_path=None, local=mode == "local", tensors=False), result
+    )
     assert result.data["weights_dir"] == str(checkpoint)
+
+
+def test_separate_draft_inventory(cfg, checkpoint, tmp_path):
+    draft = tmp_path / "draft"
+    draft.mkdir()
+    write_weights(
+        draft / "model.safetensors",
+        [("candidate_selector.hidden_projection.weight", "BF16", [4, 8])],
+    )
+    args = Namespace(path=checkpoint, draft_path="draft", local=True, tensors=True)
+    cfg.shared.models_dir = str(tmp_path)
+    result = RunResult("weights inspect", True, {})
+    commands.inspect(cfg, args, result)
+    assert result.data["draft"]["safetensors"][0]["tensor_count"] == 1
+    assert result.data["draft"]["weights_dir"] == str(draft)
+    assert "Draft checkpoint" in commands.human_format(result)
 
 
 def test_missing_weights_directory(cfg):
@@ -218,7 +233,7 @@ def test_missing_weights_directory(cfg):
 def test_remote(cfg, checkpoint):
     cfg.remote.enabled = True
     result = RunResult("weights inspect", True, {})
-    args = Namespace(path=str(checkpoint), local=False, tensors=True)
+    args = Namespace(path=str(checkpoint), draft_path=None, local=False, tensors=True)
     with patch.object(commands, "Executor") as executor:
 
         def remote(command, *, cwd, check):
@@ -252,7 +267,6 @@ def test_human_and_error(repo, checkpoint, capsys, monkeypatch):
     for expected in (
         "Files",
         "Safetensors payloads",
-        "model-mtp.safetensors",
         "moe_experts",
         "mul1",
     ):

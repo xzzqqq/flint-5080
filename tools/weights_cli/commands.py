@@ -19,15 +19,20 @@ from . import _inspect
 
 def inspect(cfg, args, result):
     path = cfg.resolve_model_dir(args.path)
-    if args.local or not cfg.is_remote:
-        result.data.update(_inspect.inspect_directory(path, include_tensors=args.tensors))
-    else:
+
+    def inventory(path):
+        if args.local or not cfg.is_remote:
+            return _inspect.inspect_directory(path, include_tensors=args.tensors)
         source = Path(_inspect.__file__).read_text(encoding="utf-8")
         command = ["python3", "-c", source, str(path)]
         if args.tensors:
             command.append("--tensors")
         response = Executor(cfg).run(shlex.join(command), cwd=".", check=True)
-        result.data.update(json.loads(response.stdout))
+        return json.loads(response.stdout)
+
+    result.data.update(inventory(path))
+    if draft := cfg.resolve_draft_dir(args.draft_path):
+        result.data["draft"] = inventory(draft)
 
 
 def golden(cfg, args, result):
@@ -36,7 +41,8 @@ def golden(cfg, args, result):
     path = cfg.resolve_model_dir(args.path)
     if args.steps is not None and args.steps < 1:
         raise ValueError("--steps must be positive")
-    if args.skip_e2e and args.skip_ops and args.skip_mtp:
+    draft = cfg.resolve_draft_dir(args.draft_path)
+    if args.skip_e2e and args.skip_ops and (args.skip_draft or not draft):
         raise ValueError("Select at least one fixture tier.")
     out = args.out or str(cfg.resolve_golden_dir(path))
     python = args.python or cfg.weights.python or ("python3" if cfg.is_remote else sys.executable)
@@ -53,6 +59,8 @@ def golden(cfg, args, result):
         "--cases",
         args.cases,
     ]
+    if draft:
+        command.extend(["--draft-path", str(draft)])
     for case in args.case:
         command.extend(["--case", case])
     if args.steps is not None:
@@ -61,8 +69,8 @@ def golden(cfg, args, result):
         command.append("--skip-ops")
     if args.skip_e2e:
         command.append("--skip-e2e")
-    if args.skip_mtp:
-        command.append("--skip-mtp")
+    if args.skip_draft:
+        command.append("--skip-draft")
     executor = Executor(cfg)
     if cfg.is_remote:
         executor.sync()
@@ -131,6 +139,7 @@ def kld(cfg, args, result):
         start_args = Namespace(
             path=str(path),
             no_model=False,
+            draft_dir="",
             reset_baseline=False,
             no_build=args.no_build,
             kv_seq_len=max(len(case["token_ids"]) for case in cases),
@@ -190,6 +199,12 @@ def human_format(result):
         f"  {h['file']}  {h['tensor_count']:,} tensors  {h['total_tensor_bytes']:,} bytes"
         for h in data["safetensors"]
     )
+    if draft := data.get("draft"):
+        lines.append(f"Draft checkpoint {draft['weights_dir']}")
+        lines.extend(
+            f"  {h['file']}  {h['tensor_count']:,} tensors  {h['total_tensor_bytes']:,} bytes"
+            for h in draft["safetensors"]
+        )
     lines.append("Components")
     for name, values in data["exl3"]["component_breakdown"].items():
         lines.append(f"  {name:<16} {values['count']:>6,} tensors  {values['bytes']:>16,} bytes")

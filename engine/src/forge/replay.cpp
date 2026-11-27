@@ -14,6 +14,7 @@
 #include "forge/safetensors_writer.h"
 #include "loader/kv_layout.h"
 #include "loader/safetensors.h"
+#include "runtime/config.h"
 #include "runtime/sampler.h"
 
 namespace flint {
@@ -56,7 +57,7 @@ Replay::Replay(DaemonConfig cfg) : config_(std::move(cfg)) {
   model_config_ = model::MakeDefaultInklingConfig();
   if (!config_.model_dir.empty()) {
     auto start = std::chrono::steady_clock::now();
-    weights_.emplace(WeightsArena::Load(config_.model_dir, nullptr, true));
+    weights_.emplace(WeightsArena::Load(config_.model_dir, nullptr, config_.draft_dir));
     weights_load_ms_ =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     model_config_ = weights_->view().config;
@@ -64,17 +65,28 @@ Replay::Replay(DaemonConfig cfg) : config_(std::move(cfg)) {
   plan_ = BuildVisitPlan(model_config_);
   width_ = model_config_.hidden_size;
   vocab_ = model_config_.unpadded_vocab_size;
-  bool draft = weights_ && weights_->view().has_mtp;
-  kv_.emplace(KvStateArena::Allocate(model_config_, config_.kv_seq_len, draft));
+  bool draft = weights_ && weights_->view().has_draft;
   scratch_.emplace(ScratchArena::Allocate(size_t(config_.scratch_mb) << 20));
-  capacity_ = std::min<size_t>({config_.kv_seq_len, model::kSlidingWindow,
-                                scratch_->view().bytes / (width_ * sizeof(float))});
+  auto chunk =
+      std::min<size_t>(model::kSlidingWindow, scratch_->view().bytes / (width_ * sizeof(float)));
+  auto io_bytes = [&](size_t rows) {
+    return (2 + model::kCarryPlanes + (draft ? 4 : 0)) * rows * width_ * sizeof(uint16_t) +
+           kLogitRows * vocab_ * sizeof(float) + (rows + kLogitRows) * sizeof(int);
+  };
+  if (!config_.kv_seq_len) {
+    const size_t free = FreeBytes();
+    const size_t overhead = io_bytes(chunk) + RuntimeConfig{}.vram_reserve_bytes;
+    config_.kv_seq_len =
+        KvStateArena::MaxFullSeqLenForBudget(model_config_, free - std::min(free, overhead), draft);
+    if (!config_.kv_seq_len)
+      throw std::runtime_error(
+          "insufficient VRAM for Forge KV after weights, scratch and workspace reserve");
+  }
+  capacity_ = std::min<size_t>(chunk, config_.kv_seq_len);
   if (!capacity_) throw std::runtime_error("scratch too small for one token");
+  kv_.emplace(KvStateArena::Allocate(model_config_, config_.kv_seq_len, draft));
   size_t elements = size_t(capacity_) * width_;
-  auto hidden_bytes = elements * sizeof(uint16_t);
-  io_.emplace(ScratchArena::Allocate((2 + model::kCarryPlanes + (draft ? 4 : 0)) * hidden_bytes +
-                                     kLogitRows * vocab_ * sizeof(float) +
-                                     (capacity_ + kLogitRows) * sizeof(int)));
+  io_.emplace(ScratchArena::Allocate(io_bytes(capacity_)));
   hidden_ = static_cast<uint16_t*>(io_->view().device_ptr);
   out_ = hidden_ + elements;
   carry_ = out_ + elements;
@@ -97,7 +109,8 @@ Replay::Replay(DaemonConfig cfg) : config_(std::move(cfg)) {
     // the process lifetime. Warm the same two live executables as interleaved
     // A/B, then destroy both before sampling steady-state unload losses.
     if (weights_) {
-      CheckCuda(cudaMemsetAsync(ids_, 0, sizeof(int), stream_));
+      unsigned batch_rows = std::min(capacity_, kLogitRows);
+      CheckCuda(cudaMemsetAsync(ids_, 0, batch_rows * sizeof(int), stream_));
       const auto free_before = FreeBytes();
       auto spec = Spec(0, model::kNumLogicalVisits, 1, 0, true, true);
       spec.is_decode = 1;
@@ -107,14 +120,18 @@ Replay::Replay(DaemonConfig cfg) : config_(std::move(cfg)) {
         ForwardOptions opts{.use_cuda_graph = 1, .return_logits = 1};
         a->Run(spec, opts);
         b->Run(spec, opts);
+        // KLD also exercises the batched target kernels when no draft is loaded.
+        auto batch = Spec(0, model::kNumLogicalVisits, batch_rows, 0, true, true);
+        batch.all_token_logits = batch.reset_kv = 1;
+        a->Run(batch, {.return_logits = 1});
         if (draft && capacity_ >= 9) {
           spec.d_taps_out = taps_;
           int anchor = a->Run(spec, {}).next_token_id;
           a->StoreContext(taps_, 1, 0);
-          RunSpecRound(*a, anchor, taps_, 1, false);
+          RunSpecRound(*a, anchor, 1, false);
           anchor = b->Run(spec, {}).next_token_id;
           b->StoreContext(taps_, 1, 0);
-          RunSpecRound(*b, anchor, taps_, 1, false);
+          RunSpecRound(*b, anchor, 1, false);
         }
       }
       warmup_vram_bytes_ = int64_t(free_before) - int64_t(FreeBytes());
@@ -133,6 +150,7 @@ Object Replay::Status() const {
   return {{"pid", getpid()},
           {"gpu", gpu.name},
           {"model_dir", config_.model_dir.string()},
+          {"draft_model_dir", config_.draft_dir.string()},
           {"weights_load_ms", weights_load_ms_},
           {"weights_h2d_ms", weights_ ? weights_->transfer_ms() : 0},
           {"warmup_vram_bytes", warmup_vram_bytes_},
@@ -508,8 +526,8 @@ void Replay::Dump(const Json& q, const Measurement& m, const Recording& r,
   auto dump = WriteDump(q.at("out").as<std::string>(), tensors);
   reply.merge(dump);
 }
-Replay::SpecRound Replay::RunSpecRound(ForwardModule& candidate, int anchor, const uint16_t* last,
-                                       unsigned pos, bool profiler_range, bool enable_profiling) {
+Replay::SpecRound Replay::RunSpecRound(ForwardModule& candidate, int anchor, unsigned pos,
+                                       bool profiler_range, bool enable_profiling) {
   using Clock = std::chrono::steady_clock;
   SpecRound round{};
   round.block.resize(8);
@@ -518,7 +536,9 @@ Replay::SpecRound Replay::RunSpecRound(ForwardModule& candidate, int anchor, con
   if (profiler_range) CheckCuda(cudaProfilerStart());
   try {
     auto start = Clock::now();
-    candidate.Draft(anchor, last, pos, round.block.data() + 1);
+    auto proposal =
+        candidate.Draft({anchor, int(pos), 0, 0, candidate.speculative_options.use_cuda_graph});
+    std::ranges::copy(proposal.draft_ids, round.block.begin() + 1);
     auto drafted = Clock::now();
     Upload(stream_, ids_, round.block);
     auto s = Spec(0, model::kNumLogicalVisits, 8, pos, true, true);
@@ -528,7 +548,7 @@ Replay::SpecRound Replay::RunSpecRound(ForwardModule& candidate, int anchor, con
     round.verify_result = candidate.Verify(s, verify_opts);
     round.verified = Read(next_, 8);
     uint64_t seed = 0;
-    auto result = VerifySpeculative(std::span(round.block).subspan(1), round.verified, {}, {},
+    auto result = VerifySpeculative(std::span(round.block).subspan(1), round.verified, {}, {}, {},
                                     vocab_, 0, 0, 0, seed);
     auto verified = Clock::now();
     unsigned count = 1 + result.accepted_draft_count;
@@ -592,7 +612,6 @@ void Replay::PreparePrefix(const Measurement& m, bool speculative, Object& reply
   for (unsigned i = 1; i < m.step; ++i) advance({prefix.generated.back()}, true);
   if (speculative) {
     CheckCuda(cudaStreamSynchronize(stream_));
-    prefix.last_tap = Read(taps_ + size_t(rows - 1) * 4 * width_, 4 * width_);
     SaveSpecState(prefix);
   } else {
     auto& r = prefix.recording;
@@ -624,7 +643,7 @@ void Replay::SaveSpecState(Prefix& prefix) {
     }
   };
   save_ring(kv.swa_kv, kv.swa_window, 2 * kv.num_swa_visits);
-  save_ring(kv.mtp_swa_kv, kv.mtp_swa_window, 4);
+  save_ring(kv.draft_swa_kv, kv.draft_swa_window, 10);
 }
 Object Replay::MeasureSpeculative(const Json& q, const std::string& cmd, const Measurement& m) {
   Object reply;
@@ -640,9 +659,8 @@ Object Replay::MeasureSpeculative(const Json& q, const std::string& cmd, const M
   bool profiler_range = false;
   auto round = [&](ForwardModule& candidate) {
     for (auto& [ptr, bytes] : prefix.mutable_state) Upload(stream_, ptr, bytes);
-    Upload(stream_, taps_, prefix.last_tap);
-    result = RunSpecRound(candidate, prefix.generated.back(), taps_, prefix.position,
-                          profiler_range, enable_profiling);
+    result = RunSpecRound(candidate, prefix.generated.back(), prefix.position, profiler_range,
+                          enable_profiling);
     return result.elapsed_ms;
   };
   for (unsigned i = 0; i < m.warmup; ++i) {
@@ -650,12 +668,17 @@ Object Replay::MeasureSpeculative(const Json& q, const std::string& cmd, const M
     if (b) round(*b);
   }
   profiler_range = q.get("profiler_range", false);
-  std::vector<double> times, paired;
+  std::vector<double> times, paired, draft_times, verify_times, commit_times;
   Array pairs;
   for (unsigned j = 0; j < m.rounds; ++j) {
     std::vector<double> group_a, group_b;
     for (unsigned i = 0; i < m.iters; ++i) {
       group_a.push_back(round(*a));
+      if (cmd == "run") {
+        draft_times.push_back(result.draft_ms);
+        verify_times.push_back(result.verify_ms);
+        commit_times.push_back(result.elapsed_ms - result.verify_ms - result.draft_ms);
+      }
       if (b) {
         auto first = result.emitted;
         group_b.push_back(round(*b));
@@ -687,6 +710,11 @@ Object Replay::MeasureSpeculative(const Json& q, const std::string& cmd, const M
   auto& emitted = result.emitted;
   reply["spec_accepted"] = emitted.size() - 1;
   reply["tokens_emitted"] = emitted.size();
+  if (cmd == "run") {
+    reply["draft_ms"] = Median(draft_times);
+    reply["verify_ms"] = Median(verify_times);
+    reply["commit_and_store_ms"] = Median(commit_times);
+  }
   if (cmd == "profile" || q.get("enable_profiling", false)) {
     FormatStages(result.verify_result, reply);
     reply["verify_logical_bytes"] = result.verify_result.logical_bytes;
@@ -727,7 +755,7 @@ Object Replay::Measure(const Json& q, const std::string& cmd) {
   auto m = ParseMeasurement(q, cmd);
   if (!m.context_len) prefix_.reset();
   bool e2e = m.e2e();
-  if (e2e && m.step && weights_ && weights_->view().has_mtp && q.get("use_speculative", true))
+  if (e2e && m.step && weights_ && weights_->view().has_draft && q.get("use_speculative", true))
     return MeasureSpeculative(q, cmd, m);
   Object reply{{"context_len", m.context_len}, {"prefix_cache_hit", false}};
   using Clock = std::chrono::steady_clock;

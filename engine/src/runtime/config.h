@@ -3,7 +3,7 @@
 
 namespace flint {
 struct RuntimeConfig {
-  std::string model_dir;
+  std::string model_dir, draft_model_dir;
   uint32_t max_context = 0, prefill_chunk_size = 256;
   size_t scratch_bytes = 450ull << 20, vram_reserve_bytes = 512ull << 20;
   uint32_t prefix_cache_slots = 3;
@@ -24,6 +24,7 @@ struct RuntimeConfig {
       }
     };
     read("model_dir", c.model_dir);
+    read("draft_model_dir", c.draft_model_dir);
     read("max_context", c.max_context);
     read("prefill_chunk_size", c.prefill_chunk_size);
     read("scratch_bytes", c.scratch_bytes);

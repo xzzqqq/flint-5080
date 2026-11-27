@@ -65,20 +65,22 @@ __global__ void Flash(AttentionParams p, int first) {
   constexpr bool prewritten = mode == Mode::Prewritten;
   __shared__ __align__(16) B keys[kKeyTile][128], values[kKeyTile][128];
   int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
-  int tile = blockIdx.y * kQueryTile, row = tile + warp / 3;
-  int kv_head = blockIdx.x, head = kv_head * 3 + warp % 3, query = row * 24 + head;
+  constexpr int group = draft ? 4 : 3;
+  int tile = blockIdx.y * kQueryTile, row = tile + warp / group;
+  int kv_head = blockIdx.x, head = kv_head * group + warp % group, query = row * (8 * group) + head;
   int base = Position(p.position, p.d_pos, p.pos_offset);
   int split = blockIdx.z, splits = gridDim.z;
   int tile_end = base + min(tile + kQueryTile, p.tokens);
-  int tile_begin = draft ? (p.sliding ? max(0, base - 1024) : first)
-                         : (p.sliding ? max(0, base + tile + 1 - p.capacity) : 0);
+  // The draft ring reserves an extra block so new keys cannot overwrite live history.
+  int window = draft ? p.capacity - p.tokens : p.capacity;
+  int tile_begin = p.sliding ? max(0, base + tile + 1 - window) : (draft ? first : 0);
   // Assign absolute key tiles to splits. Every causal row then reduces its
   // prefix in the same order, including partial and wrapped verify blocks.
   int first_tile = tile_begin / kKeyTile;
   int start = (first_tile + (split - first_tile % splits + splits) % splits) * kKeyTile;
   int end = tile_end;
   int pos = base + row;
-  int begin = !draft && p.sliding ? max(0, pos + 1 - p.capacity) : tile_begin;
+  int begin = p.sliding ? max(0, pos + 1 - window) : tile_begin;
 
   bool active = row < p.tokens;
   float peak = !draft && split == 0 && active ? Get(p.sink, query) : -CUDART_INF_F;
@@ -155,7 +157,8 @@ __global__ void Flash(AttentionParams p, int first) {
     for (int i = 0; i < 4; ++i)
       Put(p.y, query * 128 + lane * 4 + i, prewritten ? acc[i] : acc[i] / denom);
   } else {
-    float* part = p.scores + (size_t(split) * p.tokens * 24 + query) * FLINT_ATTENTION_PARTIAL;
+    float* part =
+        p.scores + (size_t(split) * p.tokens * (8 * group) + query) * FLINT_ATTENTION_PARTIAL;
     if (!lane) {
       part[0] = peak;
       part[1] = denom;
@@ -170,9 +173,9 @@ __global__ void Flash(AttentionParams p, int first) {
 
 __global__ void Combine(AttentionParams p, int splits) {
   __shared__ float scales[32], denominator;
-  int c = threadIdx.x, query = blockIdx.y * 24 + blockIdx.x;
+  int c = threadIdx.x, query = blockIdx.y * gridDim.x + blockIdx.x;
   const float* part = p.scores + query * FLINT_ATTENTION_PARTIAL;
-  size_t stride = size_t(p.tokens) * 24 * FLINT_ATTENTION_PARTIAL;
+  size_t stride = size_t(p.tokens) * gridDim.x * FLINT_ATTENTION_PARTIAL;
   if (c < 32) {
     float peak = c < splits ? part[c * stride] : -CUDART_INF_F;
     float largest = peak;
@@ -197,10 +200,11 @@ int LaunchFlash(AttentionParams p, int first, int splits, void* stream) {
   auto s = static_cast<cudaStream_t>(stream);
   int rows = p.tokens < kQueryTile ? p.tokens : kQueryTile;
   dim3 grid(8, (p.tokens + kQueryTile - 1) / kQueryTile, splits);
-  Flash<mode><<<grid, rows * 3 * 32, 0, s>>>(p, first);
+  constexpr int group = mode == Mode::Draft ? 4 : 3;
+  Flash<mode><<<grid, rows * group * 32, 0, s>>>(p, first);
   auto status = cudaGetLastError();
   if (status || splits == 1) return status;
-  Combine<<<dim3(24, p.tokens), 128, 0, s>>>(p, splits);
+  Combine<<<dim3(8 * group, p.tokens), 128, 0, s>>>(p, splits);
   return cudaGetLastError();
 }
 __global__ void Gate(GateMulParams p) {

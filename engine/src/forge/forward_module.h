@@ -21,14 +21,13 @@ class ForwardModule {
   ForwardRunResult Run(const ForwardRunSpec& spec, const ForwardOptions& opts = {});
   void StoreContext(const void* taps, uint32_t n, uint32_t pos);
   ForwardOptions speculative_options{.use_cuda_graph = 1};
-  void Draft(int anchor, const void* taps, uint32_t pos, int* ids);
+  ForwardDraftResult Draft(const ForwardDraftSpec& spec);
   ForwardRunResult Verify(const ForwardRunSpec& spec, const ForwardOptions&);
   void Commit(uint32_t pos, uint32_t len, uint32_t accepted);
   void ReportGraphStats(Object& reply, const char* key) const;
 
  private:
   decltype(&flint_forward_store_context) store_context_{};
-  void (*set_draft_graph_)(bool){};
   decltype(&flint_forward_draft) draft_{};
   decltype(&flint_forward_verify) verify_{};
   decltype(&flint_forward_commit) commit_{};

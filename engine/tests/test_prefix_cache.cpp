@@ -59,37 +59,29 @@ void WatermarkAndLogits() {
   c.InvalidateAll();
   Cold(c.Match(extended));
 }
-void MtpSnapshot() {
+void DraftSnapshot() {
   auto config = model::MakeDefaultInklingConfig();
-  config.has_mtp = 1;
-  config.mtp = model::kMtpConfig;
+  config.has_draft = 1;
+  config.draft = model::kDraftConfig;
   const auto sizes = ComputeKvArenaSizes(config, true);
-  Require(sizes.Fixed() == ComputeKvArenaSizes(config).Fixed() + 2 * 1032 * 4096,
-          "MTP snapshot size");
+  Require(sizes.Fixed() == ComputeKvArenaSizes(config).Fixed() + 5 * 2056 * 4096,
+          "Draft snapshot size");
   auto arena = KvStateArena::Allocate(config, 16, true);
   PrefixCache cache(1, config, 16, true);
   Tokens prompt{1, 2};
   std::vector<float> logits(config.unpadded_vocab_size);
-  std::vector<uint16_t> tap(4 * config.hidden_size);
-  std::iota(tap.begin(), tap.end(), 1);
   auto& kv = arena.view();
-  CheckCuda(cudaMemset(kv.mtp_swa_kv, 0x5a, sizes.mtp_swa));
-  cache.Save(prompt, kv, logits, nullptr, tap);
-  auto plan = cache.Match(prompt);
-  Require(plan.use_cached_logits && std::ranges::equal(cache.SlotLastTap(plan.logits_slot), tap),
-          "exact MTP tap");
-  CheckCuda(cudaMemset(kv.mtp_swa_kv, 0, sizes.mtp_swa));
-  cache.Restore(plan.restore_slot, kv, nullptr);
-  std::vector<unsigned char> restored(sizes.mtp_swa);
-  CheckCuda(cudaMemcpy(restored.data(), kv.mtp_swa_kv, restored.size(), cudaMemcpyDeviceToHost));
-  Require(std::ranges::all_of(restored, [](auto v) { return v == 0x5a; }), "restore MTP SWA");
+  CheckCuda(cudaMemset(kv.draft_swa_kv, 0x5a, sizes.draft_swa));
   cache.Save(prompt, kv, logits, nullptr);
-  Require(!cache.Match(prompt).use_cached_logits && cache.SlotLastTap(plan.logits_slot).empty(),
-          "missing tap disables exact MTP hit");
-  cache.Save(prompt, kv, logits, nullptr, tap);
+  auto plan = cache.Match(prompt);
+  Require(plan.use_cached_logits, "exact draft hit");
+  CheckCuda(cudaMemset(kv.draft_swa_kv, 0, sizes.draft_swa));
+  cache.Restore(plan.restore_slot, kv, nullptr);
+  std::vector<unsigned char> restored(sizes.draft_swa);
+  CheckCuda(cudaMemcpy(restored.data(), kv.draft_swa_kv, restored.size(), cudaMemcpyDeviceToHost));
+  Require(std::ranges::all_of(restored, [](auto v) { return v == 0x5a; }), "restore Draft SWA");
   cache.OnKvWrite(1);
-  Require(cache.SlotLastTap(plan.logits_slot).empty() && !cache.Match(prompt).use_cached_logits,
-          "invalidated tap");
+  Require(!cache.Match(prompt).use_cached_logits, "invalidated prefix");
 }
 void Pinning() {
   PrefixCache c(3, 0);
@@ -151,7 +143,7 @@ int main() {
   try {
     Disabled();
     WatermarkAndLogits();
-    MtpSnapshot();
+    DraftSnapshot();
     Pinning();
     Eviction();
     return 0;

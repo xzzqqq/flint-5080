@@ -20,7 +20,7 @@
 namespace {
 using namespace flint;
 namespace fs = std::filesystem;
-void Require(bool value, const char* what) {
+void Require(bool value, const std::string& what) {
   if (!value) throw std::runtime_error(what);
 }
 
@@ -241,7 +241,8 @@ void TestKldRpc(const char* host, const char* forward, const char* model) {
               reply.at("top1_match_rate").number<double>() == 1,
           "KLD position agreement");
   for (auto key : {"mean_kl", "p95_kl", "max_kl", "max_abs_logit_diff", "unload_loss_bytes"})
-    Require(reply.at(key).number<double>() == 0, key);
+    Require(reply.at(key).number<double>() == 0,
+            std::string(key) + "=" + std::to_string(reply.at(key).number<double>()));
   Require(fs::is_empty(f.root / "loaded"), "leftover KLD DSO");
   f.Shutdown();
 }
