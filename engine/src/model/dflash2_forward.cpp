@@ -71,6 +71,13 @@ void DFlash2Runner::StoreContextKv(const void* taps, uint32_t tokens, uint32_t p
 }
 void DFlash2Runner::Draft(const ForwardDraftSpec& spec, ForwardDraftResult& result,
                           DFlash2Capture* cap) {
+  EnqueueDraft(spec, cap);
+  auto s = gemm_.stream();
+  CheckCuda(cudaMemcpyAsync(&result, result_, sizeof(result), cudaMemcpyDeviceToHost, s));
+  CheckCuda(cudaStreamSynchronize(s));
+}
+void DFlash2Runner::DraftDevice(const ForwardDraftSpec& spec) { EnqueueDraft(spec, nullptr); }
+void DFlash2Runner::EnqueueDraft(const ForwardDraftSpec& spec, DFlash2Capture* cap) {
   if (spec.anchor < 0 || spec.anchor >= V || spec.pos < 0 ||
       uint32_t(spec.pos) > kv_.max_full_seq_len)
     throw std::invalid_argument("invalid draft block");
@@ -95,8 +102,6 @@ void DFlash2Runner::Draft(const ForwardDraftSpec& spec, ForwardDraftResult& resu
     CheckCuda(cudaGraphLaunch(graph_, s));
   } else
     RunBlock(cap);
-  CheckCuda(cudaMemcpyAsync(&result, result_, sizeof(result), cudaMemcpyDeviceToHost, s));
-  CheckCuda(cudaStreamSynchronize(s));
 }
 void DFlash2Runner::RunBlock(DFlash2Capture* cap) {
   auto d_ctx = &spec_->pos;

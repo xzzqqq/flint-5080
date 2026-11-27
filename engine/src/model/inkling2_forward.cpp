@@ -134,6 +134,7 @@ InklingRunner::InklingRunner(const ModelWeightsView& w, const KvStateArenaView& 
   c.gemm = std::make_unique<Gemm>(c.stream, workspace, bytes);
 }
 cudaStream_t InklingRunner::stream() const { return impl_->stream; }
+ScratchArenaView InklingRunner::scratch_tail() const { return impl_->activations; }
 InklingRunner::~InklingRunner() = default;
 ForwardGraphStats InklingRunner::graph_stats() const { return impl_->stats; }
 void InklingRunner::Impl::RunInkling(const ForwardRunSpec& s, const ForwardOptions& o,
@@ -355,6 +356,10 @@ void InklingRunner::Impl::PrepareGraph(GraphSlot& slot, const ForwardRunSpec& ba
 }
 ForwardRunResult InklingRunner::Run(const ForwardRunSpec& batch, const ForwardOptions& o,
                                     const ForwardCapture* capture) {
+  return Enqueue(batch, o, capture, false);
+}
+ForwardRunResult InklingRunner::Enqueue(const ForwardRunSpec& batch, const ForwardOptions& o,
+                                        const ForwardCapture* capture, bool device_only) {
   auto& c = *impl_;
   auto s = batch;
   if (!s.seq_len || s.begin_visit > s.end_visit || s.end_visit > c.plan.size() || !s.d_hidden_out ||
@@ -378,7 +383,7 @@ ForwardRunResult InklingRunner::Run(const ForwardRunSpec& batch, const ForwardOp
   }
   if (o.profiler_range) CheckCuda(cudaProfilerStart());
   try {
-    CheckCuda(cudaEventRecord(c.start, c.stream));
+    if (!device_only) CheckCuda(cudaEventRecord(c.start, c.stream));
     if (decode || c.recording)
       CheckCuda(cudaMemcpyAsync(c.d_decode_pos, &s.pos_offset, sizeof(int32_t),
                                 cudaMemcpyHostToDevice, c.stream));
@@ -388,6 +393,7 @@ ForwardRunResult InklingRunner::Run(const ForwardRunSpec& batch, const ForwardOp
       ++c.stats.launches;
     } else
       c.RunInkling(s, o, r, capture);
+    if (device_only) return r;
     if (s.run_lm_head)
       CheckCuda(cudaMemcpyAsync(c.host_token,
                                 s.d_next_token + (s.all_token_logits ? s.seq_len - 1 : 0),
@@ -405,7 +411,8 @@ ForwardRunResult InklingRunner::Run(const ForwardRunSpec& batch, const ForwardOp
   if (o.profiler_range) CheckCuda(cudaProfilerStop());
   return r;
 }
-ForwardRunResult InklingRunner::RunVerify(ForwardRunSpec s, const ForwardOptions& o) {
+ForwardRunResult InklingRunner::RunVerify(ForwardRunSpec s, const ForwardOptions& o,
+                                          bool device_only) {
   auto& c = *impl_;
   if (!c.backup || c.verify_len || !s.seq_len || s.seq_len > 8 || s.reset_kv ||
       s.pos_offset > c.kv.max_full_seq_len || s.seq_len > c.kv.max_full_seq_len - s.pos_offset)
@@ -418,7 +425,7 @@ ForwardRunResult InklingRunner::RunVerify(ForwardRunSpec s, const ForwardOptions
   c.verify_len = s.seq_len;
   c.recording = true;
   try {
-    auto result = Run(s, o);
+    auto result = Enqueue(s, o, nullptr, device_only && !o.enable_profiling && !o.profiler_range);
     c.recording = false;
     return result;
   } catch (...) {

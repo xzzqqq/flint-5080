@@ -523,6 +523,11 @@ void ModelTests(const std::filesystem::path& model_dir, const std::filesystem::p
     Success(Run(warm.get(), prompt, p));
     p.temperature = 0.8f;
     Success(Run(warm.get(), prompt, p));
+    // Include the filtered verifier's CUDA modules in the warmed teardown baseline.
+    auto filtered = p;
+    filtered.top_k = 40;
+    filtered.top_p = .9f;
+    Success(Run(warm.get(), prompt, filtered));
   }
   size_t before = FreeBytes();
   auto engine = Create(config);
@@ -662,12 +667,46 @@ void ModelTests(const std::filesystem::path& model_dir, const std::filesystem::p
       spec_runs.push_back(std::move(r));
     }
   }
-  for (unsigned width : {4, 6}) {
-    auto spec = Create(Encode(Object{{"model_dir", model_dir.string()},
-                                     {"draft_model_dir", draft_dir.string()},
-                                     {"max_context", kMaxContext},
-                                     {"prefill_chunk_size", 8},
-                                     {"spec_verify_len", width}}));
+  for (unsigned width : {4, 6, 8}) {
+    auto cfg = Encode(Object{{"model_dir", model_dir.string()},
+                             {"draft_model_dir", draft_dir.string()},
+                             {"max_context", kMaxContext},
+                             {"prefill_chunk_size", 8},
+                             {"scratch_bytes", 64 << 20},
+                             {"spec_verify_len", width}});
+    auto params = [](bool filtered) {
+      return RequestParams{.max_tokens = 24,
+                           .temperature = 1.f,
+                           .top_p = filtered ? .9f : 0.f,
+                           .top_k = filtered ? 40 : 0,
+                           .seed = 5080,
+                           .ignore_eos = 1};
+    };
+    // CUDA and cuBLAS load kernels lazily for each target shape. Compare two
+    // independent engine lifetimes after exercising the same shape and modes.
+    size_t cold = FreeBytes();
+    {
+      auto warm = Create(cfg);
+      for (bool filtered : {false, true}) Success(Run(warm.get(), prompt, params(filtered)));
+      Success(Run(warm.get(), prompt, {.max_tokens = uint32_t(gold.size()), .ignore_eos = 1}));
+    }
+    size_t baseline = FreeBytes();
+    std::cout << "spec width=" << width
+              << " first lifetime delta=" << int64_t(cold) - int64_t(baseline) << " B" << std::endl;
+    auto spec = Create(cfg);
+    for (bool filtered : {false, true}) {
+      auto sample = params(filtered);
+      auto a = Run(spec.get(), prompt, sample), replay = Run(spec.get(), prompt, sample);
+      ++sample.seed;
+      auto other = Run(spec.get(), prompt, sample);
+      Success(a);
+      Success(replay);
+      Success(other);
+      Require(a.ids.size() == sample.max_tokens && a.ids == replay.ids && a.ids != other.ids &&
+                  a.t.spec_accepted == replay.t.spec_accepted &&
+                  a.t.decode_rounds == replay.t.decode_rounds,
+              "stochastic speculative replay");
+    }
     auto r = Run(spec.get(), prompt, {.max_tokens = uint32_t(gold.size()), .ignore_eos = 1});
     Success(r);
     Require(r.ids == ar_runs.front().second.ids && Counter(spec.get(), "spec_verify_len") == width,
@@ -683,6 +722,10 @@ void ModelTests(const std::filesystem::path& model_dir, const std::filesystem::p
     Require(accepted > 0 && accepted == r.t.spec_accepted &&
                 std::accumulate(hist.begin(), hist.end(), 0u) + final_ar == r.t.decode_rounds,
             "speculative acceptance histogram totals");
+    spec.reset();
+    auto delta = int64_t(baseline) - int64_t(FreeBytes());
+    std::cout << "spec width=" << width << " teardown delta=" << delta << " B" << std::endl;
+    Require(delta == 0, "stochastic speculative VRAM drift after destroy");
   }
   LongDraftPrefill(model_dir, draft_dir, prompt);
   PrefixTests(model_dir, draft_dir, prompt, gold);

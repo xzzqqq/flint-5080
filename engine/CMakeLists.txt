@@ -48,7 +48,7 @@ target_link_libraries(engine_loader PUBLIC CUDA::cudart)
 
 add_library(engine_ops OBJECT
     src/ops/exl3_linear.cu src/ops/norm_embed.cu src/ops/sconv.cu
-    src/ops/dflash2.cu src/ops/spec_rollback.cu src/ops/attention.cu src/ops/moe.cu src/ops/loop_res.cu
+    src/ops/dflash2.cu src/ops/spec_verify.cu src/ops/spec_rollback.cu src/ops/attention.cu src/ops/moe.cu src/ops/loop_res.cu
     src/ops/gemm_cublas.cpp)
 set_target_properties(engine_ops PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(engine_ops PUBLIC src)
@@ -120,6 +120,11 @@ add_executable(e2e_tests tests/test_e2e_golden.cpp)
 target_link_libraries(e2e_tests PRIVATE engine_loader ${CMAKE_DL_LIBS})
 add_dependencies(e2e_tests forward)
 add_test(NAME e2e_tests COMMAND e2e_tests --forward $<TARGET_FILE:forward>)
+
+add_executable(spec_verify_tests tests/test_spec_verify.cpp)
+target_include_directories(spec_verify_tests PRIVATE src)
+target_link_libraries(spec_verify_tests PRIVATE engine CUDA::cudart)
+add_test(NAME spec_verify_tests COMMAND spec_verify_tests)
 
 add_executable(sampler_tests tests/test_sampler.cpp src/runtime/sampler.cpp)
 target_include_directories(sampler_tests PRIVATE src)

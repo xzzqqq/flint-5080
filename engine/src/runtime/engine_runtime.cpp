@@ -3,7 +3,6 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -25,6 +24,7 @@
 #include "loader/scratch_workspace.h"
 #include "model/dflash2_forward.h"
 #include "model/inkling2_forward.h"
+#include "ops/spec_verify_ops.h"
 #include "ops/stub_ops.h"
 #include "runtime/config.h"
 #include "runtime/prefix_cache.h"
@@ -154,7 +154,7 @@ class ModelExecutor {
                                    (active_ ? rows_ * kTap * sizeof(uint16_t) : 0))),
         cache_(AllocatePrefixCache(cfg, model_config(), active_)),
         host_ids_(AllocatePinned<int32_t>(rows_)),
-        host_logits_(AllocatePinned<float>(kVocab * (active_ ? kBlock : 1))),
+        host_logits_(AllocatePinned<float>(kVocab)),
         kv_(KvStateArena::Allocate(model_config(), cfg.max_context, active_)),
         runner_(weights_.view(), kv_.view(), target_scratch_, stream) {
     ScratchWorkspace ws(io_.view());
@@ -164,7 +164,10 @@ class ModelExecutor {
     next_ = ws.Take<int32_t>(active_ ? kBlock : 1);
     if (active_) {
       taps_ = ws.Take<uint16_t>(rows_ * kTap);
-      host_next_ = AllocatePinned<int32_t>(kBlock);
+      d_spec_in_ = ws.Take<SpecVerifyInput>(1);
+      d_spec_out_ = ws.Take<SpecVerifyOutput>(1);
+      host_spec_in_ = AllocatePinned<SpecVerifyInput>(1);
+      host_spec_out_ = AllocatePinned<SpecVerifyOutput>(1);
       dflash2_.emplace(weights_.view(), kv_.view(), draft_scratch_, stream);
     }
   }
@@ -207,7 +210,10 @@ class ModelExecutor {
   KvStateArena kv_;
   InklingRunner runner_;
   std::optional<DFlash2Runner> dflash2_;
-  std::unique_ptr<int32_t, FreePinned> host_next_;
+  SpecVerifyInput* d_spec_in_{};
+  SpecVerifyOutput* d_spec_out_{};
+  std::unique_ptr<SpecVerifyInput, FreePinned> host_spec_in_;
+  std::unique_ptr<SpecVerifyOutput, FreePinned> host_spec_out_;
   uint16_t* taps_{};
   Sampler sampler_;
   int32_t *ids_, *next_;
@@ -307,16 +313,10 @@ void ModelExecutor::SpecRound(Request& r, uint32_t& pos, int32_t& anchor) {
   auto& p = r.params;
   const bool stochastic = p.temperature > 0;
   const uint32_t len = std::min(config_.spec_verify_len, config_.max_context - pos);
-  std::span<int32_t, kBlock> block(host_ids_.get(), kBlock);
-  block.front() = anchor;
-  ForwardDraftResult proposal;
-  dflash2_->Draft({anchor, int(pos), p.temperature, p.seed, config_.use_cuda_graph}, proposal);
-  // Reserve seven SplitMix draws for the draft before drawing acceptance uniforms.
-  if (stochastic) p.seed += uint64_t(kDraftTokens) * kSplitMixIncrement;
-  std::ranges::copy(proposal.draft_ids, block.begin() + 1);
-  auto input = block.first(len);
-  CheckCuda(
-      cudaMemcpyAsync(ids_, input.data(), input.size_bytes(), cudaMemcpyHostToDevice, stream_));
+  dflash2_->DraftDevice({anchor, int(pos), p.temperature, p.seed, config_.use_cuda_graph});
+  auto* proposal = dflash2_->device_result();
+  CheckCuda(flint_spec_prepare_verify_ids(&dflash2_->device_spec()->anchor, proposal, ids_, len,
+                                          stream_));
   runner_.RunVerify({.seq_len = len,
                      .pos_offset = pos,
                      .d_input_ids = ids_,
@@ -324,37 +324,56 @@ void ModelExecutor::SpecRound(Request& r, uint32_t& pos, int32_t& anchor) {
                      .d_logits_out = logits_,
                      .d_next_token = next_,
                      .d_taps_out = taps_},
-                    {.use_cuda_graph = config_.use_cuda_graph, .return_logits = stochastic});
+                    {.use_cuda_graph = config_.use_cuda_graph, .return_logits = stochastic},
+                    /*device_only=*/true);
   if (config_.use_cuda_graph) {
     std::lock_guard lock(graph_mutex_);
     graphs_ = runner_.graph_stats();
   }
-  SpeculativeResult result;
+  const auto& out = *host_spec_out_;
   try {
-    std::span<int32_t> argmax(host_next_.get(), len);
-    std::span<const float> target;
-    if (stochastic) {
-      target = {host_logits_.get(), len * kVocab};
-      CheckCuda(cudaMemcpyAsync(host_logits_.get(), logits_, target.size_bytes(),
-                                cudaMemcpyDeviceToHost, stream_));
-    } else {
-      CheckCuda(cudaMemcpyAsync(argmax.data(), next_, argmax.size_bytes(), cudaMemcpyDeviceToHost,
-                                stream_));
-    }
+    const auto mode = !stochastic                               ? SPEC_SAMPLE_GREEDY
+                      : p.top_k || (p.top_p > 0 && p.top_p < 1) ? SPEC_SAMPLE_STOCHASTIC_FILTERED
+                                                                : SPEC_SAMPLE_STOCHASTIC_FULL;
+    *host_spec_in_ = {anchor,
+                      int(pos),
+                      len,
+                      p.temperature,
+                      std::max(0.f, p.top_p),
+                      p.top_k,
+                      stochastic ? p.seed + kDraftTokens * kSplitMixIncrement : p.seed};
+    CheckCuda(cudaMemcpyAsync(d_spec_in_, host_spec_in_.get(), sizeof(*d_spec_in_),
+                              cudaMemcpyHostToDevice, stream_));
+    auto scratch = runner_.scratch_tail();
+    CheckCuda(flint_spec_verify_accept(proposal, next_, logits_, d_spec_in_, d_spec_out_,
+                                       scratch.device_ptr, scratch.bytes, len, kVocab, mode,
+                                       stream_));
+    CheckCuda(cudaMemcpyAsync(host_spec_out_.get(), d_spec_out_, sizeof(out),
+                              cudaMemcpyDeviceToHost, stream_));
     CheckCuda(cudaStreamSynchronize(stream_));
-    result = VerifySpeculative(input.subspan(1), argmax,
-                               std::span(proposal.candidate_ids).first((len - 1) * kSelectorTopK),
-                               std::span(proposal.q_probs).first((len - 1) * kSelectorTopK), target,
-                               kVocab, p.temperature, p.top_k, p.top_p, p.seed);
+    switch (out.error_code) {
+      case SPEC_VERIFY_OK:
+        break;
+      case SPEC_VERIFY_INVALID_PARAM:
+        throw std::invalid_argument("invalid verification parameters");
+      case SPEC_VERIFY_NO_FINITE_LOGITS:
+        throw std::invalid_argument("no finite logits");
+      case SPEC_VERIFY_DRAFT_OUTSIDE_SUPPORT:
+        throw std::invalid_argument("draft outside proposal support");
+      case SPEC_VERIFY_INVALID_CANDIDATE:
+        throw std::invalid_argument("invalid candidate ID");
+      case SPEC_VERIFY_EMPTY_RESIDUAL:
+        throw std::logic_error("empty residual distribution");
+      default:
+        throw std::logic_error("unknown verification error");
+    }
   } catch (...) {
     runner_.CommitVerify(pos, len, 0);
     throw;
   }
-  const uint32_t accepted = result.accepted_draft_count;
-  std::array<int32_t, kBlock> output;
-  std::ranges::copy(input.subspan(1, accepted), output.begin());
-  output[accepted] = result.bonus_token;
-  auto visible = r.LimitBatch(std::span(output).first(accepted + 1));
+  p.seed = out.next_seed;
+  const uint32_t accepted = out.accepted_draft_count;
+  auto visible = r.LimitBatch(std::span(out.tokens).first(accepted + 1));
   // For an EOS/stop prediction, its predecessor was consumed. At an output
   // limit the final emitted token is still the next (unconsumed) anchor.
   uint32_t committed = visible.size() + (r.stop_reason == ENGINE_STOP_EOS ||
@@ -363,9 +382,10 @@ void ModelExecutor::SpecRound(Request& r, uint32_t& pos, int32_t& anchor) {
   StoreContext(committed, pos);
   CheckCuda(cudaStreamSynchronize(stream_));
   cache_.OnKvWrite(pos);
-  cache_.AppendLive(input.first(committed));
+  cache_.AppendLive({&anchor, 1});
+  cache_.AppendLive(std::span(out.tokens).first(committed - 1));
   pos += committed;
-  anchor = result.bonus_token;
+  anchor = out.tokens[accepted];
   ++r.telemetry.decode_rounds;
   r.telemetry.decode_ms += Milliseconds(start);
   r.EmitBatch(visible, accepted);
