@@ -2,25 +2,17 @@
 
 #include "common/cuda_check.h"
 #include "forge/forward_abi.h"
-#include "loader/scratch_workspace.h"
 #include "model/dspark_forward.h"
 #include "model/inkling2_forward.h"
-namespace {
-ScratchArenaView TargetScratch(ScratchArenaView scratch, bool mtp) {
-  if (!mtp) return scratch;
-  flint::ScratchWorkspace ws(scratch);
-  ws.Take<char>(32ul << 20);
-  return ws.rest;
-}
-}  // namespace
 struct ForwardContext {
+  ScratchArenaView draft_scratch;
   flint::InklingRunner runner;
   std::optional<flint::DsparkRunner> draft;
   ForwardContext(const ModelWeightsView& w, const KvStateArenaView& kv, ScratchArenaView ws,
                  cudaStream_t s)
-      : runner(w, kv, TargetScratch(ws, w.has_mtp), s) {
-    if (w.has_mtp)
-      draft.emplace(w, kv, ScratchArenaView{ws.device_ptr, 32ul << 20}, runner.stream());
+      : draft_scratch(w.has_mtp ? flint::DsparkRunner::ReserveScratch(ws) : ScratchArenaView{}),
+        runner(w, kv, ws, s) {
+    if (w.has_mtp) draft.emplace(w, kv, draft_scratch, runner.stream());
   }
 };
 uint32_t flint_forward_abi_version() { return FLINT_FORWARD_ABI_VERSION; }

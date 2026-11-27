@@ -1,16 +1,22 @@
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstring>
 #include <future>
+#include <iomanip>
 #include <iostream>
 #include <thread>
 
 #include "common/cuda_check.h"
 #include "common/json_output.h"
 #include "engine_api.h"
+#include "loader/arenas.h"
+#include "loader/model_constants.h"
 #include "loader/safetensors.h"
+#include "loader/scratch_workspace.h"
+#include "model/inkling2_forward.h"
 #include "runtime/config.h"
 
 namespace {
@@ -201,6 +207,13 @@ void PrefixTests(const std::filesystem::path& model_dir, const std::vector<int32
     return prompt;
   };
   Result cold_math, cold_stripped, cold_tail, cold_branch, cold_seed1, cold_seed2;
+  // Warm the cache-disabled executor too. Its sampled and tail-prefill
+  // kernels are loaded lazily on the first pass through these shapes.
+  {
+    auto warm = create(0);
+    Success(Run(warm.get(), stripped, stochastic));
+    Success(Run(warm.get(), branch(73), greedy));
+  }
   size_t before = FreeBytes();
   {
     auto cold = create(0);
@@ -317,6 +330,109 @@ Engine CreateWithoutMtpFile(const std::filesystem::path& model_dir) {
   for (auto name : {"config.json", "model.safetensors"})
     fs::create_symlink(fs::absolute(model_dir / name), tmp.dir / name);
   return Create(Encode(Object{{"model_dir", path}, {"prefill_chunk_size", 8}}));
+}
+// Before the verify fix short_sky[35] favored 149881 at T=1 (+0.33836365)
+// and 149910 at T=8 (+0.13246155). On short_code[72] the T=8 margin was zero.
+// Teacher-force the emitted history through ordinary eight-row forward. This
+// oracle neither drafts proposals nor commits a speculative prefix.
+void VerifyBatches(const ModelWeightsView& weights, uint32_t max_context, const char* name,
+                   const std::vector<int>& prompt, const Result& ar, const Result& spec) {
+  constexpr unsigned width = 8, vocab = model::kUnpaddedVocabSize;
+  auto kv = KvStateArena::Allocate(weights.config, max_context + width - 1, true);
+  auto scratch = ScratchArena::Allocate();
+  InklingRunner target(weights, kv.view(), scratch.view(), nullptr);
+  auto io = ScratchArena::Allocate(width * vocab * sizeof(float) + (1 << 20));
+  ScratchWorkspace ws(io.view());
+  auto input = ws.Take<int>(width), next = ws.Take<int>(width);
+  auto hidden = ws.Take<uint16_t>(width * model::kHiddenSize);
+  auto logits = ws.Take<float>(width * vocab);
+  ForwardRunSpec s{.end_visit = model::kNumLogicalVisits,
+                   .run_embed = 1,
+                   .run_lm_head = 1,
+                   .d_input_ids = input,
+                   .d_hidden_out = hidden,
+                   .d_logits_out = logits,
+                   .d_next_token = next};
+  auto upload = [&](const int* src, unsigned count) {
+    CheckCuda(
+        cudaMemcpyAsync(input, src, count * sizeof(int), cudaMemcpyHostToDevice, target.stream()));
+  };
+  auto prefill = [&] {
+    int anchor = -1;
+    for (s.pos_offset = 0; s.pos_offset < prompt.size(); s.pos_offset += s.seq_len) {
+      s.seq_len = std::min<size_t>(width, prompt.size() - s.pos_offset);
+      s.reset_kv = s.pos_offset == 0;
+      upload(prompt.data() + s.pos_offset, s.seq_len);
+      anchor = target.Run(s, {}).next_token_id;
+    }
+    s.reset_kv = 0;
+    return anchor;
+  };
+  size_t mismatch = std::ranges::mismatch(spec.ids, ar.ids).in1 - spec.ids.begin();
+  std::cout << name << " DSpark vs AR prefix=" << mismatch << "/" << ar.ids.size() << std::endl;
+  auto report = [&](const char* mode, unsigned row) {
+    std::vector<float> scores(vocab);
+    CheckCuda(cudaMemcpy(scores.data(), logits + row * vocab, vocab * sizeof(float),
+                         cudaMemcpyDeviceToHost));
+    auto best = std::ranges::max_element(scores);
+    auto token = best - scores.begin();
+    float score = *best;
+    *best = -INFINITY;
+    auto second = std::ranges::max_element(scores);
+    std::cout << name << " index=" << mismatch << " " << mode << " pos=" << s.pos_offset
+              << " row=" << row << " top2=" << token << ":" << std::setprecision(10) << score << ","
+              << second - scores.begin() << ":" << *second << " margin=" << score - *second
+              << std::endl;
+  };
+  if (mismatch < ar.ids.size()) {
+    Require(prefill() == ar.ids.front() && mismatch > 0, "AR prefill");
+    s.is_decode = 1;
+    s.seq_len = 1;
+    for (size_t j = 1; j <= mismatch; ++j) {
+      s.pos_offset = prompt.size() + j - 1;
+      upload(&ar.ids[j - 1], 1);
+      Require(target.Run(s, {.return_logits = uint8_t(j == mismatch)}).next_token_id == ar.ids[j],
+              "AR replay");
+    }
+    report("T=1", 0);
+    s.is_decode = 0;
+  }
+  Require(prefill() == spec.ids.front(), "speculative prefill");
+  s.seq_len = width;
+  s.all_token_logits = 1;
+  for (size_t j = 1; j < spec.ids.size(); j += width) {
+    s.pos_offset = prompt.size() + j - 1;
+    size_t rows = std::min<size_t>(width, spec.ids.size() - j);
+    std::array<int, width> block{}, verified{};
+    std::copy_n(spec.ids.begin() + j - 1, rows, block.begin());
+    upload(block.data(), width);
+    bool diverged = j <= mismatch && mismatch < j + rows;
+    bool compare = diverged || j <= 1 + width;
+    std::vector<uint32_t> graph;
+    if (compare) {
+      target.RunVerify(s, {.use_cuda_graph = 1, .return_logits = 1});
+      graph.resize(width * vocab);
+      CheckCuda(cudaMemcpy(graph.data(), logits, graph.size() * sizeof(uint32_t),
+                           cudaMemcpyDeviceToHost));
+      if (diverged) report("T=8 graph", mismatch - j);
+      target.CommitVerify(s.pos_offset, width, 0);
+    }
+    target.Run(s, {.return_logits = uint8_t(compare)});
+    if (compare) {
+      std::vector<uint32_t> eager(graph.size());
+      CheckCuda(cudaMemcpy(eager.data(), logits, eager.size() * sizeof(uint32_t),
+                           cudaMemcpyDeviceToHost));
+      Require(eager == graph, "T=8 graph verify vs ordinary forward after rollback");
+      if (diverged) report("T=8 eager", mismatch - j);
+    }
+    CheckCuda(cudaMemcpy(verified.data(), next, sizeof(verified), cudaMemcpyDeviceToHost));
+    for (size_t k = 0; k < rows; ++k)
+      Require(
+          verified[k] == spec.ids[j + k],
+          std::string(name) + " speculative vs teacher-forced target at " + std::to_string(j + k));
+  }
+  std::cout << name << " teacher-forced T=8=" << spec.ids.size() << "/" << spec.ids.size()
+            << std::endl;
 }
 void ModelTests(const std::filesystem::path& model_dir, const std::filesystem::path& golden_dir) {
   constexpr unsigned kMaxContext = 521;
@@ -464,6 +580,7 @@ void ModelTests(const std::filesystem::path& model_dir, const std::filesystem::p
   size_t after = FreeBytes();
   std::cout << "VRAM delta=" << int64_t(before) - int64_t(after) << " B" << std::endl;
   Require(before == after, "VRAM drift after destroy");
+  std::vector<Result> spec_runs;
   {
     auto spec = Create(Encode(Object{{"model_dir", model_dir.string()},
                                      {"max_context", kMaxContext},
@@ -472,11 +589,10 @@ void ModelTests(const std::filesystem::path& model_dir, const std::filesystem::p
     for (const auto& [ids, ar] : ar_runs) {
       auto r = Run(spec.get(), ids, {.max_tokens = ar.t.decode_tokens, .ignore_eos = 1});
       Success(r);
-      Require(r.ids == ar.ids && r.t.spec_accepted > 0 && r.t.decode_rounds < r.t.decode_tokens,
-              "greedy speculative vs AR");
-      std::cout << "DSpark vs AR " << r.ids.size() << "/" << ar.ids.size()
-                << " rounds=" << r.t.decode_rounds << " accepted=" << r.t.spec_accepted
-                << std::endl;
+      Require(r.ids.size() == ar.ids.size() && r.stop_reason == ENGINE_STOP_MAX_TOKENS &&
+                  r.t.spec_accepted > 0 && r.t.decode_rounds < r.t.decode_tokens,
+              "greedy speculative telemetry");
+      spec_runs.push_back(std::move(r));
     }
   }
   PrefixTests(model_dir, prompt, gold);
@@ -489,6 +605,13 @@ void ModelTests(const std::filesystem::path& model_dir, const std::filesystem::p
     Require(r.ids == std::vector<int32_t>(gold.begin(), gold.begin() + room + 1) &&
                 r.stop_reason == ENGINE_STOP_CONTEXT_LIMIT,
             "bounded verify at context limit");
+  }
+  {
+    auto weights = WeightsArena::Load(model_dir, nullptr, true);
+    const char* names[] = {"short_math", "short_sky", "short_code"};
+    for (size_t i = 0; i < ar_runs.size(); ++i)
+      VerifyBatches(weights.view(), kMaxContext, names[i], ar_runs[i].first, ar_runs[i].second,
+                    spec_runs[i]);
   }
 }
 }  // namespace

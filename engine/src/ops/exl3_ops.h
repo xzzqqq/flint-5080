@@ -32,19 +32,30 @@ typedef struct {
   const ExpertProjection* table;
   const int* ids;
 } ExpertSelection;
+/* projected is FP32 [rows, splits, n], with contiguous K tiles per split. */
+typedef struct {
+  const short* trellis;
+  const float* rotated;
+  float* projected;
+  int rows, k, n, k2, splits;
+} DenseExl3Params;
+enum { FLINT_GROUPED_SMALL_SPLITS = 4 };
 typedef struct {
   const ExpertProjection* table;
   const int *tile_expert, *tile_begin, *tile_end, *num_tiles;
   const float* rotated;
   float* projected;
   int max_tiles;
-  int k, n;
+  int k, n, max_rows_per_tile, splits;
 } GroupedExl3GemmParams;
 
+int flint_exl3_dense_splits(int rows, int k);
+int flint_exl3_dense_matmul(DenseExl3Params p, void* stream);
+int flint_wht128_scale_out_split(WhtParams p, int splits, void* stream);
 int flint_exl3_grouped_gemm(GroupedExl3GemmParams p, void* stream);
 int flint_exl3_grouped_gemm_tile_rows(void);
 int flint_exl3_grouped_rotate(ExpertSelection experts, WhtParams p, int input, const int* row_map,
-                              void* stream);
+                              int splits, void* stream);
 int flint_exl3_indexed_gemv(ExpertSelection experts, const float* rotated, float* partial, int k,
                             int n, void* stream);
 int flint_exl3_indexed_rotate(ExpertSelection expert, WhtParams p, int input, int broadcast,

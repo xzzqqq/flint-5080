@@ -39,30 +39,24 @@ int Launch(NormParams p, void* s) {
   return cudaGetLastError();
 }
 __global__ void Head(HeadParams p) {
-  __shared__ float maxima[256];
-  __shared__ int indices[256];
-  int t = blockIdx.x, lane = threadIdx.x, id = lane;
-  float best = -__int_as_float(0x7f800000);
-  for (int i = lane; i < p.vocab; i += blockDim.x) {
+  int t = blockIdx.y, first = blockIdx.x * blockDim.x + threadIdx.x;
+  HeadWinner best{-__int_as_float(0x7f800000), first};
+  for (int i = first; i < p.vocab; i += gridDim.x * blockDim.x) {
     float y = 30.f * tanhf(Read(p.x, t * p.stride + i, p.input) * (1.f / 30.f));
-    p.logits[t * p.vocab + i] = y;
-    if (y > best) {
-      best = y;
-      id = i;
-    }
+    if (p.logits) p.logits[t * p.vocab + i] = y;
+    if (y > best.value) best = {y, i};
   }
-  maxima[lane] = best;
-  indices[lane] = id;
-  __syncthreads();
-  for (int d = 128; d; d /= 2) {
-    if (lane < d && (maxima[lane + d] > maxima[lane] ||
-                     (maxima[lane + d] == maxima[lane] && indices[lane + d] < indices[lane]))) {
-      maxima[lane] = maxima[lane + d];
-      indices[lane] = indices[lane + d];
-    }
-    __syncthreads();
+  best = flint::head::BlockWinner(best);
+  if (threadIdx.x == 0) {
+    if (p.reduce_scratch)
+      static_cast<HeadWinner*>(p.reduce_scratch)[t * gridDim.x + blockIdx.x] = best;
+    else
+      p.ids[t] = best.token;
   }
-  if (!lane) p.ids[t] = indices[0];
+}
+__global__ void ReduceHead(const HeadWinner* winners, int* ids) {
+  auto best = flint::head::BlockWinner(winners[blockIdx.y * FLINT_HEAD_BLOCKS + threadIdx.x]);
+  if (threadIdx.x == 0) ids[blockIdx.y] = best.token;
 }
 }  // namespace
 int flint_embed_rmsnorm(NormParams p, void* s) {
@@ -79,7 +73,15 @@ int flint_unweighted_rmsnorm(NormParams p, void* s) {
   return Launch(p, s);
 }
 int flint_logit_softcap_argmax(HeadParams p, void* s) {
-  Head<<<p.rows, 256, 0, static_cast<cudaStream_t>(s)>>>(p);
+  int blocks = p.reduce_scratch ? FLINT_HEAD_BLOCKS : 1;
+  Head<<<dim3(blocks, p.rows), 256, 0, static_cast<cudaStream_t>(s)>>>(p);
+  auto status = cudaGetLastError();
+  if (status || !p.reduce_scratch) return status;
+  return flint_reduce_head_winners(static_cast<const HeadWinner*>(p.reduce_scratch), p.ids, p.rows,
+                                   s);
+}
+int flint_reduce_head_winners(const HeadWinner* winners, int* ids, int rows, void* s) {
+  ReduceHead<<<dim3(1, rows), FLINT_HEAD_BLOCKS, 0, static_cast<cudaStream_t>(s)>>>(winners, ids);
   return cudaGetLastError();
 }
 

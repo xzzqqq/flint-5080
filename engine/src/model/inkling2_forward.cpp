@@ -59,6 +59,9 @@ struct GraphKey {
   void *hidden_out, *block_out;
   float* logits_out;
   int32_t* next_token;
+  void* taps_out;
+  uint8_t all_token_logits;
+  bool recording;
   uint8_t use_cuda_graph, use_speculative, return_logits, enable_profiling, profiler_range;
 
   bool operator==(const GraphKey&) const = default;
@@ -78,16 +81,20 @@ struct InklingRunner::Impl {
   cudaStream_t stream{}, owned_stream{};
   cudaEvent_t start{}, stop{};
   std::array<cudaEvent_t, std::extent_v<decltype(ForwardRunResult::stages)> + 1> marks{};
-  cudaGraphExec_t graph{};
-  cudaGraph_t source_graph{};
-  GraphKey key{};
-  ForwardRunResult graph_output{};
+  struct GraphSlot {
+    cudaGraphExec_t graph{};
+    cudaGraph_t source_graph{};
+    GraphKey key{};
+    ForwardRunResult output{};
+    ~GraphSlot() {
+      if (graph) cudaGraphExecDestroy(graph);
+      if (source_graph) cudaGraphDestroy(source_graph);
+    }
+  } decode_graph, verify_graph;
   ForwardGraphStats stats{};
   Impl(const ModelWeightsView& w, const KvStateArenaView& k)
       : weights(w), kv(k), plan(BuildVisitPlan(w.config)) {}
   ~Impl() {
-    if (graph) cudaGraphExecDestroy(graph);
-    if (source_graph) cudaGraphDestroy(source_graph);
     gemm.reset();
     if (host_token) cudaFreeHost(host_token);
     for (auto e : marks)
@@ -98,7 +105,7 @@ struct InklingRunner::Impl {
   }
   void RunInkling(const ForwardRunSpec&, const ForwardOptions&, ForwardRunResult&,
                   const ForwardCapture*);
-  void PrepareGraph(const ForwardRunSpec&, const ForwardOptions&);
+  void PrepareGraph(GraphSlot&, const ForwardRunSpec&, const ForwardOptions&);
 };
 InklingRunner::InklingRunner(const ModelWeightsView& w, const KvStateArenaView& kv,
                              ScratchArenaView scratch, cudaStream_t stream)
@@ -133,7 +140,7 @@ void InklingRunner::Impl::RunInkling(const ForwardRunSpec& s, const ForwardOptio
                                      ForwardRunResult& result, const ForwardCapture* capture) {
   const auto& g = *gemm;
   const auto& w = weights;
-  const auto* d_pos = s.is_decode && s.seq_len == 1 ? d_decode_pos : nullptr;
+  const auto* d_pos = (recording || (s.is_decode && s.seq_len == 1)) ? d_decode_pos : nullptr;
   const int t = s.seq_len, h = w.config.hidden_size, n = t * h;
   ScratchWorkspace ws(activations);
   auto* hidden = static_cast<uint16_t*>(s.d_hidden_out);
@@ -182,9 +189,6 @@ void InklingRunner::Impl::RunInkling(const ForwardRunSpec& s, const ForwardOptio
   } else
     copy(hidden, s.d_hidden_in, plane);
 
-  // Residual attention returns token-major [T,Q,H]. Gather each query into
-  // a contiguous [T,H] plane for the individual controllers and projections.
-  auto* packed = ws.Take<float>(size_t(4) * n);
   auto* queries = ws.Take<float>(4 * h);
   auto* messages = ws.Take<float>(size_t(4) * n);
   auto* attn = ws.Take<float>(size_t(3) * n);
@@ -193,12 +197,8 @@ void InklingRunner::Impl::RunInkling(const ForwardRunSpec& s, const ForwardOptio
   auto* tmp = ws.Take<uint16_t>(n);
   auto aggregate = [&](const uint16_t* blocks, int nb, const void* x, FlintType type,
                        const float* query, int q, float* dst) {
-    RunBlockResidual(g, ws.rest,
-                     {blocks, x, query, q == 1 ? dst : packed, nb, t, h, q, FLINT_BF16, type});
-    if (q > 1)
-      for (int j = 0; j < q; ++j)
-        CheckCuda(cudaMemcpy2DAsync(dst + size_t(j) * n, h * 4, packed + j * h, q * h * 4, h * 4, t,
-                                    cudaMemcpyDeviceToDevice, stream));
+    CheckCuda(flint_block_residual_fused({blocks, x, query, dst, nb, t, h, q, FLINT_BF16, type}, 1,
+                                         stream));
   };
   auto norm = [&](const void* x, FlintType type, const void* weight, uint16_t* dst) {
     CheckCuda(flint_rmsnorm({x, weight, dst, nullptr, t, h, type, FLINT_BF16}, stream));
@@ -285,25 +285,25 @@ void InklingRunner::Impl::RunInkling(const ForwardRunSpec& s, const ForwardOptio
     if (!s.run_lm_head) return;
     int rows = s.all_token_logits ? t : 1;
     int vocab = w.config.unpadded_vocab_size;
-    // The parity GEMM uses 32-row tiles. Reuse one tile even when all logits
-    // from a long prefill are requested.
+    // Bound head scratch when returning every logit row for long prompts.
     int tile = std::min(rows, 32);
-    auto* raw = ws.Take<float>(size_t(tile) * vocab);
     auto* rounded = ws.Take<uint16_t>(size_t(tile) * vocab);
+    auto* winners = ws.Take<HeadWinner>(tile * FLINT_HEAD_BLOCKS);
     for (int row = 0; row < rows; row += tile) {
       int count = std::min(tile, rows - row);
-      RunParityRowMatmul(g, ws.rest, hidden + size_t(t - rows + row) * h, w.unembed_weight, raw,
-                         count, vocab, h, FLINT_BF16, FLINT_F32, true);
-      CheckCuda(flint_cast({raw, rounded, count * vocab, FLINT_F32, FLINT_BF16}, stream));
-      float* logits = o.return_logits ? s.d_logits_out + size_t(row) * vocab : raw;
+      g.Multiply(hidden + size_t(t - rows + row) * h, w.unembed_weight, rounded, count, vocab, h,
+                 FLINT_BF16, FLINT_BF16, true);
+      float* logits = o.return_logits ? s.d_logits_out + size_t(row) * vocab : nullptr;
       CheckCuda(flint_logit_softcap_argmax(
-          {rounded, logits, s.d_next_token + row, count, vocab, vocab, FLINT_BF16}, stream));
+          {rounded, logits, s.d_next_token + row, count, vocab, vocab, FLINT_BF16, winners},
+          stream));
     }
     stage("lm_head", 2ull * h * vocab + 6ull * h);
   }
 }
 
-void InklingRunner::Impl::PrepareGraph(const ForwardRunSpec& batch, const ForwardOptions& opts) {
+void InklingRunner::Impl::PrepareGraph(GraphSlot& slot, const ForwardRunSpec& batch,
+                                       const ForwardOptions& opts) {
   // Position is uploaded before each launch. KV reset also runs outside capture.
   auto captured = batch;
   captured.pos_offset = 0;
@@ -322,11 +322,15 @@ void InklingRunner::Impl::PrepareGraph(const ForwardRunSpec& batch, const Forwar
                            .block_out = batch.d_block_out,
                            .logits_out = batch.d_logits_out,
                            .next_token = batch.d_next_token,
+                           .taps_out = batch.d_taps_out,
+                           .all_token_logits = batch.all_token_logits,
+                           .recording = recording,
                            .use_cuda_graph = opts.use_cuda_graph,
                            .use_speculative = opts.use_speculative,
                            .return_logits = opts.return_logits,
                            .enable_profiling = opts.enable_profiling,
                            .profiler_range = opts.profiler_range};
+  auto& [graph, source_graph, key, graph_output] = slot;
   if (graph && key == requested) return;
   if (graph) {
     CheckCuda(cudaGraphExecDestroy(graph));
@@ -364,22 +368,23 @@ ForwardRunResult InklingRunner::Run(const ForwardRunSpec& batch, const ForwardOp
     throw std::invalid_argument("missing all-row token output");
   if (s.run_lm_head && !s.d_next_token) s.d_next_token = c.d_next_token;
   bool decode = s.is_decode && s.seq_len == 1;
-  bool graph = o.use_cuda_graph && decode && !capture && !s.d_taps_out && !c.recording &&
+  bool graph = o.use_cuda_graph && (decode || (c.recording && s.seq_len <= 8)) && !capture &&
                !o.enable_profiling;
+  auto& slot = c.recording ? c.verify_graph : c.decode_graph;
   ForwardRunResult r{};
   if (graph) {
-    c.PrepareGraph(s, o);
-    r = c.graph_output;
+    c.PrepareGraph(slot, s, o);
+    r = slot.output;
   }
   if (o.profiler_range) CheckCuda(cudaProfilerStart());
   try {
     CheckCuda(cudaEventRecord(c.start, c.stream));
-    if (decode)
+    if (decode || c.recording)
       CheckCuda(cudaMemcpyAsync(c.d_decode_pos, &s.pos_offset, sizeof(int32_t),
                                 cudaMemcpyHostToDevice, c.stream));
     if (graph) {
       if (s.reset_kv) CheckCuda(cudaMemsetAsync(c.kv.arena_base, 0, c.kv.arena_bytes, c.stream));
-      CheckCuda(cudaGraphLaunch(c.graph, c.stream));
+      CheckCuda(cudaGraphLaunch(slot.graph, c.stream));
       ++c.stats.launches;
     } else
       c.RunInkling(s, o, r, capture);

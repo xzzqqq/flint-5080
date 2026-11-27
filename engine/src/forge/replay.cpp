@@ -107,6 +107,9 @@ Replay::Replay(DaemonConfig cfg) : config_(std::move(cfg)) {
           spec.d_taps_out = taps_;
           int anchor = a->Run(spec, {}).next_token_id;
           a->StoreContext(taps_, 1, 0);
+          RunSpecRound(*a, anchor, taps_, 1, false);
+          anchor = b->Run(spec, {}).next_token_id;
+          b->StoreContext(taps_, 1, 0);
           RunSpecRound(*b, anchor, taps_, 1, false);
         }
       }
@@ -492,7 +495,7 @@ Replay::SpecRound Replay::RunSpecRound(ForwardModule& candidate, int anchor, con
     Upload(stream_, ids_, round.block);
     auto s = Spec(0, model::kNumLogicalVisits, 8, pos, true, true);
     s.d_taps_out = taps_;
-    candidate.Verify(s);
+    candidate.Verify(s, candidate.speculative_options);
     round.verified = Read(next_, 8);
     uint64_t seed = 0;
     auto result = VerifySpeculative(std::span(round.block).subspan(1), round.verified, {}, {},
@@ -566,6 +569,8 @@ Object Replay::MeasureSpeculative(const Json& q, const std::string& cmd, const M
   save_ring(kv.mtp_swa_kv, kv.mtp_swa_window, 4);
   auto a = Load(q.at(cmd == "ab" ? "so_a" : "so_path").as<std::string>());
   auto b = cmd == "ab" ? Load(q.at("so_b").as<std::string>()) : std::nullopt;
+  a->speculative_options.use_cuda_graph = q.get("use_cuda_graph", true);
+  if (b) b->speculative_options = a->speculative_options;
   SpecRound result;
   bool profile = false;
   auto round = [&](ForwardModule& candidate) {
@@ -611,6 +616,8 @@ Object Replay::MeasureSpeculative(const Json& q, const std::string& cmd, const M
     reply["speedup"] = median / second;
     reply["delta_ms"] = median - second;
   }
+  a->ReportGraphStats(reply, b ? "graph_a" : "graph");
+  if (b) b->ReportGraphStats(reply, "graph_b");
   auto& emitted = result.emitted;
   reply["spec_accepted"] = emitted.size() - 1;
   reply["tokens_emitted"] = emitted.size();

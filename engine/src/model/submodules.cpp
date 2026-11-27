@@ -1,7 +1,6 @@
 #include "model/submodules.h"
 
 #include <algorithm>
-#include <cmath>
 #include <stdexcept>
 
 #include "common/cuda_check.h"
@@ -16,26 +15,36 @@ namespace flint {
 void RunParityRowMatmul(const Gemm& g, ScratchArenaView scratch, const void* a, const void* b,
                         void* c, int m, int n, int k, FlintType input, FlintType output,
                         bool transpose) {
-  ScratchWorkspace ws(scratch);
+  // Bounded verification must compute an accepted row using the same
+  // projection as the corresponding row of a full eight-token block.
   size_t stride_a = size_t(k) * (input == FLINT_F32 ? 4 : 2),
          stride_c = size_t(n) * (output == FLINT_F32 ? 4 : 2);
   auto x = static_cast<const char*>(a);
   auto y = static_cast<char*>(c);
-  while (m >= 32) {
-    g.Multiply(x, b, y, 32, n, k, input, output, transpose);
-    x += 32 * stride_a;
-    y += 32 * stride_c;
-    m -= 32;
+  while (m >= 8) {
+    g.Multiply(x, b, y, 8, n, k, input, output, transpose);
+    x += 8 * stride_a;
+    y += 8 * stride_c;
+    m -= 8;
   }
   if (!m) return;
-  auto padded = ws.Take<char>(32 * stride_a), out = ws.Take<char>(32 * stride_c);
+  if (m == 1) {
+    g.Multiply(x, b, y, 1, n, k, input, output, transpose);
+    return;
+  }
+  ScratchWorkspace ws(scratch);
+  auto padded = ws.Take<char>(8 * stride_a), out = ws.Take<char>(8 * stride_c);
   CheckCuda(cudaMemcpyAsync(padded, x, m * stride_a, cudaMemcpyDeviceToDevice, g.stream()));
-  CheckCuda(cudaMemsetAsync(padded + m * stride_a, 0, (32 - m) * stride_a, g.stream()));
-  g.Multiply(padded, b, out, 32, n, k, input, output, transpose);
+  CheckCuda(cudaMemsetAsync(padded + m * stride_a, 0, (8 - m) * stride_a, g.stream()));
+  g.Multiply(padded, b, out, 8, n, k, input, output, transpose);
   CheckCuda(cudaMemcpyAsync(y, out, m * stride_c, cudaMemcpyDeviceToDevice, g.stream()));
 }
 void RunFp32Linear(const Gemm& g, ScratchArenaView scratch, const void* x, FlintType input,
                    const void* weight, FlintType weight_type, float* out, int rows, int n, int k) {
+  if (input == FLINT_BF16 && weight_type == FLINT_BF16) {
+    RunParityRowMatmul(g, scratch, x, weight, out, rows, n, k, FLINT_BF16, FLINT_F32, true);
+    return;
+  }
   ScratchWorkspace ws(scratch);
   auto promote = [&](const void* src, FlintType type, int count) -> const void* {
     if (type == FLINT_F32) return src;
@@ -45,7 +54,7 @@ void RunFp32Linear(const Gemm& g, ScratchArenaView scratch, const void* x, Flint
   };
   auto a = promote(x, input, rows * k);
   auto b = promote(weight, weight_type, n * k);
-  RunParityRowMatmul(g, ws.rest, a, b, out, rows, n, k, FLINT_F32, FLINT_F32, true);
+  g.Multiply(a, b, out, rows, n, k, FLINT_F32, FLINT_F32, true);
 }
 
 void RunExl3Linear(const Gemm& g, ScratchArenaView scratch, const Exl3MatrixView& mat,
@@ -53,20 +62,18 @@ void RunExl3Linear(const Gemm& g, ScratchArenaView scratch, const Exl3MatrixView
   ScratchWorkspace ws(scratch);
   auto s = g.stream();
   int k = mat.k, n = mat.n;
-  auto inner = ws.Take<uint16_t>(k * n);
-  auto weight = ws.Take<float>(k * n);
-  auto rotated = ws.Take<float>((size_t)rows * k);
-  auto projected = ws.Take<float>((size_t)rows * n);
-  CheckCuda(flint_exl3_decode_inner_f16({mat.trellis, inner, k, n, mat.k2}, s));
-  CheckCuda(flint_cast({inner, weight, k * n, FLINT_F16, FLINT_F32}, s));
+  int splits = flint_exl3_dense_splits(rows, k);
+  auto rotated = ws.Take<float>(size_t(rows) * k);
+  auto projected = ws.Take<float>(size_t(rows) * splits * n);
   CheckCuda(flint_wht128_scale_in({x, mat.suh, rotated, rows, k, input, FLINT_F32}, s));
-  RunParityRowMatmul(g, ws.rest, rotated, weight, projected, rows, n, k, FLINT_F32, FLINT_F32,
-                     false);
-  CheckCuda(flint_wht128_scale_out({projected, mat.svh, y, rows, n, FLINT_F32, output}, s));
+  CheckCuda(
+      flint_exl3_dense_matmul({mat.trellis, rotated, projected, rows, k, n, mat.k2, splits}, s));
+  CheckCuda(
+      flint_wht128_scale_out_split({projected, mat.svh, y, rows, n, FLINT_F32, output}, splits, s));
 }
 namespace {
 void AttentionChunk(const Gemm& g, ScratchArenaView scratch, const LayerWeightsView& l,
-                    const KvStateArenaView& cache, AttentionBatch b, bool full) {
+                    const KvStateArenaView& cache, AttentionBatch b, bool full, int chunk_offset) {
   int t = b.tokens;
   auto [ck, cv, cap] = VisitKvCache(cache, b.visit);
   auto s = g.stream();
@@ -80,9 +87,9 @@ void AttentionChunk(const Gemm& g, ScratchArenaView scratch, const LayerWeightsV
   auto gated = ws.Take<uint16_t>(size_t(t) * model::kQDim),
        gate = ws.Take<uint16_t>(size_t(t) * model::kQDim);
   auto delta = ws.Take<uint16_t>(t * model::kDynConvProjDim);
-  auto scores = ws.Take<float>(size_t(cap) * model::kNumQHeads);
   RunExl3Linear(g, ws.rest, l.q_proj, b.q, q, t);
-  CheckCuda(flint_q_norm_clip({q, l.q_l2_clip_scale, q, t, b.position, full, b.d_pos}, s));
+  CheckCuda(
+      flint_q_norm_clip({q, l.q_l2_clip_scale, q, t, b.position, full, b.d_pos, chunk_offset}, s));
   for (int j = 0; j < 2; ++j) {
     const void* input = j ? b.v : b.k;
     auto kv = j ? v : k;
@@ -105,28 +112,30 @@ void AttentionChunk(const Gemm& g, ScratchArenaView scratch, const LayerWeightsV
     } else
       CheckCuda(flint_static_sconv(conv, s));
   }
-  CheckCuda(flint_k_l2_clip({k, nullptr, k, t, b.position, 0}, s));
+  CheckCuda(flint_k_l2_clip({k, nullptr, k, t, b.position, 0, b.d_pos, chunk_offset}, s));
   CheckCuda(flint_unweighted_rmsnorm(
       {v, nullptr, v, nullptr, t * model::kNumKvHeads, model::kHeadDim, FLINT_BF16, FLINT_BF16},
       s));
   RunParityRowMatmul(g, ws.rest, b.q, l.wr_du, rel, t, model::kRelProjDim, model::kHiddenSize,
                      FLINT_BF16, FLINT_BF16, true);
-  CheckCuda(flint_rel_norm_clip({rel, l.rel_l2_clip_scale, rel, t, b.position, full, b.d_pos}, s));
+  CheckCuda(flint_rel_norm_clip(
+      {rel, l.rel_l2_clip_scale, rel, t, b.position, full, b.d_pos, chunk_offset}, s));
   RunParityRowMatmul(g, ws.rest, rel, l.rel_logits_proj, bias, t * model::kNumQHeads,
                      model::kRelExtent, model::kRelDim, FLINT_BF16, FLINT_BF16, false);
   RunParityRowMatmul(g, ws.rest, b.q, l.attn_sink_proj, sink, t, model::kNumQHeads,
                      model::kHiddenSize, FLINT_BF16, FLINT_BF16, true);
-  // Interleave writes and reads so later prefill tokens cannot evict a visible key.
-  for (int row = 0; row < t; ++row) {
-    CheckCuda(flint_kv_cache_write({k + row * model::kKvDim, v + row * model::kKvDim, ck, cv, 1,
-                                    b.position + row, cap, !full, b.d_pos},
-                                   s));
-    CheckCuda(flint_attention_forward(
-        {q + row * model::kQDim, ck, cv, bias + row * model::kNumQHeads * model::kRelExtent,
-         sink + row * model::kNumQHeads, gated + row * model::kQDim, scores, 1, b.position + row,
-         cap, !full, b.d_pos},
-        s));
-  }
+  int splits = flint_attention_splits(cap);
+  // Partials are dead before the output projections reuse this workspace.
+  ScratchWorkspace attention_ws(ws.rest);
+  float* partials = splits == 1 ? nullptr
+                                : attention_ws.Take<float>(size_t(splits) * t * model::kNumQHeads *
+                                                           FLINT_ATTENTION_PARTIAL);
+  CheckCuda(flint_attention_forward({q, ck, cv, bias, sink, gated, partials, t, b.position, cap,
+                                     !full, b.d_pos, k, v, chunk_offset},
+                                    s));
+  // Commit only after every query has consumed the old SWA window.
+  CheckCuda(
+      flint_kv_cache_write({k, v, ck, cv, t, b.position, cap, !full, b.d_pos, chunk_offset}, s));
   RunExl3Linear(g, ws.rest, l.o_gate_proj, b.q, gate, t);
   CheckCuda(flint_gated_mul_sigmoid({gated, gate, gated, t * model::kQDim}, s));
   RunExl3Linear(g, ws.rest, l.o_proj, gated, b.y, t);
@@ -148,7 +157,7 @@ void Attention(const Gemm& g, ScratchArenaView scratch, const LayerWeightsView& 
         {static_cast<const uint16_t*>(b.q) + offset, static_cast<const uint16_t*>(b.k) + offset,
          static_cast<const uint16_t*>(b.v) + offset, static_cast<uint16_t*>(b.y) + offset, count,
          b.position + row, b.visit, b.d_pos, b.kv_trace},
-        full);
+        full, row);
     row += count;
   }
 }
@@ -173,20 +182,24 @@ void GroupedMoe(cudaStream_t stream, ScratchWorkspace ws, const ExpertProjection
   auto gate_up = ws.Take<uint16_t>(elements);
   auto act = ws.Take<uint16_t>(size_t(rows) * kIntermediateSize);
   auto rotated = ws.Take<float>(elements);
-  auto projected = ws.Take<float>(elements);
+  constexpr int small_splits = FLINT_GROUPED_SMALL_SPLITS;
+  int splits = t <= 8 && max_tiles <= 64 && elements * small_splits * sizeof(float) <= ws.rest.bytes
+                   ? small_splits
+                   : 1;
+  auto projected = ws.Take<float>(elements * splits);
   auto linear = [&](const ExpertProjection* table, const void* input, uint16_t* output, int k,
                     const int* source_rows) {
     ExpertSelection selection{table, group.grouped_expert};
     CheckCuda(flint_exl3_grouped_rotate(selection,
                                         {input, nullptr, rotated, rows, k, FLINT_BF16, FLINT_F32},
-                                        1, source_rows, stream));
-    CheckCuda(
-        flint_exl3_grouped_gemm({table, group.tile_expert, group.tile_begin, group.tile_end,
-                                 group.num_tiles, rotated, projected, max_tiles, k, kHiddenSize},
-                                stream));
+                                        1, source_rows, 1, stream));
+    CheckCuda(flint_exl3_grouped_gemm(
+        {table, group.tile_expert, group.tile_begin, group.tile_end, group.num_tiles, rotated,
+         projected, max_tiles, k, kHiddenSize, std::min(t, tile_rows), splits},
+        stream));
     CheckCuda(flint_exl3_grouped_rotate(
         selection, {projected, nullptr, output, rows, kHiddenSize, FLINT_F32, FLINT_BF16}, 0,
-        nullptr, stream));
+        nullptr, splits, stream));
   };
   linear(experts, x, gate_up, kHiddenSize, group.grouped_token);
   CheckCuda(flint_softcapped_swiglu({gate_up, act, rows, kIntermediateSize}, stream));
@@ -203,22 +216,8 @@ void RunFullAttention(const Gemm& g, ScratchArenaView w, const LayerWeightsView&
                       const KvStateArenaView& c, AttentionBatch b) {
   Attention(g, w, l, c, b, true);
 }
-void RunBlockResidual(const Gemm& g, ScratchArenaView scratch, ResidualParams p) {
-  // Keep the two per-token FP32 matrix products in the reference orientation.
-  // Even one changed BF16 input can select a different expert later in the loop.
-  ScratchWorkspace ws(scratch);
-  int nb = p.num_blocks + 1, h = p.width, nq = p.queries;
-  auto states = ws.Take<float>(size_t(p.tokens) * nb * h);
-  auto scores = ws.Take<float>(size_t(p.tokens) * nq * nb);
-  CheckCuda(flint_residual_norm_states(p, states, g.stream()));
-  for (int t = 0; t < p.tokens; ++t)
-    g.Multiply(p.query, states + t * nb * h, scores + t * nq * nb, nq, nb, h, FLINT_F32, FLINT_F32,
-               true);
-  CheckCuda(
-      flint_residual_softmax(scores, p.tokens * nq, nb, 1.f / std::sqrt(float(h)), g.stream()));
-  for (int t = 0; t < p.tokens; ++t)
-    g.Multiply(scores + t * nq * nb, states + t * nb * h, p.y + t * nq * h, nq, h, nb, FLINT_F32,
-               FLINT_F32, false);
+void RunBlockResidual(const Gemm& g, ScratchArenaView, ResidualParams p) {
+  CheckCuda(flint_block_residual_fused(p, 0, g.stream()));
 }
 void RunMessageGate(const Gemm& g, ScratchArenaView w, const ControllerWeightsView& ctl,
                     const float* x, const float* msg, float* y, int t) {

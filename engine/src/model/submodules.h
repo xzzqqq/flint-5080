@@ -4,10 +4,9 @@
 #include "ops/gemm_cublas.h"
 #include "ops/loop_res_ops.h"
 namespace flint {
-// Promote mixed input/weight types to FP32 in scratch for C = A @ B^T.
+// FP32 accumulation and output for C = A @ B^T.
 void RunFp32Linear(const Gemm&, ScratchArenaView, const void* x, FlintType input,
                    const void* weight, FlintType weight_type, float* out, int rows, int n, int k);
-// Preserve Phase-1 cuBLAS rounding: kernel selection depends on the padded 32-row shape.
 void RunParityRowMatmul(const Gemm&, ScratchArenaView, const void* a, const void* b, void* c,
                         int rows, int n, int k, FlintType input, FlintType output, bool transpose);
 

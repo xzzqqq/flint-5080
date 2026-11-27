@@ -28,6 +28,8 @@ typedef struct {
   float* y;
   int layer, width;
 } MergeParams;
+/* y: [tokens,queries,width], or [queries,tokens,width] when query_major is set. */
+int flint_block_residual_fused(ResidualParams p, int query_major, void* stream);
 int flint_residual_norm_states(ResidualParams p, float* states, void* stream);
 int flint_residual_softmax(float* scores, int rows, int states, float scale, void* stream);
 int flint_message_gate_prep(PrepParams p, void* cuda_stream);

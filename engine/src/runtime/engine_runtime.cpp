@@ -106,7 +106,6 @@ std::unique_ptr<T, FreePinned> AllocatePinned(size_t count) {
 
 constexpr uint32_t kBlock = model::kMtpConfig.block_size;
 constexpr size_t kTap = 4 * model::kHiddenSize;
-constexpr size_t kDraftWorkspaceBytes = 32ull << 20;
 constexpr size_t kVocab = model::kUnpaddedVocabSize;
 PrefixCache AllocatePrefixCache(RuntimeConfig& cfg, const ModelConfig& c, bool with_mtp) {
   size_t free, total;
@@ -137,17 +136,22 @@ class ModelExecutor {
         weights_(WeightsArena::Load(cfg.model_dir, stream, cfg.use_speculative)),
         active_(weights_.view().has_mtp),
         rows_(active_ ? std::max(kBlock, cfg.prefill_chunk_size) : cfg.prefill_chunk_size),
-        scratch_(ScratchArena::Allocate(cfg.scratch_bytes)),
-        io_(ScratchArena::Allocate(
-            rows_ * (model::kHiddenSize * sizeof(uint16_t) + sizeof(int32_t)) +
-            kVocab * sizeof(float) * (active_ ? kBlock : 1) + 2048 +
-            (active_ ? (rows_ + 1) * kTap * sizeof(uint16_t) + kDraftWorkspaceBytes : 0))),
+        // The minimum 64 MiB target configuration previously had a separate 32 MiB draft arena.
+        scratch_(ScratchArena::Allocate(active_ ? std::max(cfg.scratch_bytes, size_t{96} << 20)
+                                                : cfg.scratch_bytes)),
+        target_scratch_(scratch_.view()),
+        draft_scratch_(active_ ? DsparkRunner::ReserveScratch(target_scratch_)
+                               : ScratchArenaView{}),
+        io_(ScratchArena::Allocate(rows_ *
+                                       (model::kHiddenSize * sizeof(uint16_t) + sizeof(int32_t)) +
+                                   kVocab * sizeof(float) * (active_ ? kBlock : 1) + 2048 +
+                                   (active_ ? (rows_ + 1) * kTap * sizeof(uint16_t) : 0))),
         cache_(AllocatePrefixCache(cfg, model_config(), active_)),
         host_ids_(AllocatePinned<int32_t>(rows_)),
         host_logits_(AllocatePinned<float>(kVocab * (active_ ? kBlock : 1))),
         kv_(KvStateArena::Allocate(model_config(), cfg.max_context + (active_ ? kBlock - 1 : 0),
                                    active_)),
-        runner_(weights_.view(), kv_.view(), scratch_.view(), stream) {
+        runner_(weights_.view(), kv_.view(), target_scratch_, stream) {
     ScratchWorkspace ws(io_.view());
     ids_ = ws.Take<int32_t>(rows_);
     hidden_ = ws.Take<uint16_t>(rows_ * model::kHiddenSize);
@@ -159,9 +163,7 @@ class ModelExecutor {
       host_tap_ = AllocatePinned<uint16_t>(kTap);
       host_next_ = AllocatePinned<int32_t>(kBlock);
       draft_logits_ = AllocatePinned<float>((kBlock - 1) * kVocab);
-      dspark_.emplace(weights_.view(), kv_.view(),
-                      ScratchArenaView{ws.Take<char>(kDraftWorkspaceBytes), kDraftWorkspaceBytes},
-                      stream);
+      dspark_.emplace(weights_.view(), kv_.view(), draft_scratch_, stream);
     }
   }
 
@@ -198,7 +200,9 @@ class ModelExecutor {
   WeightsArena weights_;
   const bool active_;
   const size_t rows_;
-  ScratchArena scratch_, io_;
+  ScratchArena scratch_;
+  ScratchArenaView target_scratch_, draft_scratch_;
+  ScratchArena io_;
   PrefixCache cache_;
   std::unique_ptr<int32_t, FreePinned> host_ids_;
   std::unique_ptr<float, FreePinned> host_logits_;
@@ -236,7 +240,7 @@ int32_t ModelExecutor::Forward(RequestParams& params, std::span<const int32_t> i
                             .d_logits_out = logits_,
                             .d_next_token = next_,
                             .d_taps_out = taps_};
-  const ForwardOptions opts{.use_cuda_graph = decode && !active_ && config_.use_cuda_graph,
+  const ForwardOptions opts{.use_cuda_graph = decode && config_.use_cuda_graph,
                             .return_logits = head && (stochastic || (!decode && cache_.enabled()))};
   const auto out = runner_.Run(spec, opts);
   if (active_) StoreContext(input.size(), position);
@@ -308,7 +312,7 @@ void ModelExecutor::SpecRound(Request& r, uint32_t& pos, int32_t& anchor) {
     dspark_->DraftWithLogits(anchor, last_tap_, pos, block.data() + 1, draft_logits_.get(),
                              [&](auto row) { return Sample(p, row); });
   else
-    dspark_->DraftGreedy(anchor, last_tap_, pos, block.data() + 1);
+    dspark_->DraftGreedy(anchor, last_tap_, pos, block.data() + 1, nullptr, config_.use_cuda_graph);
   auto input = block.first(len);
   CheckCuda(
       cudaMemcpyAsync(ids_, input.data(), input.size_bytes(), cudaMemcpyHostToDevice, stream_));
@@ -319,7 +323,11 @@ void ModelExecutor::SpecRound(Request& r, uint32_t& pos, int32_t& anchor) {
                      .d_logits_out = logits_,
                      .d_next_token = next_,
                      .d_taps_out = taps_},
-                    {.return_logits = stochastic});
+                    {.use_cuda_graph = config_.use_cuda_graph, .return_logits = stochastic});
+  if (config_.use_cuda_graph) {
+    std::lock_guard lock(graph_mutex_);
+    graphs_ = runner_.graph_stats();
+  }
   SpeculativeResult result;
   try {
     std::span<int32_t> argmax(host_next_.get(), len);
