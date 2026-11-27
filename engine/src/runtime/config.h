@@ -1,5 +1,6 @@
 #pragma once
 #include "common/json.h"
+#include "loader/model_constants.h"
 
 namespace flint {
 struct RuntimeConfig {
@@ -7,6 +8,7 @@ struct RuntimeConfig {
   uint32_t max_context = 0, prefill_chunk_size = 256;
   size_t scratch_bytes = 450ull << 20, vram_reserve_bytes = 512ull << 20;
   uint32_t prefix_cache_slots = 3;
+  uint32_t spec_verify_len = 8;
   bool use_cuda_graph = true;
   bool use_speculative = true;
 
@@ -30,8 +32,11 @@ struct RuntimeConfig {
     read("scratch_bytes", c.scratch_bytes);
     read("vram_reserve_bytes", c.vram_reserve_bytes);
     read("prefix_cache_slots", c.prefix_cache_slots);
+    read("spec_verify_len", c.spec_verify_len);
     read("use_cuda_graph", c.use_cuda_graph);
     read("use_speculative", c.use_speculative);
+    if (c.spec_verify_len < 2 || c.spec_verify_len > model::kDraftConfig.block_size)
+      throw std::invalid_argument("spec_verify_len must be in [2, 8]");
     if (!c.prefill_chunk_size || c.prefill_chunk_size > 2048)
       throw std::invalid_argument("prefill_chunk_size must be in [1, 2048]");
     if (c.scratch_bytes < (64ull << 20))

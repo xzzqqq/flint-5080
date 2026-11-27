@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define FLINT_ENGINE_ABI_VERSION 2u
+#define FLINT_ENGINE_ABI_VERSION 3u
 
 /* All CUDA and request state is private to the engine. */
 typedef struct EngineHandle EngineHandle;
@@ -44,6 +44,7 @@ typedef struct EngineTelemetry {
   double decode_ms;
   uint32_t decode_rounds;
   uint32_t spec_accepted;
+  uint32_t spec_accept_hist[8]; /* Speculative rounds by number of emitted draft tokens. */
 } EngineTelemetry;
 
 /* All pointers in an event are borrowed for the duration of the callback.

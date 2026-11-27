@@ -98,6 +98,8 @@ def test_serve_lifecycle(local, monkeypatch):
         "64",
         "--prefix-cache-slots",
         "1",
+        "--spec-verify-len",
+        "6",
         "--request-timeout-sec",
         "0",
         "--no-cuda-graph",
@@ -116,6 +118,8 @@ def test_serve_lifecycle(local, monkeypatch):
         "64",
         "--prefix-cache-slots",
         "1",
+        "--spec-verify-len",
+        "6",
         "--request-timeout-sec",
         "0",
         "--no-cuda-graph",
@@ -222,9 +226,10 @@ def test_restart_stopped_and_running(local):
     cfg, run, binary = local
     install(binary)
     first = run("restart", "--model-name", "stubborn")
-    fresh = run("restart", "--force", "--model-name", "fresh", "--no-spec")
+    fresh = run("restart", "--force", "--model-name", "fresh", "--spec-verify-len", "4")
     assert first["pid"] != fresh["pid"] and fresh["action"] == "restart"
-    assert fresh["ready"]["model"] == "fresh" and "--no-spec" in fresh["ready"]["argv"]
+    assert fresh["ready"]["model"] == "fresh"
+    assert fresh["ready"]["argv"][-2:] == ["--spec-verify-len", "4"]
     assert run("status")["lease"]["record"]["pid"] == fresh["pid"]
     run("stop")
     assert not Path(cfg.shared.lock_file).exists()

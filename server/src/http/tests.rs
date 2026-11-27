@@ -48,6 +48,7 @@ fn script_engine(text: &str, end_reason: EngineStopReason) -> Engine {
         let mut t = Telemetry {
             prefill_tokens: req.token_ids.len() as u32,
             cached_prefix_tokens: 2,
+            spec_accept_hist: [1, 0, 2, 0, 0, 0, 0, 0],
             prefill_ms: 1.5,
             decode_ms: 2.25,
             ..Default::default()
@@ -130,6 +131,12 @@ async fn chat_formats_and_usage_opt_in() {
             Some(5 + body["usage"]["completion_tokens"].as_u64().unwrap())
         );
         assert_eq!(body.get("x_flint_telemetry").is_some(), opted);
+        if opted {
+            assert_eq!(
+                body["x_flint_telemetry"]["spec_accept_hist"],
+                json!([1, 0, 2, 0, 0, 0, 0, 0])
+            );
+        }
         for usage in [false, true] {
             let res = router
                 .clone()

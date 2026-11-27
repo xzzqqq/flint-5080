@@ -36,6 +36,7 @@ class PrefixCache {
             std::span<const float> last_logits, cudaStream_t stream);
   void OnKvWrite(uint32_t write_pos);
   void AppendLive(std::span<const int32_t> tokens);
+  void DiscardLive() { live_tokens_.clear(); }
   void InvalidateAll();
 
  private:

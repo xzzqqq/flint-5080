@@ -75,10 +75,16 @@ struct Request {
     if (telemetry.decode_tokens + count == params.max_tokens) stop_reason = ENGINE_STOP_MAX_TOKENS;
     return tokens.first(count);
   }
-  void EmitBatch(std::span<const int32_t> visible, uint32_t accepted = 0) {
-    if (cancelled || visible.empty()) return;
+  void EmitBatch(std::span<const int32_t> visible,
+                 std::optional<uint32_t> accepted = std::nullopt) {
+    if (cancelled) visible = {};
+    if (accepted) {
+      const auto emitted = std::min<size_t>(*accepted, visible.size());
+      telemetry.spec_accepted += emitted;
+      ++telemetry.spec_accept_hist[emitted];
+    }
+    if (visible.empty()) return;
     telemetry.decode_tokens += visible.size();
-    telemetry.spec_accepted += std::min<size_t>(accepted, visible.size());
     EngineEvent event{.req_id = id,
                       .kind = ENGINE_EVENT_TOKENS,
                       .stop_reason = ENGINE_STOP_NONE,
@@ -177,7 +183,7 @@ class ModelExecutor {
  private:
   enum class Phase { kPrefill, kDecode };
   int32_t Forward(RequestParams&, std::span<const int32_t> input, uint32_t position, Phase,
-                  bool head);
+                  bool head, bool capture_taps);
   int32_t Sample(RequestParams& params, std::span<const float> logits) {
     return sampler_.Sample(logits, params.temperature, params.top_k, params.top_p, params.seed);
   }
@@ -212,7 +218,7 @@ class ModelExecutor {
 };
 
 int32_t ModelExecutor::Forward(RequestParams& params, std::span<const int32_t> input,
-                               uint32_t position, Phase phase, bool head) {
+                               uint32_t position, Phase phase, bool head, bool capture_taps) {
   std::ranges::copy(input, host_ids_.get());
   CheckCuda(
       cudaMemcpyAsync(ids_, host_ids_.get(), input.size_bytes(), cudaMemcpyHostToDevice, stream_));
@@ -229,11 +235,10 @@ int32_t ModelExecutor::Forward(RequestParams& params, std::span<const int32_t> i
                             .d_hidden_out = hidden_,
                             .d_logits_out = logits_,
                             .d_next_token = next_,
-                            .d_taps_out = taps_};
+                            .d_taps_out = capture_taps ? taps_ : nullptr};
   const ForwardOptions opts{.use_cuda_graph = decode && config_.use_cuda_graph,
                             .return_logits = head && (stochastic || (!decode && cache_.enabled()))};
   const auto out = runner_.Run(spec, opts);
-  if (active_) StoreContext(input.size(), position);
   if (opts.use_cuda_graph) {
     std::lock_guard lock(graph_mutex_);
     graphs_ = runner_.graph_stats();
@@ -258,12 +263,22 @@ DecodeState ModelExecutor::Prefill(Request& r) {
     token = Sample(r.params, cache_.SlotLogits(plan.logits_slot));
   } else {
     cache_.OnKvWrite(pos);
+    uint32_t last_complete_pos = pos;
+    uint32_t draft_contiguous_from = model::DraftContextStart(pos);
     while (pos < prompt.size() && !r.cancelled) {
       uint32_t chunk = std::min(config_.prefill_chunk_size, uint32_t(prompt.size()) - pos);
       if (plan.pin_pos > pos) chunk = std::min(chunk, plan.pin_pos - pos);
       auto input = prompt.subspan(pos, chunk);
-      bool last = pos + chunk == prompt.size();
-      token = Forward(r.params, input, pos, Phase::kPrefill, last);
+      const uint32_t end = pos + chunk;
+      const bool last = end == prompt.size();
+      const uint32_t target_end =
+          cache_.enabled() && end <= plan.pin_pos ? plan.pin_pos : prompt.size();
+      const uint32_t lo = std::max(pos, model::DraftContextStart(target_end));
+      const bool capture = active_ && lo < end;
+      token = Forward(r.params, input, pos, Phase::kPrefill, last, capture);
+      if (capture) dflash2_->StoreContextKv(taps_ + size_t(lo - pos) * kTap, end - lo, lo);
+      if (lo > pos) draft_contiguous_from = std::min(lo, end);
+      if (draft_contiguous_from <= model::DraftContextStart(end)) last_complete_pos = end;
       ++r.prefill_chunks;
       pos += chunk;
       cache_.AppendLive(input);
@@ -275,6 +290,12 @@ DecodeState ModelExecutor::Prefill(Request& r) {
         copied_state = true;
       }
     }
+    if (active_ && r.cancelled && pos != last_complete_pos) {
+      cache_.OnKvWrite(last_complete_pos);
+      // The live convolution and ring states have advanced beyond the rewind.
+      // Only a saved snapshot can resume from a nonzero earlier boundary.
+      cache_.DiscardLive();
+    }
   }
   if (copied_state || active_) CheckCuda(cudaStreamSynchronize(stream_));
   t.prefill_ms = Milliseconds(start_prefill);
@@ -285,7 +306,7 @@ void ModelExecutor::SpecRound(Request& r, uint32_t& pos, int32_t& anchor) {
   auto start = Clock::now();
   auto& p = r.params;
   const bool stochastic = p.temperature > 0;
-  const uint32_t len = std::min(kBlock, config_.max_context - pos);
+  const uint32_t len = std::min(config_.spec_verify_len, config_.max_context - pos);
   std::span<int32_t, kBlock> block(host_ids_.get(), kBlock);
   block.front() = anchor;
   ForwardDraftResult proposal;
@@ -365,8 +386,11 @@ void ModelExecutor::Decode(Request& r, DecodeState state) {
     }
     auto start = Clock::now();
     auto fed_token = token;
-    token = Forward(r.params, {&fed_token, 1}, pos, Phase::kDecode, true);
-    if (active_) CheckCuda(cudaStreamSynchronize(stream_));
+    token = Forward(r.params, {&fed_token, 1}, pos, Phase::kDecode, true, active_);
+    if (active_) {
+      StoreContext(1, pos);
+      CheckCuda(cudaStreamSynchronize(stream_));
+    }
     cache_.OnKvWrite(pos);
     cache_.AppendLive({&fed_token, 1});
     ++pos;
@@ -576,6 +600,7 @@ std::string EngineRuntime::StatsJson() const {
                        {"prefill_chunk_size", e.config.prefill_chunk_size},
                        {"use_cuda_graph", e.config.use_cuda_graph},
                        {"use_speculative", e.config.use_speculative},
+                       {"spec_verify_len", e.config.spec_verify_len},
                        {"speculative_active", e.model && e.model->speculative_active()},
                        {"total_prefill_chunks", e.total_prefill_chunks},
                        {"total_prefill_tokens", e.total_prefill_tokens},

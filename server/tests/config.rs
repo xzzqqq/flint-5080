@@ -32,7 +32,7 @@ fn toml_cli_environment_and_engine_defaults() {
     assert_eq!(config.request_timeout, None);
     assert_eq!(
         serde_json::from_str::<Value>(&config.engine_json()).unwrap(),
-        json!({"model_dir":model,"draft_model_dir":"draft","max_context":0,"prefix_cache_slots":3,"prefill_chunk_size":256,"use_cuda_graph":false,"use_speculative":false})
+        json!({"model_dir":model,"draft_model_dir":"draft","max_context":0,"prefix_cache_slots":3,"prefill_chunk_size":256,"spec_verify_len":8,"use_cuda_graph":false,"use_speculative":false})
     );
     fs::write(
         model.join("generation_config.json"),
@@ -56,6 +56,8 @@ fn toml_cli_environment_and_engine_defaults() {
         "alias",
         "--no-cuda-graph=false",
         "--no-spec=false",
+        "--spec-verify-len",
+        "4",
         "--request-timeout-sec",
         "12",
     ])
@@ -66,6 +68,8 @@ fn toml_cli_environment_and_engine_defaults() {
         config.draft_dir.unwrap(),
         std::path::PathBuf::from("override")
     );
+    assert_eq!(config.spec_verify_len, 4);
+    assert!(parse(&["--spec-verify-len", "9"]).resolve(None).is_err());
     assert_eq!(config.temperature, 0.7);
     assert_eq!(config.model_name, "alias");
     assert!(config.use_cuda_graph && config.use_speculative);

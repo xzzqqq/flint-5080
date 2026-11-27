@@ -46,6 +46,7 @@ class Endpoint:
                         "use_cuda_graph": True,
                         "use_speculative": True,
                         "speculative_active": True,
+                        "spec_verify_len": 6,
                         "completed_requests": 101,
                     },
                 },
@@ -108,6 +109,7 @@ class Endpoint:
                 decode_ms=40,
                 decode_rounds=4,
                 spec_accepted=3,
+                spec_accept_hist=[2, 1, 1, 0, 0, 0, 0, 0],
             )
         if not body["stream"]:
             msg = dict(content=content, reasoning_content=reasoning, tool_calls=calls)
@@ -202,6 +204,7 @@ def test_suites(suite, harness, monkeypatch):
         use_cuda_graph=True,
         use_speculative=True,
         speculative_active=True,
+        spec_verify_len=6,
     )
     assert data["metadata"]["canary_passed"] == (True if "canary" in suites else None)
     if "short" in suites:
@@ -218,6 +221,9 @@ def test_suites(suite, harness, monkeypatch):
         for case in data["cases"]["short"].values():
             assert [r["round"] for r in case["samples"]] == [1, 2]
             assert case["summary"]["prefill_ms"] == {"median": 20, "mean": 20, "n": 2}
+            assert case["summary"]["spec_accept_hist"] == [4, 2, 2, 0, 0, 0, 0, 0]
+            assert case["samples"][0]["metrics"]["spec_accept_hist"] == [2, 1, 1, 0, 0, 0, 0, 0]
+        assert data["suite_summary"]["short"]["spec_accept_hist"] == [12, 6, 6, 0, 0, 0, 0, 0]
         assert data["suite_summary"]["short"]["prefill_ms"]["n"] == 6
     if "agent" in suites:
         agent_reqs = [
@@ -325,9 +331,37 @@ def test_model_typo(harness):
     assert not endpoint.chat
 
 
+def test_sampling_overrides(harness):
+    endpoint, invoke, _ = harness
+    options = dict(temperature=0.7, top_p=0.9, top_k=40, seed=0)
+    result = invoke(
+        "run",
+        "--json",
+        "--suite",
+        "all",
+        "--rounds",
+        "1",
+        "--temperature",
+        "0.7",
+        "--top-p",
+        "0.9",
+        "--top-k",
+        "40",
+        "--seed",
+        "0",
+    )
+    assert result["data"]["metadata"]["sampling_overrides"] == options
+    for body in endpoint.chat:
+        if body["messages"][0]["content"].startswith("[bench-"):
+            assert {k: body[k] for k in options} == options
+        else:
+            assert body["temperature"] == 0 and not ({"top_p", "top_k", "seed"} & body.keys())
+
+
 def test_compare(harness):
     endpoint, invoke, repo = harness
     base = invoke("run", "--json", "--suite", "short", "--rounds", "2")
+    base["data"]["metadata"]["sampling_overrides"] = {"seed": 42}
     endpoint.model = "other"
     candidate = invoke("run", "--json", "--suite", "short", "--rounds", "1", "--model", "other")
     # JSON stdout is also a supported input. Give each case a different ratio.
@@ -346,6 +380,7 @@ def test_compare(harness):
     data = result["data"]
     assert any("model:" in w for w in data["warnings"])
     assert any("rounds:" in w for w in data["warnings"])
+    assert any("sampling_overrides:" in w for w in data["warnings"])
     assert "metrics_version: baseline=None, candidate=2" in data["warnings"]
     assert "client_location: baseline='remote_loopback', candidate='local'" in data["warnings"]
     metric = data["metrics"]["prefill_ms"]
@@ -593,6 +628,14 @@ sys.exit(int(failed))
         "short_chat",
         "--case",
         "short_debug",
+        "--temperature",
+        "0.6",
+        "--top-p",
+        "0.8",
+        "--top-k",
+        "32",
+        "--seed",
+        "123",
         "--tag",
         "remote",
         "--json",
@@ -615,6 +658,13 @@ sys.exit(int(failed))
         "short_chat",
         "short_debug",
     ]
+    for flag, value in (
+        ("--temperature", "0.6"),
+        ("--top-p", "0.8"),
+        ("--top-k", "32"),
+        ("--seed", "123"),
+    ):
+        assert argv[argv.index(flag) + 1] == value
     assert argv[argv.index("--tag") + 1] == "remote"
     assert "--api-key-stdin" in argv and "secret-token" not in argv
     assert res["data"]["metadata"]["client_location"] == "remote_loopback"

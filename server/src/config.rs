@@ -26,6 +26,8 @@ pub struct Options {
     pub prefill_chunk_size: Option<u32>,
     #[arg(long)]
     pub prefix_cache_slots: Option<u32>,
+    #[arg(long)]
+    pub spec_verify_len: Option<u32>,
     #[arg(long, num_args=0..=1, require_equals=true, default_missing_value="true")]
     pub no_cuda_graph: Option<bool>,
     #[arg(long, num_args=0..=1, require_equals=true, default_missing_value="true")]
@@ -47,6 +49,7 @@ pub struct Config {
     pub max_context: u32,
     pub prefill_chunk_size: u32,
     pub prefix_cache_slots: u32,
+    pub spec_verify_len: u32,
     pub use_cuda_graph: bool,
     pub use_speculative: bool,
     pub default_max_tokens: u32,
@@ -94,7 +97,12 @@ impl Options {
             .request_timeout_sec
             .or(file.request_timeout_sec)
             .unwrap_or(1800);
+        let spec_verify_len = self.spec_verify_len.or(file.spec_verify_len).unwrap_or(8);
+        if !(2..=8).contains(&spec_verify_len) {
+            return Err("spec_verify_len must be in [2, 8]".into());
+        }
         Ok(Config {
+            spec_verify_len,
             bind: self
                 .bind
                 .or(file.bind)
@@ -132,6 +140,6 @@ impl Config {
     pub fn engine_json(&self) -> String {
         json!({"model_dir": self.model_dir, "draft_model_dir": self.draft_dir.as_deref().unwrap_or(std::path::Path::new("")), "max_context": self.max_context,
             "prefill_chunk_size": self.prefill_chunk_size, "prefix_cache_slots": self.prefix_cache_slots,
-            "use_speculative": self.use_speculative, "use_cuda_graph": self.use_cuda_graph}).to_string()
+            "spec_verify_len": self.spec_verify_len, "use_speculative": self.use_speculative, "use_cuda_graph": self.use_cuda_graph}).to_string()
     }
 }

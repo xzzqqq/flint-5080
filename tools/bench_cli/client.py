@@ -32,6 +32,7 @@ async def probe_ready(url, timeout):
         "use_cuda_graph",
         "use_speculative",
         "speculative_active",
+        "spec_verify_len",
         "prefill_chunk_size",
         "mode",
         "abi_version",
@@ -85,8 +86,9 @@ def record_usage(metrics, frame, telemetry):
             "spec_accepted",
         ):
             metrics[key] = t[key]
-        if "queue_wait_ms" in t:
-            metrics["queue_wait_ms"] = t["queue_wait_ms"]
+        for key in ("queue_wait_ms", "spec_accept_hist"):
+            if key in t:
+                metrics[key] = t[key]
         metrics["telemetry_source"] = "server"
         decode_generated = max(0, t["decode_tokens"] - 1)
         if t["decode_rounds"] > 0:

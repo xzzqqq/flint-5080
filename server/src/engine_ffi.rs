@@ -2,7 +2,7 @@ use serde::Serialize;
 use std::fmt;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
-pub const FLINT_ENGINE_ABI_VERSION: u32 = 2;
+pub const FLINT_ENGINE_ABI_VERSION: u32 = 3;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,6 +42,7 @@ pub struct EngineTelemetry {
     pub decode_ms: f64,
     pub decode_rounds: u32,
     pub spec_accepted: u32,
+    pub spec_accept_hist: [u32; 8],
 }
 
 pub type Telemetry = EngineTelemetry;

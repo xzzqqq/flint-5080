@@ -71,6 +71,7 @@ def build_parser() -> argparse.ArgumentParser:
             "max-context",
             "prefill-chunk-size",
             "prefix-cache-slots",
+            "spec-verify-len",
             "request-timeout-sec",
         ):
             action.add_argument("--" + flag, type=int)

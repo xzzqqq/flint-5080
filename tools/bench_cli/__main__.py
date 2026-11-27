@@ -58,6 +58,8 @@ def build_parser():
         default=1800,
         help="Per-request deadline in seconds (default 1800).",
     )
+    for name, kind in (("temperature", float), ("top-p", float), ("top-k", int), ("seed", int)):
+        run.add_argument(f"--{name}", type=kind, help=f"Override {name} for performance suites.")
     run.add_argument("--bench-file", type=Path, help="Override workloads/bench_cases.json.")
     run.add_argument("--canary-file", type=Path, help="Override workloads/canary_cases.json.")
     run.add_argument(

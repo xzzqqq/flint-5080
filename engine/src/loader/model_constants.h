@@ -44,6 +44,10 @@ inline constexpr DraftConfig kDraftConfig{.hidden_size = kHiddenSize,
                                           .rms_norm_eps = 1e-6f,
                                           .rope_theta = 10000.f,
                                           .target_layer_ids = {5, 23, 41, 48}};
+inline constexpr uint32_t kDraftContextWindow = kDraftConfig.sliding_window_size - 1;
+inline constexpr uint32_t DraftContextStart(uint32_t end) {
+  return end > kDraftContextWindow ? end - kDraftContextWindow : 0;
+}
 inline constexpr ModelConfig MakeDefaultInklingConfig() {
   ModelConfig c{};
   c.hidden_size = kHiddenSize;

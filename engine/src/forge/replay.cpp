@@ -591,14 +591,18 @@ void Replay::PreparePrefix(const Measurement& m, bool speculative, Object& reply
   auto baseline = Load(config_.baseline);
   auto& prefix = prefix_.emplace();
   prefix.key = std::move(key);
+  const auto context_start = model::DraftContextStart(length + m.step - 1);
   unsigned rows = 0;
   auto advance = [&](const std::vector<int>& tokens, bool head) {
     rows = tokens.size();
     Upload(stream_, ids_, tokens);
     auto spec = Spec(0, model::kNumLogicalVisits, rows, prefix.position, true, head);
-    if (speculative) spec.d_taps_out = taps_;
+    const auto lo = std::max(prefix.position, context_start);
+    const auto end = prefix.position + rows;
+    if (speculative && lo < end) spec.d_taps_out = taps_;
     auto result = baseline->Run(spec);
-    if (speculative) baseline->StoreContext(taps_, rows, prefix.position);
+    if (spec.d_taps_out)
+      baseline->StoreContext(taps_ + size_t(lo - prefix.position) * 4 * width_, end - lo, lo);
     prefix.position += rows;
     if (head) prefix.generated.push_back(result.next_token_id);
   };

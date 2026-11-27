@@ -21,7 +21,9 @@ specific cases from the selected suites. Use `--tag NAME` to name an archived ru
 | canary | One greedy pass over arithmetic, code, single/multiple tool calls, stop strings and bilingual UTF-8. The parity case also sends one non-streaming request. | All assertions pass, including exact reconstructed content, reasoning and tool-call payloads for parity, excluding request-specific IDs |
 
 Inputs and checks live in `workloads/{bench,canary}_cases.json`. All cases use
-temperature zero. The `agent` cases are a 4-request stratified subset extracted
+temperature zero by default. For performance suites, `bench run` accepts
+`--temperature`, `--top-p`, `--top-k`, and `--seed` for warmup and measured requests.
+The run records the overrides and `bench compare` warns when they differ. The `agent` cases are a 4-request stratified subset extracted
 from `coding_agent_48` (`django__django-11099`, `pydata__xarray-4687`,
 `pallets__flask-5014`, `psf__requests-1142`) with `cache_control` hints stripped.
 The multi-city canary validates every call and records the actual count,
@@ -41,7 +43,8 @@ the returned prompt lengths.
 Use one warmup and three measured rounds per performance case by default.
 Exclude all warmups from samples, counts and statistics. For each available
 numeric metric report median, arithmetic mean and sample count by case and
-suite. A suite summary pools its measured requests.
+suite. Sum the eight `spec_accept_hist` bins elementwise across measured requests.
+Bin k counts speculative rounds that emitted k accepted draft tokens. A suite summary pools its measured requests.
 
 Request `X-Flint-Telemetry: 1` and streaming `stream_options.include_usage`.
 Use the returned `x_flint_telemetry` as the primary engine measurement.

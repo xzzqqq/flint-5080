@@ -7,6 +7,7 @@
 #include <future>
 #include <iomanip>
 #include <iostream>
+#include <numeric>
 #include <thread>
 
 #include "common/cuda_check.h"
@@ -83,21 +84,28 @@ template <class T = uint64_t>
 T Counter(EngineHandle* e, const char* key);
 void ConfigSmoke() {
   auto defaults = RuntimeConfig::Parse("{}");
-  Require(
-      defaults.model_dir.empty() && !defaults.max_context && defaults.prefill_chunk_size == 256 &&
-          defaults.use_speculative && defaults.use_cuda_graph && defaults.prefix_cache_slots == 3 &&
-          defaults.scratch_bytes == (450ull << 20) && defaults.vram_reserve_bytes == (512ull << 20),
-      "config defaults");
+  Require(defaults.model_dir.empty() && !defaults.max_context &&
+              defaults.prefill_chunk_size == 256 && defaults.spec_verify_len == 8 &&
+              defaults.use_speculative && defaults.use_cuda_graph &&
+              defaults.prefix_cache_slots == 3 && defaults.scratch_bytes == (450ull << 20) &&
+              defaults.vram_reserve_bytes == (512ull << 20),
+          "config defaults");
   for (const char* bad :
        {"", "null", "[]", "{}x", "{\"model_dir\":true}", "{\"max_context\":-1}",
         "{\"max_context\":4294967296}", "{\"prefix_cache_slots\":1.2}",
         "{\"vram_reserve_bytes\":\"0\"}", "{\"use_cuda_graph\":1}", "{\"prefill_chunk_size\":0}",
+        "{\"spec_verify_len\":0}", "{\"spec_verify_len\":1}", "{\"spec_verify_len\":9}",
         "{\"prefill_chunk_size\":2049}", "{\"scratch_bytes\":67108863}"}) {
     char* error = nullptr;
     Engine unexpected(engine_create(bad, &error), engine_destroy);
     std::unique_ptr<char, decltype(&engine_string_free)> diagnostic(error, engine_string_free);
     Require(!unexpected && error && *error, "invalid config accepted");
   }
+  for (unsigned width : {4, 6, 8})
+    Require(
+        RuntimeConfig::Parse(Encode(Object{{"spec_verify_len", width}}).c_str()).spec_verify_len ==
+            width,
+        "valid verify width");
   auto e = Create("{}");
   auto r = Run(e.get(), {1}, {.max_tokens = 1});
   Success(r);
@@ -163,6 +171,12 @@ void SpecBoundaries(EngineHandle* e, const std::vector<int32_t>& prompt, const R
               stopped.t.decode_rounds == (first > 1 ? 1u : 2u) &&
               stopped.stop_reason == ENGINE_STOP_STOP_TOKEN,
           "stop inside accepted drafts");
+  p.stop_token_ids = &gold[1];
+  auto empty_round = Run(e, prompt, p);
+  Success(empty_round);
+  Require(empty_round.ids.size() == 1 && empty_round.t.decode_rounds == 1 &&
+              empty_round.t.spec_accepted == 0 && empty_round.t.spec_accept_hist[0] == 1,
+          "first verify prediction stopped");
   p.stop_token_ids = nullptr;
   p.n_stop_token_ids = 0;
   p.ignore_eos = 0;
@@ -320,6 +334,65 @@ void PrefixTests(const std::filesystem::path& model_dir, const std::filesystem::
   std::cout << "prefix destroy VRAM delta=" << int64_t(before) - int64_t(after) << " B"
             << std::endl;
   Require(before == after, "prefix cache VRAM drift after destroy");
+}
+void LongDraftPrefill(const std::filesystem::path& model_dir,
+                      const std::filesystem::path& draft_dir, const std::vector<int32_t>& math) {
+  constexpr unsigned length = 2304, pin = 2176, chunk = 128;
+  auto create = [&](bool speculative) {
+    return Create(Encode(Object{{"model_dir", model_dir.string()},
+                                {"draft_model_dir", draft_dir.string()},
+                                {"use_speculative", speculative},
+                                {"prefix_cache_slots", speculative ? 3 : 0},
+                                {"max_context", length + 32},
+                                {"prefill_chunk_size", chunk}}));
+  };
+  std::vector<int32_t> prompt(pin + math.size());
+  for (size_t i = 0; i < prompt.size(); ++i) prompt[i] = math[i % math.size()];
+  std::copy(math.begin(), math.end(), prompt.end() - math.size());
+  RequestParams greedy{.max_tokens = 16, .ignore_eos = 1};
+  auto ar = create(false);
+  const auto reference = Run(ar.get(), prompt, greedy);
+  Success(reference);
+  ar.reset();
+  auto spec = create(true);
+  auto cold = Run(spec.get(), prompt, greedy);
+  Success(cold);
+  Require(cold.ids == reference.ids && !cold.t.cached_prefix_tokens,
+          "long draft prefill AR parity");
+  // The longer branch pins the LCP. Restoring it for the shorter suffix needs KV
+  // older than the window retained at the end of the longer branch.
+  auto branch = prompt;
+  branch.resize(length, 63);
+  ++branch[pin];
+  std::copy(math.begin(), math.end(), branch.end() - math.size());
+  auto pinned = Run(spec.get(), branch, greedy);
+  Success(pinned);
+  Require(!pinned.t.cached_prefix_tokens, "long branch should pin a new intermediate snapshot");
+  auto hit = Run(spec.get(), prompt, greedy);
+  Success(hit);
+  Require(
+      hit.t.cached_prefix_tokens == pin && hit.ids == reference.ids && hit.batches == cold.batches,
+      "long pin restore changed target or draft output");
+
+  // Start at a saved, nonzero boundary and cancel after some skipped projections.
+  auto prefix = std::vector<int32_t>(prompt.begin(), prompt.begin() + chunk);
+  ++prefix.front();
+  Success(Run(spec.get(), prefix, {.max_tokens = 1}));
+  std::copy(prefix.begin(), prefix.end(), branch.begin());
+  auto delay = std::chrono::milliseconds(std::max<int>(1, cold.t.prefill_ms / 5));
+  auto cancelled = Run(spec.get(), branch, greedy, 0, delay);
+  Require(cancelled.status == ENGINE_ERR_CANCELLED && cancelled.ids.empty() &&
+              cancelled.t.cached_prefix_tokens == chunk && cancelled.t.prefill_tokens > chunk &&
+              cancelled.t.prefill_tokens < length,
+          "cancel within an incomplete draft window");
+  auto retry = Run(spec.get(), branch, greedy);
+  Success(retry);
+  Require(retry.t.cached_prefix_tokens == chunk, "interrupted tail reused");
+  spec.reset();
+  ar = create(false);
+  auto retry_ar = Run(ar.get(), branch, greedy);
+  Success(retry_ar);
+  Require(retry.ids == retry_ar.ids, "post-cancel AR parity");
 }
 // Before the verify fix short_sky[35] favored 149881 at T=1 (+0.33836365)
 // and 149910 at T=8 (+0.13246155). On short_code[72] the T=8 margin was zero.
@@ -589,6 +662,29 @@ void ModelTests(const std::filesystem::path& model_dir, const std::filesystem::p
       spec_runs.push_back(std::move(r));
     }
   }
+  for (unsigned width : {4, 6}) {
+    auto spec = Create(Encode(Object{{"model_dir", model_dir.string()},
+                                     {"draft_model_dir", draft_dir.string()},
+                                     {"max_context", kMaxContext},
+                                     {"prefill_chunk_size", 8},
+                                     {"spec_verify_len", width}}));
+    auto r = Run(spec.get(), prompt, {.max_tokens = uint32_t(gold.size()), .ignore_eos = 1});
+    Success(r);
+    Require(r.ids == ar_runs.front().second.ids && Counter(spec.get(), "spec_verify_len") == width,
+            "configured verify width short_math AR parity");
+    const auto hist = std::span(r.t.spec_accept_hist);
+    uint32_t accepted = 0;
+    for (unsigned k = 0; k < hist.size(); ++k) {
+      accepted += k * hist[k];
+      Require(k < width || !hist[k], "accepted beyond verify width");
+    }
+    // With ignore_eos and sufficient context, only a final one-token budget uses AR.
+    const bool final_ar = r.batches.back() == 1;
+    Require(accepted > 0 && accepted == r.t.spec_accepted &&
+                std::accumulate(hist.begin(), hist.end(), 0u) + final_ar == r.t.decode_rounds,
+            "speculative acceptance histogram totals");
+  }
+  LongDraftPrefill(model_dir, draft_dir, prompt);
   PrefixTests(model_dir, draft_dir, prompt, gold);
   for (unsigned room : {1, 5}) {
     auto edge = Create(Encode(Object{{"model_dir", model_dir.string()},

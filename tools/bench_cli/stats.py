@@ -34,11 +34,17 @@ def paired_bootstrap_ci(ratios, seed=42, resamples=2000):
 
 def summarize(rows):
     columns = defaultdict(list)
+    histograms = []
     for row in rows:
+        if "spec_accept_hist" in row:
+            histograms.append(row["spec_accept_hist"])
         for key, value in row.items():
             if type(value) in (int, float):
                 columns[key].append(value)
-    return {
+    summary = {
         key: {"median": median(values), "mean": fmean(values), "n": len(values)}
         for key, values in columns.items()
     }
+    if histograms:
+        summary["spec_accept_hist"] = [sum(counts) for counts in zip(*histograms, strict=True)]
+    return summary

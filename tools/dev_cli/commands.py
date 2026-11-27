@@ -478,6 +478,7 @@ def serve(cfg, args, result):
             "max_context",
             "prefill_chunk_size",
             "prefix_cache_slots",
+            "spec_verify_len",
             "request_timeout_sec",
         ):
             value = getattr(args, key)

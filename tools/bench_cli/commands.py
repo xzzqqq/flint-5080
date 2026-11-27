@@ -20,14 +20,22 @@ from .stats import paired_bootstrap_ci, summarize
 from .workloads import PERF, evaluate, load_workloads, requests_for
 
 
-async def performance(send, suite, case, args):
+def sampling_overrides(args):
+    return {
+        key: value
+        for key in ("temperature", "top_p", "top_k", "seed")
+        if (value := getattr(args, key)) is not None
+    }
+
+
+async def performance(send, suite, case, args, overrides):
     rows = []
     width = max(2, len(str(max(args.warmup, args.rounds))))
     for i in range(-args.warmup, args.rounds):
         warmup = i < 0
         number = i + args.warmup if warmup else i + 1
         bodies = requests_for(suite, case, number, warmup, width)
-        responses = [await send(body) for body in bodies]
+        responses = [await send(body | overrides) for body in bodies]
         if not warmup:
             for response in responses:
                 rows.append(dict(round=number, metrics=response.metrics))
@@ -112,6 +120,8 @@ def run_remote(cfg, args, root, result):
         "--timeout",
         str(args.timeout),
     ]
+    for key, value in sampling_overrides(args).items():
+        cmd.extend(["--" + key.replace("_", "-"), str(value)])
     for case in args.case or []:
         cmd.extend(["--case", case])
     if args.tag:
@@ -190,7 +200,9 @@ async def run(args, root, result, *, cfg=None):
         s: hashlib.sha256(json.dumps(cases, sort_keys=True).encode()).hexdigest()
         for s, cases in workloads.items()
     }
+    overrides = sampling_overrides(args) if any(s in PERF for s in workloads) else {}
     meta = dict(
+        sampling_overrides=overrides,
         metrics_version=2,
         client_location="local",
         model=model,
@@ -231,7 +243,7 @@ async def run(args, root, result, *, cfg=None):
                     if not report["passed"]:
                         failed.append(case["id"])
                 else:
-                    report = await performance(send, suite, case, args)
+                    report = await performance(send, suite, case, args, overrides)
                 results[suite][case["id"]] = report
             result.data["suite_summary"][suite] = summarize(
                 row["metrics"] for case in results[suite].values() for row in case["samples"]
@@ -328,11 +340,14 @@ def compare(args, result, root):
         "warmup",
         "telemetry",
         "canary_passed",
+        "sampling_overrides",
         "workload_sha256",
         "server",
     ):
-        if a.get(field) != b.get(field):
-            warnings.append(f"{field}: baseline={a.get(field)!r}, candidate={b.get(field)!r}")
+        default = {} if field == "sampling_overrides" else None
+        baseline_value, candidate_value = a.get(field, default), b.get(field, default)
+        if baseline_value != candidate_value:
+            warnings.append(f"{field}: baseline={baseline_value!r}, candidate={candidate_value!r}")
 
     def medians(run):
         return {
