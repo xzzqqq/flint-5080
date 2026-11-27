@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-#define FLINT_FORWARD_ABI_VERSION 6u
+#define FLINT_FORWARD_ABI_VERSION 7u
 
 typedef struct ForwardContext ForwardContext;
 
@@ -46,6 +46,8 @@ int32_t flint_forward_draft(ForwardContext* c, const ForwardDraftSpec* spec,
                             ForwardDraftResult* result);
 int32_t flint_forward_verify(ForwardContext* c, const ForwardRunSpec* spec,
                              const ForwardOptions* opts, ForwardRunResult* result);
+int32_t flint_forward_spec_round(ForwardContext*, const ForwardSpecRoundSpec*,
+                                 const ForwardOptions*, ForwardSpecRoundResult*);
 int32_t flint_forward_commit(ForwardContext* c, uint32_t pos, uint32_t len, uint32_t accepted);
 /* Optional graph diagnostics. */
 ForwardGraphStats flint_forward_graph_stats(const ForwardContext* context);

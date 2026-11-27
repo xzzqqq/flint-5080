@@ -56,7 +56,7 @@ target_link_libraries(engine_ops PUBLIC CUDA::cudart CUDA::cublas)
 target_compile_options(engine_ops PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:-rdc=false>")
 flint_configure_cuda_target(engine_ops)
 
-add_library(engine_model OBJECT src/model/dflash2_forward.cpp src/model/inkling2_forward.cpp src/model/submodules.cpp)
+add_library(engine_model OBJECT src/model/spec_round.cpp src/model/dflash2_forward.cpp src/model/inkling2_forward.cpp src/model/submodules.cpp)
 set_target_properties(engine_model PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(engine_model PUBLIC engine_ops CUDA::cudart CUDA::cublas)
 

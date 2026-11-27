@@ -189,6 +189,8 @@ def execute(cfg, args, result):
             command=cmd,
             case=name,
             step=args.step,
+            verify_len=args.verify_len,
+            fixed_proposal=args.fixed_proposal,
             input_ids=case["input_ids"],
             begin_visit=begin,
             end_visit=end,

@@ -20,6 +20,8 @@ class DFlash2Runner {
   DFlash2Runner(const DFlash2Runner&) = delete;
   DFlash2Runner& operator=(const DFlash2Runner&) = delete;
   void StoreContextKv(const void* taps, uint32_t count, uint32_t pos);
+  void EnqueueBlock() { EnqueueBlockAt(spec_); }
+  void EnqueueBlockAt(const ForwardDraftSpec* spec) { RunBlock(spec, nullptr); }
   void DraftDevice(const ForwardDraftSpec&);
   [[nodiscard]] const ForwardDraftSpec* device_spec() const { return spec_; }
   [[nodiscard]] const ForwardDraftResult* device_result() const { return result_; }
@@ -27,7 +29,7 @@ class DFlash2Runner {
 
  private:
   void EnqueueDraft(const ForwardDraftSpec&, DFlash2Capture*);
-  void RunBlock(DFlash2Capture*);
+  void RunBlock(const ForwardDraftSpec*, DFlash2Capture*);
   DraftKv Cache(int layer) const;
   const ModelWeightsView& w_;
   const KvStateArenaView& kv_;

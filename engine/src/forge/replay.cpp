@@ -106,8 +106,8 @@ Replay::Replay(DaemonConfig cfg) : config_(std::move(cfg)) {
   CheckCuda(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
   try {
     // The driver retains graph launch storage at its high-water mark for
-    // the process lifetime. Warm the same two live executables as interleaved
-    // A/B, then destroy both before sampling steady-state unload losses.
+    // the process lifetime. Warm both replay paths on two live A/B modules
+    // before sampling steady-state unload losses.
     if (weights_) {
       unsigned batch_rows = std::min(capacity_, kLogitRows);
       CheckCuda(cudaMemsetAsync(ids_, 0, batch_rows * sizeof(int), stream_));
@@ -124,14 +124,18 @@ Replay::Replay(DaemonConfig cfg) : config_(std::move(cfg)) {
         auto batch = Spec(0, model::kNumLogicalVisits, batch_rows, 0, true, true);
         batch.all_token_logits = batch.reset_kv = 1;
         a->Run(batch, {.return_logits = 1});
-        if (draft && capacity_ >= 9) {
+        if (draft && capacity_ >= 3) {
           spec.d_taps_out = taps_;
-          int anchor = a->Run(spec, {}).next_token_id;
-          a->StoreContext(taps_, 1, 0);
-          RunSpecRound(*a, anchor, 1, false);
-          anchor = b->Run(spec, {}).next_token_id;
-          b->StoreContext(taps_, 1, 0);
-          RunSpecRound(*b, anchor, 1, false);
+          unsigned len = std::min(capacity_ - 1, kLogitRows);
+          for (auto* module : {&*a, &*b}) {
+            int anchor = module->Run(spec).next_token_id;
+            module->StoreContext(taps_, 1, 0);
+            auto fixed = FreezeProposal(*module, anchor, 1, len);
+            RunSpecRound(*module, anchor, 1, len, fixed, false);
+            anchor = module->Run(spec).next_token_id;
+            module->StoreContext(taps_, 1, 0);
+            RunSpecRound(*module, anchor, 1, len, {}, false);
+          }
         }
       }
       warmup_vram_bytes_ = int64_t(free_before) - int64_t(FreeBytes());
@@ -394,7 +398,9 @@ Replay::Measurement Replay::ParseMeasurement(const Json& q, const std::string& c
   auto warmup = Count(q, "warmup", 1, 0, 10000), iters = Count(q, "iters", 5, 1, 10000);
   auto rounds = cmd == "ab" ? Count(q, "rounds", 5, 1, 10000) : 1;
   if (size_t(iters) * rounds > 100000) throw std::runtime_error("too many timed iterations");
-  return {begin, end, step, warmup, iters, rounds, context_len, name, std::move(ids)};
+  return {begin, end,           step,        warmup,
+          iters, rounds,        context_len, Count(q, "verify_len", 8, 2, 8),
+          name,  std::move(ids)};
 }
 const Recording& Replay::ResolveRecording(const Measurement& m, Object& reply,
                                           Recording& uncached) {
@@ -526,41 +532,57 @@ void Replay::Dump(const Json& q, const Measurement& m, const Recording& r,
   auto dump = WriteDump(q.at("out").as<std::string>(), tensors);
   reply.merge(dump);
 }
+std::vector<int> Replay::FreezeProposal(ForwardModule& baseline, int anchor, unsigned pos,
+                                        unsigned len) {
+  const auto proposal = baseline.Draft({anchor, int(pos), 0, 0, 0});
+  std::vector<int> block(len);
+  block.front() = anchor;
+  std::copy_n(proposal.draft_ids, len - 1, block.begin() + 1);
+  return block;
+}
 Replay::SpecRound Replay::RunSpecRound(ForwardModule& candidate, int anchor, unsigned pos,
+                                       unsigned len, const std::vector<int>& fixed_block,
                                        bool profiler_range, bool enable_profiling) {
   using Clock = std::chrono::steady_clock;
   SpecRound round{};
-  round.block.resize(8);
-  round.block[0] = anchor;
+  if (!fixed_block.empty()) Upload(stream_, ids_, fixed_block);
   CheckCuda(cudaStreamSynchronize(stream_));
   if (profiler_range) CheckCuda(cudaProfilerStart());
   try {
     auto start = Clock::now();
-    auto proposal =
-        candidate.Draft({anchor, int(pos), 0, 0, candidate.speculative_options.use_cuda_graph});
-    std::ranges::copy(proposal.draft_ids, round.block.begin() + 1);
-    auto drafted = Clock::now();
-    Upload(stream_, ids_, round.block);
-    auto s = Spec(0, model::kNumLogicalVisits, 8, pos, true, true);
-    s.d_taps_out = taps_;
-    auto verify_opts = candidate.speculative_options;
-    verify_opts.enable_profiling = enable_profiling;
-    round.verify_result = candidate.Verify(s, verify_opts);
-    round.verified = Read(next_, 8);
-    uint64_t seed = 0;
-    auto result = VerifySpeculative(std::span(round.block).subspan(1), round.verified, {}, {}, {},
-                                    vocab_, 0, 0, 0, seed);
+    if (fixed_block.empty()) {
+      const auto result = candidate.SpecRound({.input = {anchor, int(pos), len},
+                                               .d_input_ids = ids_,
+                                               .d_hidden_out = out_,
+                                               .d_logits_out = logits_,
+                                               .d_next_token = next_,
+                                               .d_taps_out = taps_,
+                                               .cache_graph = 1});
+      auto count = 1 + result.output.accepted_draft_count;
+      round.emitted.assign(result.output.tokens, result.output.tokens + count);
+      round.body_ms = result.elapsed_ms;
+    } else {
+      auto spec = Spec(0, model::kNumLogicalVisits, len, pos, true, true);
+      spec.d_taps_out = taps_;
+      auto opts = candidate.speculative_options;
+      opts.enable_profiling = enable_profiling;
+      round.verify_result = candidate.Verify(spec, opts);
+      round.verified = Read(next_, len);
+      uint64_t seed = 0;
+      auto result = VerifySpeculative(std::span(fixed_block).subspan(1), round.verified, {}, {}, {},
+                                      vocab_, 0, 0, 0, seed);
+      round.emitted.assign(fixed_block.begin() + 1,
+                           fixed_block.begin() + 1 + result.accepted_draft_count);
+      round.emitted.push_back(result.bonus_token);
+      round.body_ms = round.verify_result.elapsed_ms;
+    }
     auto verified = Clock::now();
-    unsigned count = 1 + result.accepted_draft_count;
-    candidate.Commit(pos, 8, count);
-    candidate.StoreContext(taps_, count, pos);
+    candidate.Commit(pos, len, round.emitted.size());
+    candidate.StoreContext(taps_, round.emitted.size(), pos);
     CheckCuda(cudaStreamSynchronize(stream_));
     auto stop = Clock::now();
     round.elapsed_ms = std::chrono::duration<double, std::milli>(stop - start).count();
-    round.draft_ms = std::chrono::duration<double, std::milli>(drafted - start).count();
-    round.verify_ms = std::chrono::duration<double, std::milli>(verified - drafted).count();
-    round.emitted.assign(round.block.begin() + 1, round.block.begin() + count);
-    round.emitted.push_back(result.bonus_token);
+    round.commit_ms = std::chrono::duration<double, std::milli>(stop - verified).count();
   } catch (...) {
     if (profiler_range) cudaProfilerStop();
     throw;
@@ -575,7 +597,7 @@ void Replay::ResetKv() {
 
 void Replay::PreparePrefix(const Measurement& m, bool speculative, Object& reply) {
   const unsigned length = m.context_len ? m.context_len : m.ids.size();
-  const unsigned tail = speculative ? 8 : 1;
+  const unsigned tail = speculative ? m.verify_len : 1;
   if (capacity_ < tail || uint64_t(length) + m.step - 1 + tail > kv_->view().max_full_seq_len)
     throw std::invalid_argument(
         "prefix and decode exceed available capacity; increase --kv-seq-len");
@@ -653,18 +675,25 @@ Object Replay::MeasureSpeculative(const Json& q, const std::string& cmd, const M
   Object reply;
   PreparePrefix(m, true, reply);
   const auto& prefix = *prefix_;
+  const bool enable_profiling =
+      (cmd == "profile" && !q.get("profiler_range", false)) || q.get("enable_profiling", false);
+  const bool fixed = cmd == "dump" || enable_profiling || q.get("fixed_proposal", false);
+  std::vector<int> block;
+  if (fixed) {
+    for (auto& [ptr, bytes] : prefix.mutable_state) Upload(stream_, ptr, bytes);
+    auto baseline = Load(config_.baseline);
+    block = FreezeProposal(*baseline, prefix.generated.back(), prefix.position, m.verify_len);
+  }
   auto a = Load(q.at(cmd == "ab" ? "so_a" : "so_path").as<std::string>());
   auto b = cmd == "ab" ? Load(q.at("so_b").as<std::string>()) : std::nullopt;
   a->speculative_options.use_cuda_graph = q.get("use_cuda_graph", true);
-  const bool enable_profiling =
-      (cmd == "profile" && !q.get("profiler_range", false)) || q.get("enable_profiling", false);
   if (b) b->speculative_options = a->speculative_options;
   SpecRound result;
   bool profiler_range = false;
   auto round = [&](ForwardModule& candidate) {
     for (auto& [ptr, bytes] : prefix.mutable_state) Upload(stream_, ptr, bytes);
-    result = RunSpecRound(candidate, prefix.generated.back(), prefix.position, profiler_range,
-                          enable_profiling);
+    result = RunSpecRound(candidate, prefix.generated.back(), prefix.position, m.verify_len, block,
+                          profiler_range, enable_profiling);
     return result.elapsed_ms;
   };
   for (unsigned i = 0; i < m.warmup; ++i) {
@@ -672,17 +701,14 @@ Object Replay::MeasureSpeculative(const Json& q, const std::string& cmd, const M
     if (b) round(*b);
   }
   profiler_range = q.get("profiler_range", false);
-  std::vector<double> times, paired, draft_times, verify_times, commit_times;
+  std::vector<double> times, paired, body_times, commit_times;
   Array pairs;
   for (unsigned j = 0; j < m.rounds; ++j) {
     std::vector<double> group_a, group_b;
     for (unsigned i = 0; i < m.iters; ++i) {
       group_a.push_back(round(*a));
-      if (cmd == "run") {
-        draft_times.push_back(result.draft_ms);
-        verify_times.push_back(result.verify_ms);
-        commit_times.push_back(result.elapsed_ms - result.verify_ms - result.draft_ms);
-      }
+      body_times.push_back(result.body_ms);
+      commit_times.push_back(result.commit_ms);
       if (b) {
         auto first = result.emitted;
         group_b.push_back(round(*b));
@@ -714,17 +740,13 @@ Object Replay::MeasureSpeculative(const Json& q, const std::string& cmd, const M
   auto& emitted = result.emitted;
   reply["spec_accepted"] = emitted.size() - 1;
   reply["tokens_emitted"] = emitted.size();
-  if (cmd == "run") {
-    reply["draft_ms"] = Median(draft_times);
-    reply["verify_ms"] = Median(verify_times);
-    reply["commit_and_store_ms"] = Median(commit_times);
-  }
-  if (cmd == "profile" || q.get("enable_profiling", false)) {
+  reply["verify_len"] = m.verify_len;
+  reply["spec_mode"] = fixed ? "fixed_proposal" : "merged";
+  reply[fixed ? "verify_ms" : "round_ms"] = Median(body_times);
+  reply["commit_and_store_ms"] = Median(commit_times);
+  if (enable_profiling) {
     FormatStages(result.verify_result, reply);
     reply["verify_logical_bytes"] = result.verify_result.logical_bytes;
-    reply["draft_ms"] = result.draft_ms;
-    reply["verify_ms"] = result.verify_ms;
-    reply["commit_and_store_ms"] = result.elapsed_ms - result.draft_ms - result.verify_ms;
   }
   Array ids;
   for (int token : emitted) ids.emplace_back(token);
@@ -748,8 +770,8 @@ Object Replay::MeasureSpeculative(const Json& q, const std::string& cmd, const M
   if (cmd == "dump") {
     auto dump =
         WriteDump(q.at("out").as<std::string>(),
-                  {{"verify_input_ids", "I32", {8}, std::as_bytes(std::span(result.block))},
-                   {"target_ids", "I32", {8}, std::as_bytes(std::span(result.verified))},
+                  {{"verify_input_ids", "I32", {m.verify_len}, std::as_bytes(std::span(block))},
+                   {"target_ids", "I32", {m.verify_len}, std::as_bytes(std::span(result.verified))},
                    {"emitted_ids", "I32", {emitted.size()}, std::as_bytes(std::span(emitted))}});
     reply.merge(dump);
   }

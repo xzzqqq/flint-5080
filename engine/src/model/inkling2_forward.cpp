@@ -104,7 +104,7 @@ struct InklingRunner::Impl {
     if (owned_stream) cudaStreamDestroy(owned_stream);
   }
   void RunInkling(const ForwardRunSpec&, const ForwardOptions&, ForwardRunResult&,
-                  const ForwardCapture*);
+                  const ForwardCapture*, const int32_t* external_pos = nullptr);
   void PrepareGraph(GraphSlot&, const ForwardRunSpec&, const ForwardOptions&);
 };
 InklingRunner::InklingRunner(const ModelWeightsView& w, const KvStateArenaView& kv,
@@ -138,10 +138,13 @@ ScratchArenaView InklingRunner::scratch_tail() const { return impl_->activations
 InklingRunner::~InklingRunner() = default;
 ForwardGraphStats InklingRunner::graph_stats() const { return impl_->stats; }
 void InklingRunner::Impl::RunInkling(const ForwardRunSpec& s, const ForwardOptions& o,
-                                     ForwardRunResult& result, const ForwardCapture* capture) {
+                                     ForwardRunResult& result, const ForwardCapture* capture,
+                                     const int32_t* external_pos) {
   const auto& g = *gemm;
   const auto& w = weights;
-  const auto* d_pos = (recording || (s.is_decode && s.seq_len == 1)) ? d_decode_pos : nullptr;
+  const auto* d_pos = external_pos                                     ? external_pos
+                      : (recording || (s.is_decode && s.seq_len == 1)) ? d_decode_pos
+                                                                       : nullptr;
   const int t = s.seq_len, h = w.config.hidden_size, n = t * h;
   ScratchWorkspace ws(activations);
   auto* hidden = static_cast<uint16_t*>(s.d_hidden_out);
@@ -414,15 +417,17 @@ ForwardRunResult InklingRunner::Enqueue(const ForwardRunSpec& batch, const Forwa
 ForwardRunResult InklingRunner::RunVerify(ForwardRunSpec s, const ForwardOptions& o,
                                           bool device_only) {
   auto& c = *impl_;
-  if (!c.backup || c.verify_len || !s.seq_len || s.seq_len > 8 || s.reset_kv ||
-      s.pos_offset > c.kv.max_full_seq_len || s.seq_len > c.kv.max_full_seq_len - s.pos_offset)
-    throw std::invalid_argument("invalid verify block");
+  if (s.reset_kv) throw std::invalid_argument("cannot reset during verify");
+  BeginExternalVerify(s.pos_offset, s.seq_len);
   s.begin_visit = 0;
   s.end_visit = model::kNumLogicalVisits;
   s.run_embed = s.run_lm_head = s.all_token_logits = 1;
-  CheckCuda(flint_swa_kv_backup(c.kv.swa_kv, c.backup, s.pos_offset, s.seq_len, c.stream));
-  c.verify_pos = s.pos_offset;
-  c.verify_len = s.seq_len;
+  try {
+    CheckCuda(flint_swa_kv_backup(c.kv.swa_kv, c.backup, s.pos_offset, s.seq_len, c.stream));
+  } catch (...) {
+    CancelExternalVerify();
+    throw;
+  }
   c.recording = true;
   try {
     auto result = Enqueue(s, o, nullptr, device_only && !o.enable_profiling && !o.profiler_range);
@@ -433,6 +438,34 @@ ForwardRunResult InklingRunner::RunVerify(ForwardRunSpec s, const ForwardOptions
     CommitVerify(s.pos_offset, s.seq_len, 0);
     throw;
   }
+}
+void InklingRunner::BeginExternalVerify(uint32_t pos, uint32_t len) {
+  auto& c = *impl_;
+  if (!c.backup || c.verify_len || !len || len > 8 || pos > c.kv.max_full_seq_len ||
+      len > c.kv.max_full_seq_len - pos)
+    throw std::invalid_argument("invalid verify block");
+  c.verify_pos = pos;
+  c.verify_len = len;
+}
+void InklingRunner::CancelExternalVerify() { impl_->verify_len = 0; }
+void InklingRunner::EnqueueVerifyBody(ForwardRunSpec s, const ForwardOptions& o,
+                                      const int32_t* d_pos) {
+  auto& c = *impl_;
+  s.begin_visit = 0;
+  s.end_visit = model::kNumLogicalVisits;
+  s.run_embed = s.run_lm_head = s.all_token_logits = 1;
+  CheckCuda(flint_swa_kv_backup_device(c.kv.swa_kv, c.backup, d_pos, s.seq_len, c.stream));
+  ForwardRunResult unused{};
+  c.recording = true;
+  try {
+    c.RunInkling(s, o, unused, nullptr, d_pos);
+  } catch (...) {
+    c.recording = false;
+    // In capture this records a restore in the graph that the caller discards.
+    CheckCuda(flint_swa_kv_restore(c.kv.swa_kv, c.backup, c.verify_pos, s.seq_len, 0, c.stream));
+    throw;
+  }
+  c.recording = false;
 }
 void InklingRunner::CommitVerify(uint32_t pos, uint32_t len, uint32_t accepted) {
   auto& c = *impl_;

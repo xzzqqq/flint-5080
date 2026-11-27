@@ -377,7 +377,13 @@ def _gpu_check_commands(model_dir, golden_dir, draft_dir=None):
             build("-x", "engine/build/forge-host"),
             "engine/build/forge-host --smoke || exit 1",
             shlex.join(
-                ["engine/build/forge_tests", "engine/build/forge-host", forward, str(model_dir)]
+                [
+                    "engine/build/forge_tests",
+                    "engine/build/forge-host",
+                    forward,
+                    str(model_dir),
+                    *draft_args,
+                ]
             ),
         ],
         "server": [

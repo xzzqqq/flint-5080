@@ -88,7 +88,7 @@ void DFlash2Runner::EnqueueDraft(const ForwardDraftSpec& spec, DFlash2Capture* c
       cudaGraph_t source{};
       CheckCuda(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
       try {
-        RunBlock(nullptr);
+        EnqueueBlock();
       } catch (...) {
         cudaStreamEndCapture(s, &source);
         if (source) cudaGraphDestroy(source);
@@ -101,10 +101,10 @@ void DFlash2Runner::EnqueueDraft(const ForwardDraftSpec& spec, DFlash2Capture* c
     }
     CheckCuda(cudaGraphLaunch(graph_, s));
   } else
-    RunBlock(cap);
+    RunBlock(spec_, cap);
 }
-void DFlash2Runner::RunBlock(DFlash2Capture* cap) {
-  auto d_ctx = &spec_->pos;
+void DFlash2Runner::RunBlock(const ForwardDraftSpec* spec, DFlash2Capture* cap) {
+  auto d_ctx = &spec->pos;
   auto s = gemm_.stream();
   ScratchWorkspace ws(scratch_);
   auto x = ws.Take<uint16_t>(8 * H), h = ws.Take<uint16_t>(8 * H);
@@ -115,7 +115,7 @@ void DFlash2Runner::RunBlock(DFlash2Capture* cap) {
   auto norm = [&](const void* weight) {
     CheckCuda(flint_rmsnorm({x, weight, h, nullptr, 8, H, FLINT_BF16, FLINT_BF16}, s));
   };
-  CheckCuda(flint_dflash2_embed_block(w_.embed_weight, w_.embed_norm_weight, x, s, &spec_->anchor));
+  CheckCuda(flint_dflash2_embed_block(w_.embed_weight, w_.embed_norm_weight, x, s, &spec->anchor));
   if (cap) Copy(cap->embed_block, x, 8 * H * 2, s);
   for (int i = 0; i < 5; ++i) {
     const auto& l = w.layers[i];
@@ -163,7 +163,7 @@ void DFlash2Runner::RunBlock(DFlash2Capture* cap) {
   linear(h + H, w.projection, proj, 7, R, H);
   auto scratch = ws.Take<uint64_t>(flint_dflash2_topk_scratch_words());
   auto unary = ws.Take<float>(7 * 16), scores = ws.Take<float>(7 * 16 * 16);
-  CheckCuda(flint_dflash2_select(raw, proj, w.predecessor, w.successor, spec_, result_, scratch,
+  CheckCuda(flint_dflash2_select(raw, proj, w.predecessor, w.successor, spec, result_, scratch,
                                  unary, scores, s));
   if (cap) {
     Copy(cap->unary, unary, 7 * 16 * sizeof(float), s);

@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "loader/model_views.h"
+#include "ops/spec_verify_ops.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -60,6 +61,22 @@ typedef struct ForwardRunResult {
   uint32_t num_stages;
   ForwardStageTiming stages[FLINT_MAX_STAGE_TIMINGS];
 } ForwardRunResult;
+
+/* input.seed is the RNG state before drafting. Device buffers cover verify_len rows. */
+typedef struct ForwardSpecRoundSpec {
+  SpecVerifyInput input;
+  int32_t* d_input_ids;
+  void* d_hidden_out;
+  float* d_logits_out;
+  int32_t* d_next_token;
+  void* d_taps_out;
+  uint8_t cache_graph;
+} ForwardSpecRoundSpec;
+
+typedef struct ForwardSpecRoundResult {
+  SpecVerifyOutput output;
+  float elapsed_ms;
+} ForwardSpecRoundResult;
 
 typedef struct ForwardGraphStats {
   uint64_t captures, launches;

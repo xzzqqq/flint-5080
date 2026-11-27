@@ -101,6 +101,12 @@ def build_parser():
                     "Later steps advance step - 1 tokens first.",
                 )
                 p.add_argument("--no-spec", action="store_true")
+            p.add_argument("--verify-len", type=int, choices=range(2, 9), default=8)
+            p.add_argument(
+                "--fixed-proposal",
+                action="store_true",
+                help="Verify a single frozen baseline proposal on each candidate",
+            )
             p.add_argument("--step", type=natural, default=0, help="0=prefill, 1=first decode")
             p.add_argument("--case")
             if name != "ab":

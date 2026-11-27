@@ -47,6 +47,7 @@ ForwardModule::ForwardModule(const fs::path& path, const fs::path& load_dir,
     store_context_ = Symbol<decltype(store_context_)>(handle_, "flint_forward_store_context");
     draft_ = Symbol<decltype(draft_)>(handle_, "flint_forward_draft");
     verify_ = Symbol<decltype(verify_)>(handle_, "flint_forward_verify");
+    spec_round_ = Symbol<decltype(spec_round_)>(handle_, "flint_forward_spec_round");
     commit_ = Symbol<decltype(commit_)>(handle_, "flint_forward_commit");
     auto create = Symbol<decltype(&flint_forward_create)>(handle_, "flint_forward_create");
     context_ = create(weights, &kv, &scratch, stream);
@@ -90,6 +91,16 @@ ForwardDraftResult ForwardModule::Draft(const ForwardDraftSpec& spec) {
 ForwardRunResult ForwardModule::Verify(const ForwardRunSpec& spec, const ForwardOptions& o) {
   ForwardRunResult r{};
   CheckCuda(verify_(context_, &spec, &o, &r), "verify block");
+  return r;
+}
+ForwardSpecRoundResult ForwardModule::SpecRound(const ForwardSpecRoundSpec& spec) {
+  ForwardSpecRoundResult r{};
+  CheckCuda(spec_round_(context_, &spec, &speculative_options, &r), "speculative round");
+  if (r.output.error_code || r.output.accepted_draft_count < 0 ||
+      uint32_t(r.output.accepted_draft_count) >= spec.input.verify_len) {
+    Commit(spec.input.pos, spec.input.verify_len, 0);
+    throw std::runtime_error("invalid speculative output: " + std::to_string(r.output.error_code));
+  }
   return r;
 }
 void ForwardModule::Commit(uint32_t pos, uint32_t len, uint32_t accepted) {

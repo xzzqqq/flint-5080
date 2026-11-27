@@ -49,13 +49,14 @@ struct Fixture {
     Require(WIFEXITED(code) && !WEXITSTATUS(code) && !fs::exists(socket), "clean shutdown");
   }
   void Launch(const char* host, const char* forward, const char* model = nullptr,
-              bool reset = false) {
+              bool reset = false, const char* draft = nullptr) {
     pid = fork();
     Require(pid >= 0, "fork");
     if (!pid) {
       if (model) {
         execl(host, host, "--daemon", "--socket", socket.c_str(), "--state-dir", root.c_str(),
-              "--baseline", forward, "--model-dir", model, "--kv-seq-len", "32", nullptr);
+              "--baseline", forward, "--model-dir", model, "--kv-seq-len", "32",
+              draft ? "--draft-dir" : nullptr, draft, nullptr);
         _exit(127);
       }
       execl(host, host, "--daemon", "--socket", socket.c_str(), "--state-dir", root.c_str(),
@@ -92,7 +93,7 @@ struct Fixture {
     if (parsed.as<Object>().contains("vram_loss_bytes")) {
       Require(parsed.at("vram_loss_bytes").number<size_t>() <= (4u << 20), "VRAM leak");
       Require(!parsed.at("vram_leak_warn").as<bool>(), "VRAM warning");
-      if (q.at("command").as<std::string>() != "kld")
+      if (q.at("command").as<std::string>() != "kld" && !parsed.as<Object>().contains("spec_mode"))
         Require(parsed.at("numerical_error").at("exact_match").as<bool>(), "replay mismatch");
     }
     return parsed;
@@ -246,7 +247,40 @@ void TestKldRpc(const char* host, const char* forward, const char* model) {
   Require(fs::is_empty(f.root / "loaded"), "leftover KLD DSO");
   f.Shutdown();
 }
+void TestSpecReplay(const char* host, const char* forward, const char* model, const char* draft) {
+  Fixture f;
+  f.Launch(host, forward, model, false, draft);
+  Object q{{"command", "run"}, {"so_path", forward}, {"step", 1}, {"input_ids", Array{1, 42}},
+           {"verify_len", 4},  {"warmup", 1},        {"iters", 2}};
+  auto merged = f.Call(q);
+  auto emitted = Encode(merged.at("emitted_ids"));
+  Require(merged.at("spec_mode").as<std::string>() == "merged" &&
+              merged.at("verify_len").number<int>() == 4 &&
+              merged.at("round_ms").number<double>() > 0 &&
+              merged.at("graph").at("captures").number<int>() == 1 &&
+              merged.at("graph").at("launches").number<int>() == 3,
+          "merged replay");
+  q["fixed_proposal"] = true;
+  q["command"] = "ab";
+  q["so_a"] = q["so_b"] = forward;
+  q["rounds"] = 2;
+  auto fixed = f.Call(q);
+  Require(fixed.at("spec_mode").as<std::string>() == "fixed_proposal" &&
+              fixed.at("verify_ms").number<double>() > 0 &&
+              fixed.at("vram_loss_bytes").number<int>() == 0 &&
+              fixed.at("next_token_match").as<bool>() && Encode(fixed.at("emitted_ids")) == emitted,
+          "fixed proposal A/B");
+  q["fixed_proposal"] = false;
+  q["command"] = "profile";
+  auto profile = f.Call(q);
+  Require(profile.at("spec_mode").as<std::string>() == "fixed_proposal" &&
+              profile.at("stages").as<Array>().size() == model::kNumLogicalVisits + 2 &&
+              Encode(profile.at("emitted_ids")) == emitted,
+          "standalone stage profile");
+  f.Shutdown();
+}
 void Test(const char* host, const char* forward) {
+  static_assert(FLINT_FORWARD_ABI_VERSION == 7);
   Fixture f;
   f.Launch(host, forward);
   auto status = f.Call({{"command", "status"}});
@@ -257,6 +291,17 @@ void Test(const char* host, const char* forward) {
            {"input_ids", Array{1, 42, 123}},
            {"warmup", 1},
            {"iters", 2}};
+  for (int width : {1, 9}) {
+    auto invalid = q;
+    invalid["verify_len"] = width;
+    try {
+      f.Call(invalid);
+      throw std::logic_error("invalid verify_len accepted");
+    } catch (const std::runtime_error& e) {
+      Require(std::string_view(e.what()).find("verify_len") != std::string_view::npos,
+              "verify_len diagnostic");
+    }
+  }
   Require(!status.at("baseline_preserved").as<bool>(), "initial baseline");
   auto frozen = f.root / "candidates/baseline.so";
   auto original = fs::file_size(frozen);
@@ -386,8 +431,9 @@ void Test(const char* host, const char* forward) {
 }  // namespace
 int main(int argc, char** argv) {
   try {
-    if (argc == 4) {
+    if (argc == 4 || (argc == 6 && std::string_view(argv[4]) == "--draft-dir")) {
       TestKldRpc(argv[1], argv[2], argv[3]);
+      if (argc == 6) TestSpecReplay(argv[1], argv[2], argv[3], argv[5]);
       return 0;
     }
     Require(argc == 3, "expected host and forward paths");

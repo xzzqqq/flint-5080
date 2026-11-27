@@ -80,6 +80,15 @@ class ForgeCLI(unittest.TestCase):
                 self.assertTrue(parsed.json and parsed.local)
                 self.assertEqual(parsed.command, args[0])
 
+    def test_verify_width(self):
+        for command in (["run"], ["ab", "a", "b"], ["profile"], ["dump"]):
+            args = self.parser.parse_args(command)
+            self.assertEqual(args.verify_len, 8)
+            self.assertFalse(args.fixed_proposal)
+            for width in (1, 9):
+                with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                    self.parser.parse_args([*command, "--verify-len", str(width)])
+
     def test_layers_and_names(self):
         self.assertEqual(cli.layers("0..4"), (0, 4))
         self.assertEqual(cli.layers("47..48"), (47, 48))
@@ -110,7 +119,19 @@ class ForgeCLI(unittest.TestCase):
                 def execute(args):
                     commands.execute(self.cfg, self.parser.parse_args(args), result)
 
-                execute(["run", "--no-graph", "--layers", "0..4", "--context-len", "1024"])
+                execute(
+                    [
+                        "run",
+                        "--no-graph",
+                        "--layers",
+                        "0..4",
+                        "--context-len",
+                        "1024",
+                        "--verify-len",
+                        "6",
+                        "--fixed-proposal",
+                    ]
+                )
                 ex.sync.assert_called_once_with()
                 build_call, request = ex.run.call_args_list
                 build = build_call.args[0]
@@ -123,6 +144,8 @@ class ForgeCLI(unittest.TestCase):
                 self.assertEqual(q["input_ids"], [4, 5])
                 self.assertFalse(q["use_cuda_graph"])
                 self.assertEqual(q["context_len"], 1024)
+                self.assertEqual(q["verify_len"], 6)
+                self.assertTrue(q["fixed_proposal"])
                 self.assertEqual((q["begin_visit"], q["end_visit"]), (0, 4))
                 for args in [
                     ["ab", "baseline", "trial"],

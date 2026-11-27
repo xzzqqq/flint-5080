@@ -31,7 +31,7 @@ class Replay {
 
  private:
   struct Measurement {
-    unsigned begin, end, step, warmup, iters, rounds, context_len;
+    unsigned begin, end, step, warmup, iters, rounds, context_len, verify_len;
     std::string name;
     std::vector<int> ids;
     bool e2e() const { return begin == 0 && end == model::kNumLogicalVisits; }
@@ -48,12 +48,14 @@ class Replay {
   void Dump(const Json&, const Measurement&, const Recording&, const std::vector<float>&, Object&);
 
   struct SpecRound {
-    std::vector<int> block, verified, emitted;
+    std::vector<int> verified, emitted;
     ForwardRunResult verify_result{};
-    double draft_ms, verify_ms, elapsed_ms;
+    double body_ms, commit_ms, elapsed_ms;
   };
-  SpecRound RunSpecRound(ForwardModule&, int anchor, unsigned position, bool profiler_range,
+  SpecRound RunSpecRound(ForwardModule&, int anchor, unsigned position, unsigned len,
+                         const std::vector<int>& fixed_block, bool profiler_range,
                          bool enable_profiling = false);
+  std::vector<int> FreezeProposal(ForwardModule&, int anchor, unsigned pos, unsigned len);
   Object MeasureSpeculative(const Json&, const std::string&, const Measurement&);
   Object Kld(const Json& request);
   Object Measure(const Json& request, const std::string& command);

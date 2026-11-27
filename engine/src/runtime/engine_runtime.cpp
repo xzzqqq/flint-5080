@@ -18,13 +18,12 @@
 
 #include "common/cuda_check.h"
 #include "common/json_output.h"
-#include "common/splitmix64.h"
 #include "loader/arenas.h"
 #include "loader/kv_layout.h"
 #include "loader/scratch_workspace.h"
 #include "model/dflash2_forward.h"
 #include "model/inkling2_forward.h"
-#include "ops/spec_verify_ops.h"
+#include "model/spec_round.h"
 #include "ops/stub_ops.h"
 #include "runtime/config.h"
 #include "runtime/prefix_cache.h"
@@ -164,11 +163,7 @@ class ModelExecutor {
     next_ = ws.Take<int32_t>(active_ ? kBlock : 1);
     if (active_) {
       taps_ = ws.Take<uint16_t>(rows_ * kTap);
-      d_spec_in_ = ws.Take<SpecVerifyInput>(1);
-      d_spec_out_ = ws.Take<SpecVerifyOutput>(1);
-      host_spec_in_ = AllocatePinned<SpecVerifyInput>(1);
-      host_spec_out_ = AllocatePinned<SpecVerifyOutput>(1);
-      dflash2_.emplace(weights_.view(), kv_.view(), draft_scratch_, stream);
+      speculative_.emplace(weights_.view(), kv_.view(), draft_scratch_, runner_);
     }
   }
 
@@ -194,7 +189,9 @@ class ModelExecutor {
     return {host_logits_.get(), model_config().unpadded_vocab_size};
   }
 
-  void StoreContext(uint32_t rows, uint32_t pos) { dflash2_->StoreContextKv(taps_, rows, pos); }
+  void StoreContext(uint32_t rows, uint32_t pos) {
+    speculative_->draft().StoreContextKv(taps_, rows, pos);
+  }
   void SpecRound(Request&, uint32_t& pos, int32_t& anchor);
   const RuntimeConfig& config_;
   cudaStream_t stream_;
@@ -209,11 +206,7 @@ class ModelExecutor {
   std::unique_ptr<float, FreePinned> host_logits_;
   KvStateArena kv_;
   InklingRunner runner_;
-  std::optional<DFlash2Runner> dflash2_;
-  SpecVerifyInput* d_spec_in_{};
-  SpecVerifyOutput* d_spec_out_{};
-  std::unique_ptr<SpecVerifyInput, FreePinned> host_spec_in_;
-  std::unique_ptr<SpecVerifyOutput, FreePinned> host_spec_out_;
+  std::optional<SpeculativeRunner> speculative_;
   uint16_t* taps_{};
   Sampler sampler_;
   int32_t *ids_, *next_;
@@ -247,7 +240,8 @@ int32_t ModelExecutor::Forward(RequestParams& params, std::span<const int32_t> i
   const auto out = runner_.Run(spec, opts);
   if (opts.use_cuda_graph) {
     std::lock_guard lock(graph_mutex_);
-    graphs_ = runner_.graph_stats();
+    graphs_ =
+        runner_.graph_stats() + (speculative_ ? speculative_->graph_stats() : ForwardGraphStats{});
   }
   if (!opts.return_logits) return out.next_token_id;
   CheckCuda(cudaMemcpyAsync(host_logits_.get(), logits_, HostLogits().size_bytes(),
@@ -282,7 +276,8 @@ DecodeState ModelExecutor::Prefill(Request& r) {
       const uint32_t lo = std::max(pos, model::DraftContextStart(target_end));
       const bool capture = active_ && lo < end;
       token = Forward(r.params, input, pos, Phase::kPrefill, last, capture);
-      if (capture) dflash2_->StoreContextKv(taps_ + size_t(lo - pos) * kTap, end - lo, lo);
+      if (capture)
+        speculative_->draft().StoreContextKv(taps_ + size_t(lo - pos) * kTap, end - lo, lo);
       if (lo > pos) draft_contiguous_from = std::min(lo, end);
       if (draft_contiguous_from <= model::DraftContextStart(end)) last_complete_pos = end;
       ++r.prefill_chunks;
@@ -311,46 +306,22 @@ DecodeState ModelExecutor::Prefill(Request& r) {
 void ModelExecutor::SpecRound(Request& r, uint32_t& pos, int32_t& anchor) {
   auto start = Clock::now();
   auto& p = r.params;
-  const bool stochastic = p.temperature > 0;
   const uint32_t len = std::min(config_.spec_verify_len, config_.max_context - pos);
-  dflash2_->DraftDevice({anchor, int(pos), p.temperature, p.seed, config_.use_cuda_graph});
-  auto* proposal = dflash2_->device_result();
-  CheckCuda(flint_spec_prepare_verify_ids(&dflash2_->device_spec()->anchor, proposal, ids_, len,
-                                          stream_));
-  runner_.RunVerify({.seq_len = len,
-                     .pos_offset = pos,
-                     .d_input_ids = ids_,
-                     .d_hidden_out = hidden_,
-                     .d_logits_out = logits_,
-                     .d_next_token = next_,
-                     .d_taps_out = taps_},
-                    {.use_cuda_graph = config_.use_cuda_graph, .return_logits = stochastic},
-                    /*device_only=*/true);
+  const auto result = speculative_->Run(
+      {.input = {anchor, int(pos), len, p.temperature, std::max(0.f, p.top_p), p.top_k, p.seed},
+       .d_input_ids = ids_,
+       .d_hidden_out = hidden_,
+       .d_logits_out = logits_,
+       .d_next_token = next_,
+       .d_taps_out = taps_,
+       .cache_graph = len == config_.spec_verify_len},
+      {.use_cuda_graph = config_.use_cuda_graph});
   if (config_.use_cuda_graph) {
     std::lock_guard lock(graph_mutex_);
-    graphs_ = runner_.graph_stats();
+    graphs_ = runner_.graph_stats() + speculative_->graph_stats();
   }
-  const auto& out = *host_spec_out_;
+  const auto& out = result.output;
   try {
-    const auto mode = !stochastic                               ? SPEC_SAMPLE_GREEDY
-                      : p.top_k || (p.top_p > 0 && p.top_p < 1) ? SPEC_SAMPLE_STOCHASTIC_FILTERED
-                                                                : SPEC_SAMPLE_STOCHASTIC_FULL;
-    *host_spec_in_ = {anchor,
-                      int(pos),
-                      len,
-                      p.temperature,
-                      std::max(0.f, p.top_p),
-                      p.top_k,
-                      stochastic ? p.seed + kDraftTokens * kSplitMixIncrement : p.seed};
-    CheckCuda(cudaMemcpyAsync(d_spec_in_, host_spec_in_.get(), sizeof(*d_spec_in_),
-                              cudaMemcpyHostToDevice, stream_));
-    auto scratch = runner_.scratch_tail();
-    CheckCuda(flint_spec_verify_accept(proposal, next_, logits_, d_spec_in_, d_spec_out_,
-                                       scratch.device_ptr, scratch.bytes, len, kVocab, mode,
-                                       stream_));
-    CheckCuda(cudaMemcpyAsync(host_spec_out_.get(), d_spec_out_, sizeof(out),
-                              cudaMemcpyDeviceToHost, stream_));
-    CheckCuda(cudaStreamSynchronize(stream_));
     switch (out.error_code) {
       case SPEC_VERIFY_OK:
         break;

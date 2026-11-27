@@ -23,6 +23,7 @@ class ForwardModule {
   ForwardOptions speculative_options{.use_cuda_graph = 1};
   ForwardDraftResult Draft(const ForwardDraftSpec& spec);
   ForwardRunResult Verify(const ForwardRunSpec& spec, const ForwardOptions&);
+  ForwardSpecRoundResult SpecRound(const ForwardSpecRoundSpec&);
   void Commit(uint32_t pos, uint32_t len, uint32_t accepted);
   void ReportGraphStats(Object& reply, const char* key) const;
 
@@ -30,6 +31,7 @@ class ForwardModule {
   decltype(&flint_forward_store_context) store_context_{};
   decltype(&flint_forward_draft) draft_{};
   decltype(&flint_forward_verify) verify_{};
+  decltype(&flint_forward_spec_round) spec_round_{};
   decltype(&flint_forward_commit) commit_{};
   void Close() noexcept;
 

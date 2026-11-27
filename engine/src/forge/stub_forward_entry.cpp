@@ -326,3 +326,8 @@ int32_t flint_forward_verify(ForwardContext*, const ForwardRunSpec* spec,
 int32_t flint_forward_commit(ForwardContext*, uint32_t pos, uint32_t len, uint32_t accepted) {
   return cudaErrorNotSupported;
 }
+
+int32_t flint_forward_spec_round(ForwardContext*, const ForwardSpecRoundSpec*,
+                                 const ForwardOptions*, ForwardSpecRoundResult*) {
+  return cudaErrorNotSupported;
+}

@@ -3,7 +3,9 @@
 #include "spec_rollback.h"
 namespace {
 using B = __nv_bfloat16;
-__global__ void SwapSlots(B* ring, B* backup, int pos, int count, int first, bool restore) {
+__global__ void SwapSlots(B* ring, B* backup, int pos, int count, int first, bool restore,
+                          const int32_t* d_pos) {
+  pos = d_pos ? *d_pos : pos;
   int plane = blockIdx.y, j = first + blockIdx.x;
   int slot = (pos + j) % 1024;
   for (int i = threadIdx.x; i < 1024; i += blockDim.x) {
@@ -25,7 +27,14 @@ __global__ void Commit(const float* trace, float* state, int channels, int count
 int flint_swa_kv_backup(void* ring, void* backup, int pos, int count, void* stream) {
   if (count < 1 || count > 8 || pos < 0) return cudaErrorInvalidValue;
   SwapSlots<<<dim3(count, 80), 256, 0, static_cast<cudaStream_t>(stream)>>>(
-      static_cast<B*>(ring), static_cast<B*>(backup), pos, count, 0, false);
+      static_cast<B*>(ring), static_cast<B*>(backup), pos, count, 0, false, nullptr);
+  return cudaGetLastError();
+}
+int flint_swa_kv_backup_device(void* ring, void* backup, const int32_t* d_pos, int count,
+                               void* stream) {
+  if (!d_pos || count < 1 || count > 8) return cudaErrorInvalidValue;
+  SwapSlots<<<dim3(count, 80), 256, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<B*>(ring), static_cast<B*>(backup), 0, count, 0, false, d_pos);
   return cudaGetLastError();
 }
 int flint_swa_kv_restore(void* ring, void* backup, int pos, int count, int accepted, void* stream) {
@@ -33,7 +42,7 @@ int flint_swa_kv_restore(void* ring, void* backup, int pos, int count, int accep
     return cudaErrorInvalidValue;
   if (accepted == count) return cudaSuccess;
   SwapSlots<<<dim3(count - accepted, 80), 256, 0, static_cast<cudaStream_t>(stream)>>>(
-      static_cast<B*>(ring), static_cast<B*>(backup), pos, count, accepted, true);
+      static_cast<B*>(ring), static_cast<B*>(backup), pos, count, accepted, true, nullptr);
   return cudaGetLastError();
 }
 int flint_sconv_commit_trace(const float* trace, float* state, int channels, int count,

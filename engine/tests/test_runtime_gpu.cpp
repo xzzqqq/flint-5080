@@ -286,7 +286,6 @@ void PrefixTests(const std::filesystem::path& model_dir, const std::filesystem::
     };
     Require(math.size() == 27 && gold.size() == 49, "short_math fixture shape");
     parity("first", run(math, full, 0), cold_math);
-    size_t resident = FreeBytes();
     auto chunks = Counter(e, "total_prefill_chunks");
     auto repeat = run(math, full, math.size());
     Require(chunks == (math.size() + 7) / 8 && Counter(e, "total_prefill_chunks") == chunks,
@@ -306,6 +305,7 @@ void PrefixTests(const std::filesystem::path& model_dir, const std::filesystem::
     auto tail = extend(cold_stripped.ids);
     parity("live L1", run(tail, greedy, stripped.size() + greedy.max_tokens - 1), cold_tail);
     parity("seed1", run(math, stochastic, math.size()), cold_seed1);
+    size_t resident = FreeBytes();
     ++stochastic.seed;
     parity("seed2", run(math, stochastic, math.size()), cold_seed2);
     run(branch(71), greedy, 0);
@@ -661,19 +661,19 @@ void ModelTests(const std::filesystem::path& model_dir, const std::filesystem::p
     for (const auto& [ids, ar] : ar_runs) {
       auto r = Run(spec.get(), ids, {.max_tokens = ar.t.decode_tokens, .ignore_eos = 1});
       Success(r);
-      Require(r.ids.size() == ar.ids.size() && r.stop_reason == ENGINE_STOP_MAX_TOKENS &&
-                  r.t.spec_accepted > 0 && r.t.decode_rounds < r.t.decode_tokens,
+      Require(r.ids == ar.ids && r.stop_reason == ENGINE_STOP_MAX_TOKENS && r.t.spec_accepted > 0 &&
+                  r.t.decode_rounds < r.t.decode_tokens,
               "greedy speculative telemetry");
       spec_runs.push_back(std::move(r));
     }
   }
   for (unsigned width : {4, 6, 8}) {
-    auto cfg = Encode(Object{{"model_dir", model_dir.string()},
-                             {"draft_model_dir", draft_dir.string()},
-                             {"max_context", kMaxContext},
-                             {"prefill_chunk_size", 8},
-                             {"scratch_bytes", 64 << 20},
-                             {"spec_verify_len", width}});
+    Object cfg{{"model_dir", model_dir.string()},
+               {"draft_model_dir", draft_dir.string()},
+               {"max_context", prompt.size() + gold.size() + 2},
+               {"prefill_chunk_size", 8},
+               {"scratch_bytes", 64 << 20},
+               {"spec_verify_len", width}};
     auto params = [](bool filtered) {
       return RequestParams{.max_tokens = 24,
                            .temperature = 1.f,
@@ -684,16 +684,46 @@ void ModelTests(const std::filesystem::path& model_dir, const std::filesystem::p
     };
     // CUDA and cuBLAS load kernels lazily for each target shape. Compare two
     // independent engine lifetimes after exercising the same shape and modes.
-    size_t cold = FreeBytes();
+    RequestParams greedy{.max_tokens = uint32_t(gold.size()), .ignore_eos = 1};
+    const std::array modes{greedy, params(false), params(true)};
+    auto tail = prompt;
+    tail.insert(tail.end(), gold.begin(), gold.end());
+    std::array<Result, 3> eager;
+    cfg["use_cuda_graph"] = false;
     {
-      auto warm = Create(cfg);
-      for (bool filtered : {false, true}) Success(Run(warm.get(), prompt, params(filtered)));
-      Success(Run(warm.get(), prompt, {.max_tokens = uint32_t(gold.size()), .ignore_eos = 1}));
+      auto engine = Create(Encode(cfg));
+      for (unsigned i = 0; i < modes.size(); ++i) {
+        eager[i] = Run(engine.get(), prompt, modes[i]);
+        Success(eager[i]);
+      }
+      Require(Counter(engine.get(), "graph_launches") == 0, "eager launched a graph");
+    }
+    cfg["use_cuda_graph"] = true;
+    unsigned tail_batch;
+    {
+      auto warm = Create(Encode(cfg));
+      for (auto mode : modes) Success(Run(warm.get(), prompt, mode));
+      auto edge = Run(warm.get(), tail, greedy);
+      Success(edge);
+      tail_batch = edge.batches.at(1);
     }
     size_t baseline = FreeBytes();
-    std::cout << "spec width=" << width
-              << " first lifetime delta=" << int64_t(cold) - int64_t(baseline) << " B" << std::endl;
-    auto spec = Create(cfg);
+    auto spec = Create(Encode(cfg));
+    // Cancel on the first verify callback to exclude single-token AR fallback from counters.
+    uint64_t expected_launches = 0;
+    for (unsigned pass = 0; pass < 2; ++pass) {
+      for (unsigned i = 0; i < modes.size(); ++i) {
+        auto r = Run(spec.get(), prompt, modes[i], 1 + eager[i].batches.at(1));
+        Require(r.status == ENGINE_ERR_CANCELLED && r.t.decode_rounds == 1 &&
+                    Counter(spec.get(), "graph_captures") == (pass ? 3 : i + 1) &&
+                    Counter(spec.get(), "graph_launches") == ++expected_launches,
+                "merged graph capture or launch count");
+      }
+      auto edge = Run(spec.get(), tail, greedy, 1 + tail_batch);
+      Require(edge.status == ENGINE_ERR_CANCELLED && Counter(spec.get(), "graph_captures") == 3 &&
+                  Counter(spec.get(), "graph_launches") == expected_launches,
+              "context-limit tail evicted or launched a steady-state graph");
+    }
     for (bool filtered : {false, true}) {
       auto sample = params(filtered);
       auto a = Run(spec.get(), prompt, sample), replay = Run(spec.get(), prompt, sample);
@@ -702,14 +732,18 @@ void ModelTests(const std::filesystem::path& model_dir, const std::filesystem::p
       Success(a);
       Success(replay);
       Success(other);
-      Require(a.ids.size() == sample.max_tokens && a.ids == replay.ids && a.ids != other.ids &&
+      Require(a.ids.size() == sample.max_tokens && a.ids == replay.ids &&
+                  a.ids == eager[filtered ? 2 : 1].ids &&
+                  a.batches == eager[filtered ? 2 : 1].batches && a.ids != other.ids &&
                   a.t.spec_accepted == replay.t.spec_accepted &&
                   a.t.decode_rounds == replay.t.decode_rounds,
               "stochastic speculative replay");
     }
     auto r = Run(spec.get(), prompt, {.max_tokens = uint32_t(gold.size()), .ignore_eos = 1});
     Success(r);
-    Require(r.ids == ar_runs.front().second.ids && Counter(spec.get(), "spec_verify_len") == width,
+    Require(r.ids == eager[0].ids && r.batches == eager[0].batches &&
+                r.ids == ar_runs.front().second.ids &&
+                Counter(spec.get(), "spec_verify_len") == width,
             "configured verify width short_math AR parity");
     const auto hist = std::span(r.t.spec_accept_hist);
     uint32_t accepted = 0;

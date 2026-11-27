@@ -3,16 +3,16 @@
 #include "common/cuda_check.h"
 #include "forge/forward_abi.h"
 #include "model/dflash2_forward.h"
-#include "model/inkling2_forward.h"
+#include "model/spec_round.h"
 struct ForwardContext {
   ScratchArenaView draft_scratch;
   flint::InklingRunner runner;
-  std::optional<flint::DFlash2Runner> draft;
+  std::optional<flint::SpeculativeRunner> speculative;
   ForwardContext(const ModelWeightsView& w, const KvStateArenaView& kv, ScratchArenaView ws,
                  cudaStream_t s)
       : draft_scratch(w.has_draft ? flint::DFlash2Runner::ReserveScratch(ws) : ScratchArenaView{}),
         runner(w, kv, ws, s) {
-    if (w.has_draft) draft.emplace(w, kv, draft_scratch, runner.stream());
+    if (w.has_draft) speculative.emplace(w, kv, draft_scratch, runner);
   }
 };
 uint32_t flint_forward_abi_version() { return FLINT_FORWARD_ABI_VERSION; }
@@ -27,7 +27,9 @@ ForwardContext* flint_forward_create(const ModelWeightsView* weights, const KvSt
 }
 void flint_forward_destroy(ForwardContext* c) { delete c; }
 ForwardGraphStats flint_forward_graph_stats(const ForwardContext* c) {
-  return c->runner.graph_stats();
+  using flint::operator+;
+  return c->runner.graph_stats() +
+         (c->speculative ? c->speculative->graph_stats() : ForwardGraphStats{});
 }
 int32_t flint_forward_run_layers_capture(ForwardContext* c, const ForwardRunSpec* s,
                                          const ForwardOptions* o, ForwardRunResult* r,
@@ -55,7 +57,7 @@ int32_t flint_forward_run_layers(ForwardContext* c, const ForwardRunSpec* s,
 namespace {
 template <class F>
 int DraftCall(ForwardContext* c, F call) {
-  if (!c || !c->draft) return cudaErrorInvalidValue;
+  if (!c || !c->speculative) return cudaErrorInvalidValue;
   try {
     return call();
   } catch (const flint::CudaError& e) {
@@ -72,7 +74,7 @@ int DraftCall(ForwardContext* c, F call) {
 int32_t flint_forward_store_context(ForwardContext* c, const void* taps, uint32_t count,
                                     uint32_t pos) {
   return DraftCall(c, [&]() {
-    c->draft->StoreContextKv(taps, count, pos);
+    c->speculative->draft().StoreContextKv(taps, count, pos);
     return 0;
   });
 }
@@ -80,7 +82,7 @@ int32_t flint_forward_draft(ForwardContext* c, const ForwardDraftSpec* spec,
                             ForwardDraftResult* result) {
   return DraftCall(c, [&]() {
     if (!spec || !result) return int(cudaErrorInvalidValue);
-    c->draft->Draft(*spec, *result);
+    c->speculative->draft().Draft(*spec, *result);
     return 0;
   });
 }
@@ -95,6 +97,15 @@ int32_t flint_forward_verify(ForwardContext* c, const ForwardRunSpec* spec,
 int32_t flint_forward_commit(ForwardContext* c, uint32_t pos, uint32_t len, uint32_t accepted) {
   return DraftCall(c, [&]() {
     c->runner.CommitVerify(pos, len, accepted);
+    return 0;
+  });
+}
+
+int32_t flint_forward_spec_round(ForwardContext* c, const ForwardSpecRoundSpec* spec,
+                                 const ForwardOptions* opts, ForwardSpecRoundResult* result) {
+  return DraftCall(c, [&]() {
+    if (!spec || !opts || !result) return int(cudaErrorInvalidValue);
+    *result = c->speculative->Run(*spec, *opts);
     return 0;
   });
 }

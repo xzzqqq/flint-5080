@@ -14,6 +14,9 @@ class InklingRunner {
   [[nodiscard]] cudaStream_t stream() const;
   [[nodiscard]] ScratchArenaView scratch_tail() const;
   ForwardRunResult RunVerify(ForwardRunSpec, const ForwardOptions& = {}, bool device_only = false);
+  void BeginExternalVerify(uint32_t pos, uint32_t len);
+  void CancelExternalVerify();
+  void EnqueueVerifyBody(ForwardRunSpec spec, const ForwardOptions&, const int32_t* d_pos);
   void CommitVerify(uint32_t pos_offset, uint32_t verify_len, uint32_t accepted_len);
   [[nodiscard]] ForwardGraphStats graph_stats() const;
 
