@@ -58,11 +58,17 @@ fn toml_cli_environment_and_engine_defaults() {
         "--no-spec=false",
         "--spec-verify-len",
         "4",
+        "--vram-reserve-mib",
+        "192",
         "--request-timeout-sec",
         "12",
     ])
     .resolve(Some("env".into()))
     .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&config.engine_json()).unwrap()["vram_reserve_bytes"],
+        192 << 20
+    );
     assert_eq!(config.api_key.as_deref(), Some("cli"));
     assert_eq!(
         config.draft_dir.unwrap(),

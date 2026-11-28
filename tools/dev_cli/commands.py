@@ -485,6 +485,7 @@ def serve(cfg, args, result):
             "prefill_chunk_size",
             "prefix_cache_slots",
             "spec_verify_len",
+            "vram_reserve_mib",
             "request_timeout_sec",
         ):
             value = getattr(args, key)

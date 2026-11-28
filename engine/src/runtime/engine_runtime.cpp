@@ -587,6 +587,7 @@ std::string EngineRuntime::StatsJson() const {
                        {"sm_minor", e.gpu.minor},
                        {"vram_total_bytes", total},
                        {"vram_free_bytes", free},
+                       {"vram_reserve_bytes", e.config.vram_reserve_bytes},
                        {"max_context", e.config.max_context},
                        {"prefill_chunk_size", e.config.prefill_chunk_size},
                        {"use_cuda_graph", e.config.use_cuda_graph},

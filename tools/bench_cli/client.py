@@ -28,6 +28,7 @@ async def probe_ready(url, timeout):
     fields = (
         "gpu_name",
         "max_context",
+        "vram_reserve_bytes",
         "prefix_cache_slots",
         "use_cuda_graph",
         "use_speculative",

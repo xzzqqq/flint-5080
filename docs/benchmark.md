@@ -17,7 +17,7 @@ specific cases from the selected suites. Use `--tag NAME` to name an archived ru
 | Suite | Request schedule | Readout |
 | --- | --- | --- |
 | short | Serial short chat, medium debugging, long code review. Nominal input sizes ~40/256/1024 tokens, maximum 64 output tokens. | Short-context steady C1 decode and SOL |
-| agent | Four frozen SWE-bench Verified coding-agent snapshots spanning Q1–Q4 context lengths (8.5K / 15.1K / 22.4K / 47.1K tokens) across edit, explore and debug stages. `reasoning_effort: "max"`, maximum 8,192 output tokens, natural EOS. | Realistic long-context C1 decode under Full-Attention KV load and DFlash 2 acceptance |
+| agent | Four frozen SWE-bench Verified coding-agent snapshots spanning Q1–Q4 context lengths (nominal 8.5K / 15.1K / 22.4K / 47.1K tokens) across edit, explore and debug stages. `reasoning_effort: "max"`, maximum 8,192 output tokens, natural EOS. | Realistic long-context C1 decode under Full-Attention KV load and DFlash 2 acceptance |
 | canary | One greedy pass over arithmetic, code, single/multiple tool calls, stop strings and bilingual UTF-8. The parity case also sends one non-streaming request. | All assertions pass, including exact reconstructed content, reasoning and tool-call payloads for parity, excluding request-specific IDs |
 
 Inputs and checks live in `workloads/{bench,canary}_cases.json`. All cases use
@@ -25,7 +25,7 @@ temperature zero by default. For performance suites, `bench run` accepts
 `--temperature`, `--top-p`, `--top-k`, and `--seed` for warmup and measured requests.
 The run records the overrides and `bench compare` warns when they differ. The `agent` cases are a 4-request stratified subset extracted
 from `coding_agent_48` (`django__django-11099`, `pydata__xarray-4687`,
-`pallets__flask-5014`, `psf__requests-1142`) with `cache_control` hints stripped.
+`pallets__flask-5014`, `psf__requests-1142`) with `cache_control` hints stripped. With the Inkling template and round-1 nonce, the server receives 10,817 / 16,937 / 27,320 / 55,232 prompt tokens. For the four-case study, start with `--prefix-cache-slots 0 --vram-reserve-mib 192` and confirm `max_context` on `/ready`.
 The multi-city canary validates every call and records the actual count,
 accepting one or more valid calls.
 
@@ -44,7 +44,7 @@ Use one warmup and three measured rounds per performance case by default.
 Exclude all warmups from samples, counts and statistics. For each available
 numeric metric report median, arithmetic mean and sample count by case and
 suite. Sum the eight `spec_accept_hist` bins elementwise across measured requests.
-Bin k counts speculative rounds that emitted k accepted draft tokens. A suite summary pools its measured requests.
+Each performance sample also retains the HTTP `finish_reason`. Bin k counts speculative rounds that emitted k accepted draft tokens. A suite summary pools its measured requests.
 
 Request `X-Flint-Telemetry: 1` and streaming `stream_options.include_usage`.
 Use the returned `x_flint_telemetry` as the primary engine measurement.
@@ -104,7 +104,9 @@ unmatched conditions is diagnostic.
   temperature-1.0 streaming smoke uses the short prompts, seed 5080, and the
   server telemetry header. Seed 0 asks the engine to choose a fresh seed. Keep these single-request samples outside greedy medians.
   The verified 5080 baseline uses 31,508 tokens of context and three prefix slots.
-  [Baseline measurements and run IDs](findings/2026-11-27-dflash2-pivot-baseline.md)
+  Use `@m4-final-short` for the final Milestone 4 greedy baseline and
+  `@m4-final-nonce77` for its single-request stochastic smoke.
+  [Matched comparisons and archive filenames](findings/2026-11-28-verify-width-study.md)
 - Optimization and regression thresholds: target at least **70% of
   context-matched DFlash 2 round SOL** to maximize end-to-end
   `server_decode_tok_s`. Use a 5% regression review threshold on `short` and

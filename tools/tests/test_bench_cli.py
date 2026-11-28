@@ -221,6 +221,7 @@ def test_suites(suite, harness, monkeypatch):
         for case in data["cases"]["short"].values():
             assert [r["round"] for r in case["samples"]] == [1, 2]
             assert case["summary"]["prefill_ms"] == {"median": 20, "mean": 20, "n": 2}
+            assert all(row["finish_reason"] == "stop" for row in case["samples"])
             assert case["summary"]["spec_accept_hist"] == [4, 2, 2, 0, 0, 0, 0, 0]
             assert case["samples"][0]["metrics"]["spec_accept_hist"] == [2, 1, 1, 0, 0, 0, 0, 0]
         assert data["suite_summary"]["short"]["spec_accept_hist"] == [12, 6, 6, 0, 0, 0, 0, 0]

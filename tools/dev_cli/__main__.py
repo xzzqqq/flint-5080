@@ -72,6 +72,7 @@ def build_parser() -> argparse.ArgumentParser:
             "prefill-chunk-size",
             "prefix-cache-slots",
             "spec-verify-len",
+            "vram-reserve-mib",
             "request-timeout-sec",
         ):
             action.add_argument("--" + flag, type=int)

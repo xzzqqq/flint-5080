@@ -20,7 +20,7 @@
 **现有能力**
 - **Inference engine 与 VRAM 管理**：以标准 `safetensors` 只读 `mmap` 一次载入并静态划分 VRAM Arena，支持 chunked prefill、request cancel 与静态 CUDA Graph。
 - **DFlash 2 speculative decoding**：通过 `--draft-dir` 加载独立 BF16 drafter。prefill 仅为 prompt 末尾和中间 prefix snapshot 各自所需的最后 2047 个位置投影四路 target tap，生成各层的 context KV；共享的 `SpeculativeRunner`（libengine.a / forward.so）用一次 CUDA Graph launch 完成 draft、verify 输入拼接、SWA KV 备份、target verify 和接受/采样。它按 greedy、全词表采样及过滤采样分别缓存图。临近 context 上限时用 eager 执行缩短的 verify，保留常用宽度的图。draft 在 GPU 上保留 7 个 token 及每行 16 个 conditional candidate 和概率。`--spec-verify-len` 控制 target 批量 verify 的宽度（含 anchor，2–8，默认 8），并按 accept length commit 或恢复 SWA 与 conv state。GPU 在 target activation scratch 中完成过滤、接受判定与最终采样；拒绝时按词表顺序从 normalized `max(p−q, 0)` 采样。每轮仅将输出 token、接受数、后续 RNG 状态和错误码传回主机；`--no-spec` 切换到 AR。
-- **VRAM Prefix Cache**：在 VRAM 内复用多轮对话 prefix（含 target 与 drafter 的 SWA KV、target conv state 及末位 logits），exact hit 可零 prefill 直接进入 decode。
+- **VRAM Prefix Cache**：在 VRAM 内复用多轮对话 prefix（含 target 与 drafter 的 SWA KV、target conv state 及末位 logits），exact hit 可零 prefill 直接进入 decode。engine 在分配 KV arena 前预留 VRAM（默认 512 MiB）；`dev serve` 可通过 `--vram-reserve-mib` 覆盖，实际 `max_context` 和 `vram_reserve_bytes` 见 `/ready`。
 - **OpenAI 兼容 server 壳**：提供 Chat Completions（SSE / 非流式 / stop 字符串 / 超时 cancel）、离线 HF golden 对齐的 Tokenizer 与 Jinja 模板、独立 Reasoning/Tool-Call streaming parser 及免鉴权 `/health`、`/ready`、`/metrics`（Prometheus）。
 - **调优工作台与精度守门**：通过 `forge` 实现常驻 weights + 整图 `forward.so` hot-reload、A/B 交错与分阶段 profile，配合 `weights golden`/`kld` 和 `bench` 完成数值与性能闭环验收。
 

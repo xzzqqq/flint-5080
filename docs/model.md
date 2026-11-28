@@ -34,7 +34,9 @@
 
 Text weights 按组件拆分为：`moe_experts` **9.30 GiB**（80.4%，有效 `3.266 bpw`）、`embed` **883.4 MiB**、`unembed` **883.4 MiB**、`attention` **492.4 MiB**、`loop_aux/router/norms` **69.1 MiB**；独立 drafter weights 占 **944.11 MiB**（`model-vision.safetensors` 607.0 MiB 当前跳过）。
 
-生产服务使用 BF16 KV、450 MiB scratch、3 个 prefix slot 和 512 MiB 预留。RTX 5080 上，DFlash 2 服务启动后 `/ready` 报告 **31,508 tokens** 和 **489.88 MiB** 空闲 VRAM。Round 1 的相同配置下，AR 容量为 67,176 tokens。板卡总量为 16,303 MiB，CUDA 进程报告可见总量为 15,840.06 MiB。
+生产服务使用 BF16 KV、450 MiB scratch、3 个 prefix slot 和 512 MiB 预留。RTX 5080 上，DFlash 2 服务启动后 `/ready` 报告 **31,508 tokens** 和 **489.88 MiB** 空闲 VRAM。在 long-context sweep 中，使用 `--prefix-cache-slots 0 --vram-reserve-mib 192` 时，`/ready` 报告 `max_context = 61,314`。[Verify width study](findings/2026-11-28-verify-width-study.md)
+
+Round 1 使用 3 个 prefix slot 和 512 MiB reserve 时，AR 容量为 67,176 tokens。板卡总量为 16,303 MiB，CUDA 进程报告可见总量为 15,840.06 MiB。
 
 | BF16 KV 分项 | 容量 |
 |---|---:|
@@ -51,7 +53,7 @@ Forge 有独立的内存布局。双模型 weights Arena 为 **13,418,483,200 B*
 
 ### 3.1 DFlash 2 的 `short_math` 首轮
 
-27-token prefix，draft block 和 verify block 各 8 行。逻辑流量按每个 logical layer、每种投影的使用量计算，batch 内相同行或 expert 只计一次。诊断时从原生 target router 收集每层的 64 个选择。48 个 logical layers 合计命中 717 个偶数和 700 个奇数 expert（逐层去重）。带宽采用 960 GB/s，GB 使用十进制。
+27-token prefix，draft block 和默认 target verify block 各 8 行（1 个 anchor 和 7 个 proposal）。逻辑流量按每个 logical layer、每种投影的使用量计算，batch 内相同行或 expert 只计一次。诊断时从原生 target router 收集每层的 64 个选择。48 个 logical layers 合计命中 717 个偶数和 700 个奇数 expert（逐层去重）。带宽采用 960 GB/s，GB 使用十进制。
 
 | 每轮主要读取 | GB | 计算依据 |
 |---|---:|---|
@@ -60,9 +62,9 @@ Forge 有独立的内存布局。双模型 weights Arena 为 **13,418,483,200 B*
 | Target verify，共享 weights 和 unembed head | 2.099 | Forge 的 3.348 GB 单行计数扣除平均 1.248 GB expert 项并计入 verify block 的 embedding 行 |
 | Target verify，本轮路由命中的 expert | 4.602 | 偶数 expert 3,002,112 B/个，奇数 expert 3,499,776 B/个 |
 | Verify 和 draft 的可见 KV | 0.008 | `(48 + 5) × (27 + 8) × 4096 B` |
-| **合计** | **8.463** | **8.815 ms** 逻辑下限；实测 graph **36.301 ms/round**，即 **24.3% SOL** |
+| **合计** | **8.463** | **8.815 ms** 逻辑下限；width 8 merged graph 的 wall time **36.781 ms/round**，即 **24.0% SOL** |
 
-此账本估计 weights 和 KV 的逻辑读取，实际 DRAM 流量还取决于 cache、临时 tensor、rollback 和写入。其他 prefix 或 draft path 的 expert 集合需要重新计数。长 context 中，drafter 每层的 8 行合计最多可见 2,055 个不同的 KV 位置，ring 容量为 2,056，target SWA ring 保留 1,024 个，target Full 层随 context 增长。[测量与路由记录](findings/2026-11-27-dflash2-pivot-baseline.md)
+此账本估计 weights 和 KV 的逻辑读取，实际 DRAM 流量还取决于 cache、临时 tensor、rollback 和写入。其他 prefix 或 draft path 的 expert 集合需要重新计数。长 context 中，drafter 每层的 8 行合计最多可见 2,055 个不同的 KV 位置，ring 容量为 2,056，target SWA ring 保留 1,024 个，target Full 层随 context 增长。[Routing](findings/2026-11-27-dflash2-pivot-baseline.md) · [Merged graph timing](findings/2026-11-28-verify-width-study.md)
 
 ### 3.2 AR 单 token 对照
 

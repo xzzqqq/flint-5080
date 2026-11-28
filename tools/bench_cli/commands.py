@@ -38,7 +38,11 @@ async def performance(send, suite, case, args, overrides):
         responses = [await send(body | overrides) for body in bodies]
         if not warmup:
             for response in responses:
-                rows.append(dict(round=number, metrics=response.metrics))
+                rows.append(
+                    dict(
+                        round=number, metrics=response.metrics, finish_reason=response.finish_reason
+                    )
+                )
     return dict(samples=rows, summary=summarize(r["metrics"] for r in rows))
 
 
